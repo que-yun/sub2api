@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"golang.org/x/sync/singleflight"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/failsafebreaker"
 )
 
 const (
@@ -22,6 +24,7 @@ const (
 	openAIAccountScheduleLayerSessionSticky    = "session_hash"
 	openAIAccountScheduleLayerLoadBalance      = "load_balance"
 	openAIAdvancedSchedulerSettingKey          = "openai_advanced_scheduler_enabled"
+	openAIFailsafeRoutingGroupID               = int64(24)
 )
 
 const (
@@ -918,28 +921,89 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 		}
 		return buildOpenAIWeightedSelectionOrder(ranked, req)
 	}
+	buildFailsafeSelectionOrder := func(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
+		return buildOpenAIFailsafeTieredSelectionOrder(pool, req, buildSelectionOrder)
+	}
 
 	if req.RequireCompact {
-		supported := make([]openAIAccountCandidateScore, 0, len(plan.candidates))
-		unknown := make([]openAIAccountCandidateScore, 0, len(plan.candidates))
-		for _, candidate := range plan.candidates {
-			switch openAICompactSupportTier(candidate.account) {
-			case 2:
-				supported = append(supported, candidate)
-			case 1:
-				unknown = append(unknown, candidate)
+		buildCompactSelectionOrder := func(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
+			supported := make([]openAIAccountCandidateScore, 0, len(pool))
+			unknown := make([]openAIAccountCandidateScore, 0, len(pool))
+			for _, candidate := range pool {
+				switch openAICompactSupportTier(candidate.account) {
+				case 2:
+					supported = append(supported, candidate)
+				case 1:
+					unknown = append(unknown, candidate)
+				}
 			}
+			selectionOrder := make([]openAIAccountCandidateScore, 0, len(pool))
+			selectionOrder = append(selectionOrder, buildSelectionOrder(supported)...)
+			selectionOrder = append(selectionOrder, buildSelectionOrder(unknown)...)
+			return selectionOrder
 		}
 		selectionOrder := make([]openAIAccountCandidateScore, 0, len(plan.allCandidates))
-		selectionOrder = append(selectionOrder, buildSelectionOrder(supported)...)
-		selectionOrder = append(selectionOrder, buildSelectionOrder(unknown)...)
+		selectionOrder = append(selectionOrder, buildOpenAIFailsafeTieredSelectionOrder(plan.candidates, req, buildCompactSelectionOrder)...)
 		if len(plan.staleSnapshotCompactRetry) > 0 && s.service.schedulerSnapshot != nil {
 			selectionOrder = append(selectionOrder, sortOpenAICompactRetryCandidates(plan.staleSnapshotCompactRetry)...)
 		}
 		return selectionOrder
 	}
 
-	return buildSelectionOrder(plan.candidates)
+	return buildFailsafeSelectionOrder(plan.candidates)
+}
+
+func buildOpenAIFailsafeTieredSelectionOrder(
+	pool []openAIAccountCandidateScore,
+	req OpenAIAccountScheduleRequest,
+	buildSelectionOrder func([]openAIAccountCandidateScore) []openAIAccountCandidateScore,
+) []openAIAccountCandidateScore {
+	if len(pool) == 0 || buildSelectionOrder == nil {
+		return nil
+	}
+	if !shouldUseOpenAIFailsafeTieredRouting(req) {
+		return buildSelectionOrder(pool)
+	}
+
+	byID := make(map[int64]openAIAccountCandidateScore, len(pool))
+	var healthy, degraded, broken []openAIAccountCandidateScore
+	ids := make([]int64, 0, len(pool))
+	for _, candidate := range pool {
+		if candidate.account == nil {
+			continue
+		}
+		accountID := candidate.account.ID
+		ids = append(ids, accountID)
+		byID[accountID] = candidate
+		switch failsafeObserveReg.Tier(accountID) {
+		case failsafebreaker.TierHealthy:
+			healthy = append(healthy, candidate)
+		case failsafebreaker.TierDegraded:
+			degraded = append(degraded, candidate)
+		default:
+			broken = append(broken, candidate)
+		}
+	}
+
+	if len(healthy) > 0 {
+		return buildSelectionOrder(healthy)
+	}
+	if len(degraded) > 0 {
+		return buildSelectionOrder(degraded)
+	}
+	pick, ok := failsafeObserveReg.PickBest(ids, 0)
+	if !ok {
+		return nil
+	}
+	chosen, ok := byID[pick.AccountID]
+	if !ok {
+		return nil
+	}
+	return []openAIAccountCandidateScore{chosen}
+}
+
+func shouldUseOpenAIFailsafeTieredRouting(req OpenAIAccountScheduleRequest) bool {
+	return failsafeRoutingEnabled() && req.GroupID != nil && *req.GroupID == openAIFailsafeRoutingGroupID
 }
 
 func sortOpenAICompactRetryCandidates(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {

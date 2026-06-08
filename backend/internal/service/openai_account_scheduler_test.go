@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/failclass"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/failsafebreaker"
 	"github.com/stretchr/testify/require"
 )
 
@@ -2792,6 +2794,164 @@ func TestBuildOpenAIWeightedSelectionOrder_HandlesInvalidScores(t *testing.T) {
 		seen[item.account.ID] = struct{}{}
 	}
 	require.Len(t, seen, len(candidates))
+}
+
+func TestBuildOpenAIFailsafeTieredSelectionOrder_FlagOffKeepsLegacyOrder(t *testing.T) {
+	t.Setenv("GATEWAY_FAILSAFE_ROUTING", "")
+	resetFailsafeObserveRegistryForTest(t)
+	req := OpenAIAccountScheduleRequest{GroupID: int64PtrForTest(openAIFailsafeRoutingGroupID)}
+	candidates := openAIFailsafeTieredSelectionTestCandidates()
+	failsafeObserveReg.Record(61001, failclass.Result{Category: failclass.AccountQuota, CooldownHint: time.Hour})
+
+	order := buildOpenAIFailsafeTieredSelectionOrder(candidates, req, openAIFailsafeTestLegacyOrder)
+
+	require.Equal(t, []int64{61001, 61002, 61003}, openAIFailsafeCandidateIDs(order))
+}
+
+func TestBuildOpenAIFailsafeTieredSelectionOrder_NonTargetGroupKeepsLegacyOrder(t *testing.T) {
+	t.Setenv("GATEWAY_FAILSAFE_ROUTING", "1")
+	resetFailsafeObserveRegistryForTest(t)
+	req := OpenAIAccountScheduleRequest{GroupID: int64PtrForTest(openAIFailsafeRoutingGroupID + 1)}
+	candidates := openAIFailsafeTieredSelectionTestCandidates()
+	failsafeObserveReg.Record(61001, failclass.Result{Category: failclass.AccountQuota, CooldownHint: time.Hour})
+
+	order := buildOpenAIFailsafeTieredSelectionOrder(candidates, req, openAIFailsafeTestLegacyOrder)
+
+	require.Equal(t, []int64{61001, 61002, 61003}, openAIFailsafeCandidateIDs(order))
+}
+
+func TestBuildOpenAIFailsafeTieredSelectionOrder_TargetGroupPrefersHealthyTier(t *testing.T) {
+	t.Setenv("GATEWAY_FAILSAFE_ROUTING", "1")
+	resetFailsafeObserveRegistryForTest(t)
+	req := OpenAIAccountScheduleRequest{GroupID: int64PtrForTest(openAIFailsafeRoutingGroupID)}
+	candidates := openAIFailsafeTieredSelectionTestCandidates()
+	failsafeObserveReg.Record(61001, failclass.Result{Category: failclass.AccountQuota, CooldownHint: time.Hour})
+	failsafeObserveReg.Record(61002, failclass.Result{Category: failclass.AccountTransient})
+
+	order := buildOpenAIFailsafeTieredSelectionOrder(candidates, req, openAIFailsafeTestLegacyOrder)
+
+	require.Equal(t, []int64{61003}, openAIFailsafeCandidateIDs(order))
+	require.Equal(t, failsafebreaker.TierBroken, failsafeObserveReg.Tier(61001))
+	require.Equal(t, failsafebreaker.TierDegraded, failsafeObserveReg.Tier(61002))
+	require.Equal(t, failsafebreaker.TierHealthy, failsafeObserveReg.Tier(61003))
+}
+
+func TestBuildOpenAIFailsafeTieredSelectionOrder_TargetGroupAppliesTierBeforeCompactSupport(t *testing.T) {
+	t.Setenv("GATEWAY_FAILSAFE_ROUTING", "1")
+	resetFailsafeObserveRegistryForTest(t)
+	req := OpenAIAccountScheduleRequest{GroupID: int64PtrForTest(openAIFailsafeRoutingGroupID)}
+	supportedDegraded := openAIAccountCandidateScore{
+		account: &Account{
+			ID:       61011,
+			Platform: PlatformOpenAI,
+			Extra:    map[string]any{"openai_compact_supported": true},
+		},
+		loadInfo: &AccountLoadInfo{LoadRate: 0, WaitingCount: 0},
+		score:    3,
+	}
+	unknownHealthy := openAIAccountCandidateScore{
+		account:  &Account{ID: 61012, Platform: PlatformOpenAI},
+		loadInfo: &AccountLoadInfo{LoadRate: 0, WaitingCount: 0},
+		score:    1,
+	}
+	failsafeObserveReg.Record(61011, failclass.Result{Category: failclass.AccountTransient})
+
+	order := buildOpenAIFailsafeTieredSelectionOrder(
+		[]openAIAccountCandidateScore{supportedDegraded, unknownHealthy},
+		req,
+		func(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
+			supported := make([]openAIAccountCandidateScore, 0, len(pool))
+			unknown := make([]openAIAccountCandidateScore, 0, len(pool))
+			for _, candidate := range pool {
+				switch openAICompactSupportTier(candidate.account) {
+				case 2:
+					supported = append(supported, candidate)
+				case 1:
+					unknown = append(unknown, candidate)
+				}
+			}
+			out := append([]openAIAccountCandidateScore(nil), supported...)
+			out = append(out, unknown...)
+			return out
+		},
+	)
+
+	require.Equal(t, []int64{61012}, openAIFailsafeCandidateIDs(order))
+}
+
+func TestBuildOpenAIFailsafeTieredSelectionOrder_TargetGroupFallsBackToDegradedWhenNoHealthy(t *testing.T) {
+	t.Setenv("GATEWAY_FAILSAFE_ROUTING", "1")
+	resetFailsafeObserveRegistryForTest(t)
+	req := OpenAIAccountScheduleRequest{GroupID: int64PtrForTest(openAIFailsafeRoutingGroupID)}
+	candidates := openAIFailsafeTieredSelectionTestCandidates()
+	failsafeObserveReg.Record(61001, failclass.Result{Category: failclass.AccountQuota, CooldownHint: time.Hour})
+	failsafeObserveReg.Record(61002, failclass.Result{Category: failclass.AccountTransient})
+	failsafeObserveReg.Record(61003, failclass.Result{Category: failclass.AccountPermanent})
+
+	order := buildOpenAIFailsafeTieredSelectionOrder(candidates, req, openAIFailsafeTestLegacyOrder)
+
+	require.Equal(t, []int64{61002}, openAIFailsafeCandidateIDs(order))
+}
+
+func TestBuildOpenAIFailsafeTieredSelectionOrder_TargetGroupAllBrokenUsesPickBestPanicFirst(t *testing.T) {
+	t.Setenv("GATEWAY_FAILSAFE_ROUTING", "1")
+	resetFailsafeObserveRegistryForTest(t)
+	req := OpenAIAccountScheduleRequest{GroupID: int64PtrForTest(openAIFailsafeRoutingGroupID)}
+	candidates := openAIFailsafeTieredSelectionTestCandidates()
+	failsafeObserveReg.Record(61001, failclass.Result{Category: failclass.AccountQuota, CooldownHint: time.Hour})
+	failsafeObserveReg.Record(61002, failclass.Result{Category: failclass.AccountPermanent})
+	failsafeObserveReg.Record(61003, failclass.Result{Category: failclass.AccountQuota, CooldownHint: 2 * time.Hour})
+
+	order := buildOpenAIFailsafeTieredSelectionOrder(candidates, req, openAIFailsafeTestLegacyOrder)
+
+	require.Equal(t, []int64{61001}, openAIFailsafeCandidateIDs(order))
+	pick, ok := failsafeObserveReg.PickBest([]int64{61001, 61002, 61003}, 0)
+	require.True(t, ok)
+	require.True(t, pick.Panic)
+	require.Equal(t, int64(61001), pick.AccountID)
+}
+
+func resetFailsafeObserveRegistryForTest(t *testing.T) {
+	t.Helper()
+	original := failsafeObserveReg
+	failsafeObserveReg = failsafebreaker.NewRegistry(failsafebreaker.DefaultConfig())
+	t.Cleanup(func() {
+		failsafeObserveReg = original
+	})
+}
+
+func openAIFailsafeTieredSelectionTestCandidates() []openAIAccountCandidateScore {
+	return []openAIAccountCandidateScore{
+		{
+			account:  &Account{ID: 61001, Priority: 0},
+			loadInfo: &AccountLoadInfo{LoadRate: 0, WaitingCount: 0},
+			score:    3,
+		},
+		{
+			account:  &Account{ID: 61002, Priority: 1},
+			loadInfo: &AccountLoadInfo{LoadRate: 0, WaitingCount: 0},
+			score:    2,
+		},
+		{
+			account:  &Account{ID: 61003, Priority: 2},
+			loadInfo: &AccountLoadInfo{LoadRate: 0, WaitingCount: 0},
+			score:    1,
+		},
+	}
+}
+
+func openAIFailsafeTestLegacyOrder(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
+	return append([]openAIAccountCandidateScore(nil), pool...)
+}
+
+func openAIFailsafeCandidateIDs(order []openAIAccountCandidateScore) []int64 {
+	ids := make([]int64, 0, len(order))
+	for _, candidate := range order {
+		if candidate.account != nil {
+			ids = append(ids, candidate.account.ID)
+		}
+	}
+	return ids
 }
 
 func TestOpenAISelectionRNG_SeedZeroStillWorks(t *testing.T) {
