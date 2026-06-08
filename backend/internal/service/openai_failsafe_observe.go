@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"os"
@@ -21,6 +22,112 @@ func failsafeRoutingEnabled() bool {
 		return true
 	}
 	return false
+}
+
+func OpenAIFailsafeRoutingEnabledForGroup(groupID *int64) bool {
+	return failsafeRoutingEnabled() && groupID != nil && *groupID == openAIFailsafeRoutingGroupID
+}
+
+type OpenAIFailsafeRouteCall func(account *Account, selection *AccountSelectionResult) (status int, body []byte, err error)
+
+func (s *OpenAIGatewayService) RouteOpenAIChatCompletionsFailsafe(
+	ctx context.Context,
+	groupID *int64,
+	sessionHash string,
+	requestedModel string,
+	call OpenAIFailsafeRouteCall,
+) (int64, failclass.Result, bool) {
+	if s == nil || call == nil || !OpenAIFailsafeRoutingEnabledForGroup(groupID) {
+		return 0, failclass.Result{}, false
+	}
+	ctx = s.withOpenAIQuotaAutoPauseContext(ctx)
+	if open, _, _ := s.IsOpenAIGroupModelCircuitOpenForContext(ctx, groupID, requestedModel); open {
+		return 0, failclass.Result{}, false
+	}
+	if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
+		return 0, failclass.Result{}, false
+	}
+	accounts, err := s.listSchedulableAccounts(ctx, groupID)
+	if err != nil || len(accounts) == 0 {
+		return 0, failclass.Result{}, false
+	}
+
+	needsUpstreamCheck := s.needsUpstreamChannelRestrictionCheck(ctx, groupID)
+	byID := make(map[int64]Account, len(accounts))
+	ids := make([]int64, 0, len(accounts))
+	for _, account := range accounts {
+		if account.Platform != PlatformOpenAI {
+			continue
+		}
+		if !accountSupportsOpenAICapabilities(&account, OpenAIEndpointCapabilityChatCompletions, "") {
+			continue
+		}
+		if requestedModel != "" && !isOpenAIAccountEligibleForRequest(ctx, &account, requestedModel, false, OpenAIEndpointCapabilityChatCompletions) {
+			continue
+		}
+		if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, &account, requestedModel, false) {
+			continue
+		}
+		ids = append(ids, account.ID)
+		byID[account.ID] = account
+	}
+	if len(ids) == 0 {
+		return 0, failclass.Result{}, false
+	}
+
+	var stickyAccountID int64
+	if sessionHash != "" && s.cache != nil {
+		if accountID, err := s.getStickySessionAccountID(ctx, groupID, sessionHash); err == nil && accountID > 0 {
+			stickyAccountID = accountID
+		}
+	}
+
+	return failsafeObserveReg.Route(ids, stickyAccountID, func(accountID int64) (int, []byte, error) {
+		account, ok := byID[accountID]
+		if !ok {
+			return 0, []byte("failsafe route selected unknown account"), ErrNoAvailableAccounts
+		}
+		selection, err := s.selectionForOpenAIFailsafeRouteAccount(ctx, groupID, sessionHash, requestedModel, &account)
+		if err != nil {
+			return 0, []byte(err.Error()), err
+		}
+		return call(selection.Account, selection)
+	})
+}
+
+func (s *OpenAIGatewayService) selectionForOpenAIFailsafeRouteAccount(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, account *Account) (*AccountSelectionResult, error) {
+	if s == nil || account == nil {
+		return nil, ErrNoAvailableAccounts
+	}
+	fresh := s.resolveFreshSchedulableOpenAIAccount(ctx, account, requestedModel, false, OpenAIEndpointCapabilityChatCompletions)
+	if fresh == nil {
+		return nil, ErrNoAvailableAccounts
+	}
+	fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, requestedModel, false, OpenAIEndpointCapabilityChatCompletions)
+	if fresh == nil || !accountSupportsOpenAICapabilities(fresh, OpenAIEndpointCapabilityChatCompletions, "") {
+		return nil, ErrNoAvailableAccounts
+	}
+
+	cfg := s.schedulingConfig()
+	accountConcurrency := s.effectiveOpenAIAccountConcurrency(fresh, requestedModel)
+	result, err := s.tryAcquireAccountSlot(ctx, fresh.ID, accountConcurrency)
+	if err == nil && result != nil && result.Acquired {
+		return s.newAcquiredSelectionResult(ctx, fresh, result.ReleaseFunc)
+	}
+	if sessionHash != "" {
+		return s.newSelectionResult(ctx, fresh, false, nil, &AccountWaitPlan{
+			AccountID:      fresh.ID,
+			MaxConcurrency: accountConcurrency,
+			Timeout:        cfg.StickySessionWaitTimeout,
+			MaxWaiting:     cfg.StickySessionMaxWaiting,
+		})
+	}
+	return s.newSelectionResult(ctx, fresh, false, nil, &AccountWaitPlan{
+		AccountID:      fresh.ID,
+		MaxConcurrency: accountConcurrency,
+		Timeout:        cfg.FallbackWaitTimeout,
+		MaxWaiting:     cfg.FallbackMaxWaiting,
+	})
 }
 
 // observeFailsafeUpstreamError 由 HandleUpstreamError 调用(observe-only)。
