@@ -10,9 +10,9 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/failsafebreaker"
 )
 
-// failsafe-go 接入 Stage 1:observe-only。
+// failsafe-go 接入 Stage 1+2a:observe-only。
 // flag GATEWAY_FAILSAFE_ROUTING 默认关 -> 全部 no-op,行为零改动。
-// 打开后仅在上游错误中央入口对结果做分类+记账+日志(不改路由),用于灰度验证分类是否准确。
+// 打开后仅对上游错误/成功做分类+记账+日志(不改路由),用于灰度验证 Tier 是否准确。
 var failsafeObserveReg = failsafebreaker.NewRegistry(failsafebreaker.DefaultConfig())
 
 func failsafeRoutingEnabled() bool {
@@ -23,7 +23,7 @@ func failsafeRoutingEnabled() bool {
 	return false
 }
 
-// observeFailsafeUpstreamError 由 HandleUpstreamError 调用(observe-only,flag 关时直接返回)。
+// observeFailsafeUpstreamError 由 HandleUpstreamError 调用(observe-only)。
 func observeFailsafeUpstreamError(account *Account, statusCode int, headers http.Header, responseBody []byte, requestedModel []string) {
 	if account == nil || !failsafeRoutingEnabled() {
 		return
@@ -41,6 +41,7 @@ func observeFailsafeUpstreamError(account *Account, statusCode int, headers http
 	res := failclass.Classify(statusCode, nil, responseBody, resetAfter)
 	failsafeObserveReg.Record(account.ID, res)
 	slog.Info("failsafe.observe",
+		"event", "error",
 		"account_id", account.ID,
 		"model", model,
 		"status", statusCode,
@@ -49,4 +50,12 @@ func observeFailsafeUpstreamError(account *Account, statusCode int, headers http
 		"penalize_hard", res.PenalizeHard,
 		"reason", res.Reason,
 	)
+}
+
+// observeFailsafeUpstreamSuccess 由成功路径调用(observe-only):记成功 -> 清掉不可用标记,Tier 恢复 Healthy。
+func observeFailsafeUpstreamSuccess(account *Account) {
+	if account == nil || !failsafeRoutingEnabled() {
+		return
+	}
+	failsafeObserveReg.Record(account.ID, failclass.Result{Category: failclass.Success})
 }
