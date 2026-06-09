@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/failclass"
@@ -33,8 +35,27 @@ func failsafeRoutingFull() bool {
 	return false
 }
 
+// openAIFailsafeRoutingGroupExcluded 安全阀: env GATEWAY_FAILSAFE_ROUTING_EXCLUDE_GROUPS
+// 逗号分隔组ID, 命中的组退回手写路由(任一组异常可秒排除, 不必全关 flag)。
+func openAIFailsafeRoutingGroupExcluded(groupID int64) bool {
+	raw := os.Getenv("GATEWAY_FAILSAFE_ROUTING_EXCLUDE_GROUPS")
+	if raw == "" {
+		return false
+	}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if n, err := strconv.ParseInt(part, 10, 64); err == nil && n == groupID {
+			return true
+		}
+	}
+	return false
+}
+
 func OpenAIFailsafeRoutingEnabledForGroup(groupID *int64) bool {
-	return failsafeRoutingFull() && groupID != nil && *groupID == openAIFailsafeRoutingGroupID
+	return failsafeRoutingFull() && groupID != nil && !openAIFailsafeRoutingGroupExcluded(*groupID)
 }
 
 type OpenAIFailsafeRouteCall func(account *Account, selection *AccountSelectionResult) (status int, body []byte, err error)

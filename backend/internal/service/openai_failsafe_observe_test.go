@@ -24,14 +24,15 @@ func TestRouteOpenAIChatCompletionsFailsafe_FlagOffNoops(t *testing.T) {
 	require.Zero(t, accountID)
 }
 
-func TestRouteOpenAIChatCompletionsFailsafe_NonTargetGroupNoops(t *testing.T) {
+func TestRouteOpenAIChatCompletionsFailsafe_ExcludedGroupNoops(t *testing.T) {
 	t.Setenv("GATEWAY_FAILSAFE_ROUTING", "1")
+	t.Setenv("GATEWAY_FAILSAFE_ROUTING_EXCLUDE_GROUPS", "777")
 	resetFailsafeObserveRegistryForTest(t)
-	groupID := openAIFailsafeRoutingGroupID + 1
+	groupID := int64(777)
 	svc := &OpenAIGatewayService{}
 
 	accountID, _, ok := svc.RouteOpenAIChatCompletionsFailsafe(context.Background(), &groupID, "", "gpt-5.1", func(account *Account, selection *AccountSelectionResult) (int, []byte, error) {
-		t.Fatal("call should not run for non-target group")
+		t.Fatal("call should not run for excluded group")
 		return http.StatusOK, nil, nil
 	})
 

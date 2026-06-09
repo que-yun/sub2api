@@ -2808,16 +2808,31 @@ func TestBuildOpenAIFailsafeTieredSelectionOrder_FlagOffKeepsLegacyOrder(t *test
 	require.Equal(t, []int64{61001, 61002, 61003}, openAIFailsafeCandidateIDs(order))
 }
 
-func TestBuildOpenAIFailsafeTieredSelectionOrder_NonTargetGroupKeepsLegacyOrder(t *testing.T) {
+func TestBuildOpenAIFailsafeTieredSelectionOrder_ExcludedGroupKeepsLegacyOrder(t *testing.T) {
 	t.Setenv("GATEWAY_FAILSAFE_ROUTING", "1")
+	t.Setenv("GATEWAY_FAILSAFE_ROUTING_EXCLUDE_GROUPS", "777")
 	resetFailsafeObserveRegistryForTest(t)
-	req := OpenAIAccountScheduleRequest{GroupID: int64PtrForTest(openAIFailsafeRoutingGroupID + 1)}
+	req := OpenAIAccountScheduleRequest{GroupID: int64PtrForTest(777)}
 	candidates := openAIFailsafeTieredSelectionTestCandidates()
 	failsafeObserveReg.Record(61001, failclass.Result{Category: failclass.AccountQuota, CooldownHint: time.Hour})
 
 	order := buildOpenAIFailsafeTieredSelectionOrder(candidates, req, openAIFailsafeTestLegacyOrder)
 
 	require.Equal(t, []int64{61001, 61002, 61003}, openAIFailsafeCandidateIDs(order))
+}
+
+// 全组语义正向覆盖: 非首灰度组(24+1)在 flag=full 下同样走分档(无排除时)。
+func TestBuildOpenAIFailsafeTieredSelectionOrder_AnyGroupAppliesTier(t *testing.T) {
+	t.Setenv("GATEWAY_FAILSAFE_ROUTING", "1")
+	resetFailsafeObserveRegistryForTest(t)
+	req := OpenAIAccountScheduleRequest{GroupID: int64PtrForTest(openAIFailsafeRoutingGroupID + 1)}
+	candidates := openAIFailsafeTieredSelectionTestCandidates()
+	failsafeObserveReg.Record(61001, failclass.Result{Category: failclass.AccountQuota, CooldownHint: time.Hour})
+	failsafeObserveReg.Record(61002, failclass.Result{Category: failclass.AccountTransient})
+
+	order := buildOpenAIFailsafeTieredSelectionOrder(candidates, req, openAIFailsafeTestLegacyOrder)
+
+	require.Equal(t, []int64{61003}, openAIFailsafeCandidateIDs(order))
 }
 
 func TestBuildOpenAIFailsafeTieredSelectionOrder_TargetGroupPrefersHealthyTier(t *testing.T) {
