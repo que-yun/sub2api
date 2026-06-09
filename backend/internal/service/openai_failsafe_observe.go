@@ -24,8 +24,17 @@ func failsafeRoutingEnabled() bool {
 	return false
 }
 
+// failsafeRoutingFull 仅在完全打开(非 shadow)时 true:控制是否真改路由;shadow 只 observe(记账+日志),不改路由。
+func failsafeRoutingFull() bool {
+	switch os.Getenv("GATEWAY_FAILSAFE_ROUTING") {
+	case "1", "true", "on":
+		return true
+	}
+	return false
+}
+
 func OpenAIFailsafeRoutingEnabledForGroup(groupID *int64) bool {
-	return failsafeRoutingEnabled() && groupID != nil && *groupID == openAIFailsafeRoutingGroupID
+	return failsafeRoutingFull() && groupID != nil && *groupID == openAIFailsafeRoutingGroupID
 }
 
 type OpenAIFailsafeRouteCall func(account *Account, selection *AccountSelectionResult) (status int, body []byte, err error)

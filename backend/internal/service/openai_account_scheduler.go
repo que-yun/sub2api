@@ -1003,7 +1003,7 @@ func buildOpenAIFailsafeTieredSelectionOrder(
 }
 
 func shouldUseOpenAIFailsafeTieredRouting(req OpenAIAccountScheduleRequest) bool {
-	return failsafeRoutingEnabled() && req.GroupID != nil && *req.GroupID == openAIFailsafeRoutingGroupID
+	return failsafeRoutingFull() && req.GroupID != nil && *req.GroupID == openAIFailsafeRoutingGroupID
 }
 
 func sortOpenAICompactRetryCandidates(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
