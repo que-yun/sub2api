@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	defaultOpenAIMessagesDispatchOpusMappedModel   = "gpt-5.4"
+	defaultOpenAIMessagesDispatchOpusMappedModel   = "gpt-5.5"
 	defaultOpenAIMessagesDispatchSonnetMappedModel = "gpt-5.3-codex"
 	defaultOpenAIMessagesDispatchHaikuMappedModel  = "gpt-5.4-mini"
 )
@@ -36,6 +36,22 @@ func normalizeOpenAIMessagesDispatchModelConfig(cfg OpenAIMessagesDispatchModelC
 		}
 		if len(out.ExactModelMappings) == 0 {
 			out.ExactModelMappings = nil
+		}
+	}
+
+	// Normalize ReverseModelMappings (GPT → Claude)
+	if len(cfg.ReverseModelMappings) > 0 {
+		out.ReverseModelMappings = make(map[string]string, len(cfg.ReverseModelMappings))
+		for requestedModel, mappedModel := range cfg.ReverseModelMappings {
+			requestedModel = strings.TrimSpace(requestedModel)
+			mappedModel = normalizeOpenAIMessagesDispatchMappedModel(mappedModel)
+			if requestedModel == "" || mappedModel == "" {
+				continue
+			}
+			out.ReverseModelMappings[requestedModel] = mappedModel
+		}
+		if len(out.ReverseModelMappings) == 0 {
+			out.ReverseModelMappings = nil
 		}
 	}
 
@@ -76,10 +92,18 @@ func (g *Group) ResolveMessagesDispatchModel(requestedModel string) string {
 	}
 
 	cfg := normalizeOpenAIMessagesDispatchModelConfig(g.MessagesDispatchModelConfig)
+	
+	// First check ReverseModelMappings (GPT → Claude)
+	if mappedModel := strings.TrimSpace(cfg.ReverseModelMappings[requestedModel]); mappedModel != "" {
+		return mappedModel
+	}
+	
+	// Then check ExactModelMappings
 	if mappedModel := strings.TrimSpace(cfg.ExactModelMappings[requestedModel]); mappedModel != "" {
 		return mappedModel
 	}
 
+	// Finally check Claude family mappings (Claude → GPT)
 	switch claudeMessagesDispatchFamily(requestedModel) {
 	case "opus":
 		if mappedModel := strings.TrimSpace(cfg.OpusMappedModel); mappedModel != "" {

@@ -15,14 +15,14 @@ var codexModelMap = map[string]string{
 	"gpt-5.5":              "gpt-5.5",
 	"gpt-5.5-pro":          "gpt-5.5-pro",
 	"codex-auto-review":    "codex-auto-review",
-	"gpt-5.4":              "gpt-5.4",
+	"gpt-5.4":              "gpt-5.5",
 	"gpt-5.4-mini":         "gpt-5.4-mini",
-	"gpt-5.4-none":         "gpt-5.4",
-	"gpt-5.4-low":          "gpt-5.4",
-	"gpt-5.4-medium":       "gpt-5.4",
-	"gpt-5.4-high":         "gpt-5.4",
-	"gpt-5.4-xhigh":        "gpt-5.4",
-	"gpt-5.4-chat-latest":  "gpt-5.4",
+	"gpt-5.4-none":         "gpt-5.5",
+	"gpt-5.4-low":          "gpt-5.5",
+	"gpt-5.4-medium":       "gpt-5.5",
+	"gpt-5.4-high":         "gpt-5.5",
+	"gpt-5.4-xhigh":        "gpt-5.5",
+	"gpt-5.4-chat-latest":  "gpt-5.5",
 	"gpt-5.3":              "gpt-5.3-codex",
 	"gpt-5.3-none":         "gpt-5.3-codex",
 	"gpt-5.3-low":          "gpt-5.3-codex",
@@ -41,10 +41,10 @@ var codexModelMap = map[string]string{
 	"gpt-5.2-medium":       "gpt-5.2",
 	"gpt-5.2-high":         "gpt-5.2",
 	"gpt-5.2-xhigh":        "gpt-5.2",
-	"gpt-5":                "gpt-5.4",
-	"gpt-5-mini":           "gpt-5.4",
-	"gpt-5-nano":           "gpt-5.4",
-	"gpt-5.1":              "gpt-5.4",
+	"gpt-5":                "gpt-5.5",
+	"gpt-5-mini":           "gpt-5.5",
+	"gpt-5-nano":           "gpt-5.5",
+	"gpt-5.1":              "gpt-5.5",
 	"gpt-5.1-codex":        "gpt-5.3-codex",
 	"gpt-5.1-codex-max":    "gpt-5.3-codex",
 	"gpt-5.1-codex-mini":   "gpt-5.3-codex",
@@ -66,7 +66,7 @@ var codexVersionModelPrefixes = []struct {
 	{prefix: "gpt-5.4-nano", target: "gpt-5.4-nano"},
 	{prefix: "gpt-5.5-pro", target: "gpt-5.5-pro"},
 	{prefix: "gpt-5.5", target: "gpt-5.5"},
-	{prefix: "gpt-5.4", target: "gpt-5.4"},
+	{prefix: "gpt-5.4", target: "gpt-5.5"},
 	{prefix: "gpt-5.2", target: "gpt-5.2"},
 }
 
@@ -509,7 +509,7 @@ func stringifyCodexContentText(value any) string {
 func normalizeCodexModel(model string) string {
 	model = strings.TrimSpace(model)
 	if model == "" {
-		return "gpt-5.4"
+		return "gpt-5.5"
 	}
 	if mapped, ok := normalizeKnownCodexModel(model); ok {
 		return mapped

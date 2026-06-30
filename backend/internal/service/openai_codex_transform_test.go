@@ -895,7 +895,7 @@ func TestApplyCodexOAuthTransform_EmptyInput(t *testing.T) {
 
 func TestNormalizeCodexModel_Gpt53(t *testing.T) {
 	cases := map[string]string{
-		"gpt-5.4":                   "gpt-5.4",
+		"gpt-5.4":                   "gpt-5.5",
 		"gpt5.5":                    "gpt-5.5",
 		"openai/gpt5.5":             "gpt-5.5",
 		"gpt-5.5-pro":               "gpt-5.5-pro",
@@ -903,10 +903,10 @@ func TestNormalizeCodexModel_Gpt53(t *testing.T) {
 		"openai/gpt5.5-pro":         "gpt-5.5-pro",
 		"gpt-5.5-pro-high":          "gpt-5.5-pro",
 		"codex-auto-review":         "codex-auto-review",
-		"gpt5.4":                    "gpt-5.4",
-		"gpt-5.4-high":              "gpt-5.4",
-		"gpt-5.4-chat-latest":       "gpt-5.4",
-		"gpt 5.4":                   "gpt-5.4",
+		"gpt5.4":                    "gpt-5.5",
+		"gpt-5.4-high":              "gpt-5.5",
+		"gpt-5.4-chat-latest":       "gpt-5.5",
+		"gpt 5.4":                   "gpt-5.5",
 		"gpt-5.4-mini":              "gpt-5.4-mini",
 		"gpt5.4-mini":               "gpt-5.4-mini",
 		"gpt5.4mini":                "gpt-5.4-mini",
@@ -933,11 +933,11 @@ func TestNormalizeCodexModel_Gpt53(t *testing.T) {
 
 func TestNormalizeCodexModel_RemovedModelsFallbackToSupportedTargets(t *testing.T) {
 	cases := map[string]string{
-		"":                   "gpt-5.4",
-		"gpt-5":              "gpt-5.4",
-		"gpt-5-mini":         "gpt-5.4",
-		"gpt-5-nano":         "gpt-5.4",
-		"gpt-5.1":            "gpt-5.4",
+		"":                   "gpt-5.5",
+		"gpt-5":              "gpt-5.5",
+		"gpt-5-mini":         "gpt-5.5",
+		"gpt-5-nano":         "gpt-5.5",
+		"gpt-5.1":            "gpt-5.5",
 		"gpt-5.1-codex":      "gpt-5.3-codex",
 		"gpt-5.1-codex-max":  "gpt-5.3-codex",
 		"gpt-5.1-codex-mini": "gpt-5.3-codex",

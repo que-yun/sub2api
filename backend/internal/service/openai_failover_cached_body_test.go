@@ -45,8 +45,8 @@ func TestOpenAIGatewayService_Forward_FailoverReparsesCachedBodyForNextAccount(t
 			name:         "first account has mapping second account has none",
 			requestModel: "gpt-5.4-high",
 			firstMapping: map[string]any{"gpt-5.4-high": "gpt-5.4"},
-			wantFirst:    "gpt-5.4",
-			wantSecond:   "gpt-5.4",
+			wantFirst:    "gpt-5.5",
+			wantSecond:   "gpt-5.5",
 		},
 		{
 			name:          "first account has no mapping second account has mapping",

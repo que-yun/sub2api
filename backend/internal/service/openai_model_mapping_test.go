@@ -268,7 +268,7 @@ func TestNormalizeOpenAIModelForUpstream(t *testing.T) {
 			name:    "oauth normalizes known codex alias",
 			account: &Account{Type: AccountTypeOAuth},
 			model:   "gpt-5.4-high",
-			want:    "gpt-5.4",
+			want:    "gpt-5.5",
 		},
 		{
 			name:    "oauth preserves GPT-5.5 Pro model",
