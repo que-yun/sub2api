@@ -71,13 +71,10 @@ func (s *OpenAIGatewayService) RouteOpenAIChatCompletionsFailsafe(
 		return 0, failclass.Result{}, false
 	}
 	ctx = s.withOpenAIQuotaAutoPauseContext(ctx)
-	if open, _, _ := s.IsOpenAIGroupModelCircuitOpenForContext(ctx, groupID, requestedModel); open {
-		return 0, failclass.Result{}, false
-	}
 	if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
 		return 0, failclass.Result{}, false
 	}
-	accounts, err := s.listSchedulableAccounts(ctx, groupID)
+	accounts, err := s.listSchedulableAccounts(ctx, groupID, PlatformOpenAI)
 	if err != nil || len(accounts) == 0 {
 		return 0, failclass.Result{}, false
 	}
@@ -92,7 +89,7 @@ func (s *OpenAIGatewayService) RouteOpenAIChatCompletionsFailsafe(
 		if !accountSupportsOpenAICapabilities(&account, OpenAIEndpointCapabilityChatCompletions, "") {
 			continue
 		}
-		if requestedModel != "" && !isOpenAIAccountEligibleForRequest(ctx, &account, requestedModel, false, OpenAIEndpointCapabilityChatCompletions) {
+		if requestedModel != "" && !isOpenAICompatibleAccountEligibleForRequest(ctx, &account, PlatformOpenAI, requestedModel, false, OpenAIEndpointCapabilityChatCompletions) {
 			continue
 		}
 		if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, &account, requestedModel, false) {
@@ -129,17 +126,17 @@ func (s *OpenAIGatewayService) selectionForOpenAIFailsafeRouteAccount(ctx contex
 	if s == nil || account == nil {
 		return nil, ErrNoAvailableAccounts
 	}
-	fresh := s.resolveFreshSchedulableOpenAIAccount(ctx, account, requestedModel, false, OpenAIEndpointCapabilityChatCompletions)
+	fresh := s.resolveFreshSchedulableOpenAIAccount(ctx, account, PlatformOpenAI, requestedModel, false, OpenAIEndpointCapabilityChatCompletions)
 	if fresh == nil {
 		return nil, ErrNoAvailableAccounts
 	}
-	fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, requestedModel, false, OpenAIEndpointCapabilityChatCompletions)
+	fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, PlatformOpenAI, requestedModel, false, OpenAIEndpointCapabilityChatCompletions)
 	if fresh == nil || !accountSupportsOpenAICapabilities(fresh, OpenAIEndpointCapabilityChatCompletions, "") {
 		return nil, ErrNoAvailableAccounts
 	}
 
 	cfg := s.schedulingConfig()
-	accountConcurrency := s.effectiveOpenAIAccountConcurrency(fresh, requestedModel)
+	accountConcurrency := fresh.Concurrency
 	result, err := s.tryAcquireAccountSlot(ctx, fresh.ID, accountConcurrency)
 	if err == nil && result != nil && result.Acquired {
 		return s.newAcquiredSelectionResult(ctx, fresh, result.ReleaseFunc)
