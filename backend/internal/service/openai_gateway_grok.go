@@ -171,7 +171,46 @@ func patchGrokResponsesBody(body []byte, upstreamModel string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	out, err = stripGrokUnsupportedReasoningItems(out)
+	if err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// stripGrokUnsupportedReasoningItems 移除 input 中携带 encrypted_content 的 reasoning 项。
+//
+// 背景：Codex 以 OpenAI Responses 协议工作，会在每轮把上一轮返回的 reasoning.encrypted_content
+// 原样回传。但 grok/xAI 无法解码 Codex 从普通 /v1/responses 回传的加密推理内容 —— 第二轮起会返回
+// 400 "Could not decode the compaction blob. Ensure it is unmodified from the compact response."
+// 已验证 blob 字节在请求/响应两侧均未被 sub2api 改动、token 也未轮换，属于 grok 协议不兼容。
+//
+// 因此在转发给 grok 前剥离这些 reasoning 项，让 grok 用普通消息历史续接对话。
+// 代价：损失跨轮的显式推理链延续，但对话内容与正确性不受影响；否则每轮第二次请求必定失败。
+// 仅按 encrypted_content 判定，只影响 grok 加密推理场景，不误删普通 message/工具项。
+func stripGrokUnsupportedReasoningItems(body []byte) ([]byte, error) {
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return body, nil
+	}
+	kept := make([]json.RawMessage, 0, len(input.Array()))
+	removed := false
+	for _, item := range input.Array() {
+		if item.Get("type").String() == "reasoning" && item.Get("encrypted_content").Exists() {
+			removed = true
+			continue
+		}
+		// 用 RawMessage 保留每个保留项的原始字节，不重排/转义。
+		kept = append(kept, json.RawMessage(item.Raw))
+	}
+	if !removed {
+		return body, nil
+	}
+	encoded, err := json.Marshal(kept)
+	if err != nil {
+		return nil, err
+	}
+	return sjson.SetRawBytes(body, "input", encoded)
 }
 
 var grokResponsesUnsupportedRecursiveFields = map[string]struct{}{
