@@ -910,6 +910,7 @@ func TestHandleGrokAccountUpstreamErrorTempUnschedulesReadinessStates(t *testing
 		name            string
 		status          int
 		headers         http.Header
+		body            []byte
 		wantReason      string
 		wantMinCooldown time.Duration
 		wantMaxCooldown time.Duration
@@ -936,6 +937,14 @@ func TestHandleGrokAccountUpstreamErrorTempUnschedulesReadinessStates(t *testing
 			wantMinCooldown: 44 * time.Second,
 			wantMaxCooldown: 46 * time.Second,
 		},
+		{
+			name:   "free usage exhausted rolling 24h",
+			status: http.StatusTooManyRequests,
+			body: []byte(`{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for model grok-4.5-build-free for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 1033696/1000000."}`),
+			wantReason:      "grok free usage exhausted (rolling window)",
+			wantMinCooldown: 24*time.Hour - time.Second,
+			wantMaxCooldown: 24*time.Hour + time.Second,
+		},
 	}
 
 	for _, tt := range tests {
@@ -945,7 +954,7 @@ func TestHandleGrokAccountUpstreamErrorTempUnschedulesReadinessStates(t *testing
 			svc := &OpenAIGatewayService{accountRepo: repo}
 			before := time.Now()
 
-			svc.handleGrokAccountUpstreamError(context.Background(), account, tt.status, tt.headers, nil)
+			svc.handleGrokAccountUpstreamError(context.Background(), account, tt.status, tt.headers, tt.body)
 
 			require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 			require.Equal(t, 1, repo.tempUnschedCalls)
@@ -953,6 +962,14 @@ func TestHandleGrokAccountUpstreamErrorTempUnschedulesReadinessStates(t *testing
 			require.Equal(t, tt.wantReason, repo.lastTempUnschedReason)
 			require.True(t, repo.lastTempUnschedUntil.After(before.Add(tt.wantMinCooldown)))
 			require.True(t, repo.lastTempUnschedUntil.Before(before.Add(tt.wantMaxCooldown)))
+			wantRateLimit := strings.Contains(strings.ToLower(tt.wantReason), "rate limited") || strings.Contains(strings.ToLower(tt.wantReason), "free usage exhausted")
+			if wantRateLimit {
+				require.Equal(t, 1, repo.rateLimitCalls)
+				require.Equal(t, account.ID, repo.lastRateLimitID)
+				require.WithinDuration(t, repo.lastTempUnschedUntil, repo.lastRateLimitUntil, time.Second)
+			} else {
+				require.Equal(t, 0, repo.rateLimitCalls)
+			}
 		})
 	}
 }

@@ -140,3 +140,13 @@ docs/*
 frontend/coverage/
 aicodex
 output/
+
+# ===================
+# 本机部署产物 / 运行时数据（不入库）
+# ===================
+deploy/out/
+deploy/data-host/
+data/
+deploy/*.env.pre-consolidation
+deploy/host-run.env.*
+!deploy/gzip-front-proxy.env.example

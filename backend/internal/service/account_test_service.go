@@ -668,7 +668,8 @@ func (s *AccountTestService) testGrokAccountConnection(c *gin.Context, account *
 
 	testModelID := strings.TrimSpace(modelID)
 	if testModelID == "" {
-		testModelID = "grok-4.3"
+		// Free Build and current pool primarily expose/use grok-4.5.
+		testModelID = "grok-4.5"
 	}
 	if mapped := strings.TrimSpace(account.GetMappedModel(testModelID)); mapped != "" {
 		testModelID = mapped
@@ -709,6 +710,7 @@ func (s *AccountTestService) testGrokAccountConnection(c *gin.Context, account *
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Authorization", "Bearer "+authToken)
 	req.Header.Set("User-Agent", "sub2api-grok/1.0")
+	xai.MaybeApplyCLIChatProxyHeaders(req.Header, account.GetGrokBaseURL())
 
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {

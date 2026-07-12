@@ -5,6 +5,7 @@ package xai
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -60,4 +61,50 @@ func TestObserveQuotaHeadersRecordsNoHeaderProbe(t *testing.T) {
 	require.Empty(t, snapshot.Headers)
 	require.Nil(t, snapshot.Requests)
 	require.Nil(t, snapshot.Tokens)
+}
+
+
+func TestParseFreeUsageExhaustedBody(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for model grok-4.5-build-free for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 1033696/1000000. Upgrade to a Grok subscription for higher limits: https://grok.com/supergrok"}`)
+	info := ParseFreeUsageExhaustedBody(body)
+	require.NotNil(t, info)
+	require.True(t, info.Exhausted)
+	require.Equal(t, FreeUsageErrorCodeExhausted, info.ErrorCode)
+	require.Equal(t, FreeUsageWindowRolling24h, info.Window)
+	require.Equal(t, 24*time.Hour, info.Cooldown)
+	require.Equal(t, "grok-4.5-build-free", info.Model)
+	require.NotNil(t, info.ActualTokens)
+	require.Equal(t, int64(1033696), *info.ActualTokens)
+	require.NotNil(t, info.LimitTokens)
+	require.Equal(t, int64(1000000), *info.LimitTokens)
+}
+
+func TestResolveGrokCooldownFreeUsageExhausted(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for model grok-4.5-build-free for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 1033696/1000000."}`)
+	headers := http.Header{}
+	headers.Set("x-ratelimit-limit-tokens", "1000000")
+	headers.Set("x-ratelimit-remaining-tokens", "0")
+	cooldown, reason, freeInfo, snapshot := ResolveGrokCooldown(http.StatusTooManyRequests, headers, body)
+	require.NotNil(t, freeInfo)
+	require.True(t, freeInfo.Exhausted)
+	require.Equal(t, 24*time.Hour, cooldown)
+	require.Contains(t, reason, "free usage exhausted")
+	require.NotNil(t, snapshot)
+	require.True(t, snapshot.FreeUsageExhausted)
+	require.Equal(t, FreeUsageWindowRolling24h, snapshot.FreeUsageWindow)
+}
+
+func TestResolveGrokCooldownPlainRateLimit(t *testing.T) {
+	t.Parallel()
+
+	headers := http.Header{}
+	headers.Set("Retry-After", "45")
+	cooldown, reason, freeInfo, _ := ResolveGrokCooldown(http.StatusTooManyRequests, headers, []byte(`{"error":"rate limited"}`))
+	require.Nil(t, freeInfo)
+	require.Equal(t, 45*time.Second, cooldown)
+	require.Equal(t, "grok rate limited", reason)
 }

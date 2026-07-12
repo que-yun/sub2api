@@ -67,7 +67,23 @@ func (f *GrokQuotaFetcher) BuildUsageInfo(account *Account) *UsageInfo {
 			usage.GrokEntitlementStatus = "forbidden"
 		}
 	case 429:
-		usage.ErrorCode = "rate_limited"
+		if snapshot.FreeUsageExhausted {
+			usage.ErrorCode = "free_usage_exhausted"
+			if usage.GrokEntitlementStatus == "" {
+				usage.GrokEntitlementStatus = "free_usage_exhausted"
+			}
+			if usage.Error == "" {
+				usage.Error = "Grok free Build usage exhausted over rolling window"
+			}
+		} else {
+			usage.ErrorCode = "rate_limited"
+		}
+	}
+	if snapshot.FreeUsageExhausted {
+		usage.ErrorCode = "free_usage_exhausted"
+		if usage.GrokEntitlementStatus == "" {
+			usage.GrokEntitlementStatus = "free_usage_exhausted"
+		}
 	}
 	return usage
 }

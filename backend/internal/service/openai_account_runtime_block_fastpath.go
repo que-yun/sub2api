@@ -181,12 +181,19 @@ func (s *OpenAIGatewayService) isOpenAIOAuth429Storm() bool {
 	return s.openaiOAuth429WindowCount.Load() >= openAIOAuth429StormThreshold
 }
 
+// ShouldStopOpenAIOAuth429Failover decides whether to abort account switching after 429.
+//
+// Free Grok Build pools intentionally keep switching on per-account free-usage
+// exhaustion so the request can land on the next healthy free account.
+// Only OpenAI OAuth storm mode may short-circuit failover after the first switch.
 func (s *OpenAIGatewayService) ShouldStopOpenAIOAuth429Failover(account *Account, statusCode int, failedSwitches int) bool {
 	if statusCode != http.StatusTooManyRequests || failedSwitches < openAIOAuth429StormMaxAccountSwitches {
 		return false
 	}
+	// Grok free/paid OAuth accounts must keep failing over to the next account.
+	// Free-usage-exhausted is account-scoped (rolling window), not a pool-wide outage.
 	if isGrokOAuthAccount(account) {
-		return true
+		return false
 	}
 	if !isOpenAIOAuthAccount(account) {
 		return false

@@ -674,6 +674,7 @@ func buildGrokResponsesRequest(ctx context.Context, c *gin.Context, account *Acc
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("User-Agent", "sub2api-grok/1.0")
+	xai.MaybeApplyCLIChatProxyHeaders(req.Header, account.GetGrokBaseURL())
 	if c != nil {
 		if v := c.GetHeader("OpenAI-Beta"); strings.TrimSpace(v) != "" {
 			req.Header.Set("OpenAI-Beta", v)
@@ -704,33 +705,114 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 	case http.StatusForbidden:
 		s.tempUnscheduleGrok(ctx, account, 30*time.Minute, "grok entitlement or subscription tier denied")
 	case http.StatusTooManyRequests:
-		cooldown := 2 * time.Minute
-		if snapshot := xai.ParseQuotaHeaders(headers, statusCode); snapshot != nil && snapshot.RetryAfterSeconds != nil && *snapshot.RetryAfterSeconds > 0 {
-			cooldown = time.Duration(*snapshot.RetryAfterSeconds) * time.Second
+		// Free Build exhaustion is a rolling window (body: subscription:free-usage-exhausted).
+		// Plain RPM 429 still uses Retry-After / short cooldown.
+		cooldown, reason, freeInfo, snapshot := xai.ResolveGrokCooldown(statusCode, headers, responseBody)
+		if snapshot != nil {
+			s.updateGrokUsageSnapshot(ctx, account.ID, snapshot)
 		}
-		s.tempUnscheduleGrok(ctx, account, cooldown, "grok rate limited")
+		if freeInfo != nil && freeInfo.Exhausted {
+			// Keep extra free-usage metadata for quota UI / ops.
+			if s.accountRepo != nil {
+				extra := map[string]any{
+					"grok_free_usage_exhausted": true,
+					"grok_free_usage_error_code": freeInfo.ErrorCode,
+					"grok_free_usage_window":     freeInfo.Window,
+					"grok_free_usage_model":      freeInfo.Model,
+				}
+				if freeInfo.ActualTokens != nil {
+					extra["grok_free_usage_actual_tokens"] = *freeInfo.ActualTokens
+				}
+				if freeInfo.LimitTokens != nil {
+					extra["grok_free_usage_limit_tokens"] = *freeInfo.LimitTokens
+				}
+				if cooldown > 0 {
+					extra["grok_free_usage_cooldown_until"] = time.Now().UTC().Add(cooldown).Format(time.RFC3339)
+				}
+				stateCtx, cancel := openAIAccountStateContext(ctx)
+				_ = s.accountRepo.UpdateExtra(stateCtx, account.ID, extra)
+				cancel()
+			}
+		}
+		if cooldown <= 0 {
+			cooldown = 2 * time.Minute
+		}
+		if strings.TrimSpace(reason) == "" {
+			reason = "grok rate limited"
+		}
+		s.tempUnscheduleGrok(ctx, account, cooldown, reason)
 	default:
+		// Some free-usage exhaustion responses may arrive as 403; still parse body.
+		if freeInfo := xai.ParseFreeUsageExhaustedBody(responseBody); freeInfo != nil && freeInfo.Exhausted {
+			cooldown := freeInfo.Cooldown
+			if cooldown <= 0 {
+				cooldown = xai.DefaultFreeUsageCooldown
+			}
+			snapshot := xai.ParseQuotaHeaders(headers, statusCode)
+			if snapshot == nil {
+				snapshot = &xai.QuotaSnapshot{StatusCode: statusCode, UpdatedAt: time.Now().UTC().Format(time.RFC3339)}
+			}
+			freeInfo.ApplyToSnapshot(snapshot, time.Now())
+			s.updateGrokUsageSnapshot(ctx, account.ID, snapshot)
+			s.tempUnscheduleGrok(ctx, account, cooldown, "grok free usage exhausted (rolling window)")
+			return
+		}
 		if statusCode >= 500 {
 			s.tempUnscheduleGrok(ctx, account, 2*time.Minute, "grok upstream temporary error")
 		}
 	}
-	_ = responseBody
 }
 
+// tempUnscheduleGrok cools a Grok account after upstream errors.
+//
+// Rate-limit style failures (429 / free-usage-exhausted) write rate_limit_reset_at so
+// admin UI shows "限流" with an auto-resume time. Auth / entitlement / transport
+// failures keep temp_unschedulable (temporary unschedulable).
 func (s *OpenAIGatewayService) tempUnscheduleGrok(ctx context.Context, account *Account, cooldown time.Duration, reason string) {
 	if s == nil || account == nil {
 		return
 	}
 	until := time.Now().Add(cooldown)
+	// Do not shorten an already longer pause from either lane.
 	if account.TempUnschedulableUntil != nil && account.TempUnschedulableUntil.After(until) {
 		until = *account.TempUnschedulableUntil
 	}
-	s.BlockAccountScheduling(account, until, reason)
-	if s.accountRepo != nil {
-		stateCtx, cancel := openAIAccountStateContext(ctx)
-		defer cancel()
-		_ = s.accountRepo.SetTempUnschedulable(stateCtx, account.ID, until, reason)
+	if account.RateLimitResetAt != nil && account.RateLimitResetAt.After(until) {
+		until = *account.RateLimitResetAt
 	}
+	s.BlockAccountScheduling(account, until, reason)
+	if s.accountRepo == nil {
+		return
+	}
+	stateCtx, cancel := openAIAccountStateContext(ctx)
+	defer cancel()
+
+	if isGrokRateLimitCooldownReason(reason) {
+		// Persist as rate-limit so UI badge is "限流", while also stamping reason into
+		// temp_unschedulable_reason for operators who inspect free-usage exhaustion.
+		_ = s.accountRepo.SetRateLimited(stateCtx, account.ID, until)
+		_ = s.accountRepo.SetTempUnschedulable(stateCtx, account.ID, until, reason)
+		account.RateLimitResetAt = &until
+		now := time.Now()
+		account.RateLimitedAt = &now
+		account.TempUnschedulableUntil = &until
+		account.TempUnschedulableReason = reason
+		return
+	}
+
+	_ = s.accountRepo.SetTempUnschedulable(stateCtx, account.ID, until, reason)
+	account.TempUnschedulableUntil = &until
+	account.TempUnschedulableReason = reason
+}
+
+func isGrokRateLimitCooldownReason(reason string) bool {
+	r := strings.ToLower(strings.TrimSpace(reason))
+	if r == "" {
+		return false
+	}
+	return strings.Contains(r, "rate limited") ||
+		strings.Contains(r, "free usage exhausted") ||
+		strings.Contains(r, "free-usage-exhausted")
 }
 
 func ptrStringOrNil(value string) *string {
