@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -10,18 +11,6 @@ import (
 )
 
 const grokQuotaSnapshotExtraKey = "grok_usage_snapshot"
-
-// grokNegativeSnapshotFreshWindow 限定 401/403 这类"负面"快照多久内才被采信为实时权限状态。
-//
-// 背景：单次 403(permission-denied)/401 会写入快照并永久钉住，直到下一次成功探测覆盖。
-// xAI 侧的权限判定会波动(例如故障窗口内短暂 403、之后又放行)，若继续据此显示 forbidden，
-// 会把实际已恢复可用的账号误标为封禁(账号 status 是"正常"绿灯却挂红色 forbidden，自相矛盾)。
-//
-// 正在被调度尝试的账号，每次转发都会用真实响应刷新快照(见 openai_gateway_grok.go 的
-// updateGrokUsageSnapshot)，因此不会陈旧；只有"已恢复但长期无流量复测"的账号会挂着旧的
-// 负面快照。超过该窗口即视为陈旧、不再断言 forbidden/needs_reauth，交由下一次真实流量或主动
-// 探测(/quota)刷新。
-const grokNegativeSnapshotFreshWindow = 15 * time.Minute
 
 type GrokQuotaFetcher struct{}
 
@@ -37,96 +26,148 @@ func (f *GrokQuotaFetcher) BuildUsageInfo(account *Account) *UsageInfo {
 	}
 	if account == nil {
 		usage.ErrorCode = "quota_unknown"
-		usage.Error = "Grok quota is unknown until the first upstream response includes xAI rate-limit headers"
+		usage.Error = "Grok quota is unknown until billing is probed or an upstream response includes xAI rate-limit headers"
 		return usage
 	}
 
+	billing, _ := grokBillingSnapshotFromExtra(account.Extra)
 	snapshot, err := grokQuotaSnapshotFromExtra(account.Extra)
+	if billing != nil {
+		usage.GrokBilling = billing
+		if billing.Plan != "" {
+			usage.SubscriptionTier = billing.Plan
+			usage.SubscriptionTierRaw = billing.Plan
+		}
+		if parsedAt, parseErr := time.Parse(time.RFC3339, billing.UpdatedAt); parseErr == nil {
+			usage.UpdatedAt = &parsedAt
+		}
+		if billing.FetchedAt != "" {
+			usage.GrokLastQuotaProbeAt = billing.FetchedAt
+		}
+		usage.GrokQuotaSnapshotState = "billing_observed"
+		usage.GrokLastStatusCode = billing.StatusCode
+		switch billing.StatusCode {
+		case 401:
+			usage.NeedsReauth = true
+			usage.ErrorCode = "unauthenticated"
+		case 403:
+			usage.IsForbidden = true
+			usage.ForbiddenType = "forbidden"
+			usage.ErrorCode = "forbidden"
+		case 429:
+			usage.ErrorCode = "rate_limited"
+		}
+	}
+
 	if err != nil || snapshot == nil {
-		usage.ErrorCode = "quota_unknown"
-		usage.Error = "Grok quota is unknown until the first upstream response includes xAI rate-limit headers"
+		applyGrokCredentialUsageFallback(usage, account)
+		if billing == nil {
+			usage.ErrorCode = "quota_unknown"
+			usage.Error = "Grok quota is unknown until billing is probed or an upstream response includes xAI rate-limit headers"
+		}
 		return usage
 	}
 
-	if parsedAt, err := time.Parse(time.RFC3339, snapshot.UpdatedAt); err == nil {
-		usage.UpdatedAt = &parsedAt
+	if parsedAt, parseErr := time.Parse(time.RFC3339, snapshot.UpdatedAt); parseErr == nil {
+		if billing == nil || usage.UpdatedAt == nil || parsedAt.After(*usage.UpdatedAt) {
+			usage.UpdatedAt = &parsedAt
+		}
 	}
 	usage.GrokRequestQuota = snapshot.Requests
 	usage.GrokTokenQuota = snapshot.Tokens
 	usage.GrokRetryAfterSeconds = snapshot.RetryAfterSeconds
-	usage.SubscriptionTier = snapshot.SubscriptionTier
-	usage.SubscriptionTierRaw = snapshot.SubscriptionTier
-	usage.GrokEntitlementStatus = snapshot.EntitlementStatus
-	usage.GrokLastQuotaProbeAt = snapshot.LastProbeAt
+	if usage.SubscriptionTier == "" {
+		usage.SubscriptionTier = snapshot.SubscriptionTier
+		usage.SubscriptionTierRaw = snapshot.SubscriptionTier
+	}
+	if usage.GrokEntitlementStatus == "" {
+		usage.GrokEntitlementStatus = snapshot.EntitlementStatus
+	}
+	if usage.GrokLastQuotaProbeAt == "" {
+		usage.GrokLastQuotaProbeAt = snapshot.LastProbeAt
+	}
 	usage.GrokLastHeadersSeenAt = snapshot.LastHeadersSeenAt
-	usage.GrokLastStatusCode = snapshot.StatusCode
+	if snapshot.StatusCode >= http.StatusBadRequest || usage.GrokLastStatusCode == 0 {
+		usage.GrokLastStatusCode = snapshot.StatusCode
+	}
 	if snapshot.HasObservedHeaders() {
-		usage.GrokQuotaSnapshotState = "observed"
-	} else {
+		if usage.GrokQuotaSnapshotState == "" {
+			usage.GrokQuotaSnapshotState = "observed"
+		}
+	} else if billing == nil {
 		usage.GrokQuotaSnapshotState = "no_headers"
 		usage.ErrorCode = "quota_unknown"
 		usage.Error = "No xAI quota headers observed on the latest Grok probe"
 	}
 
-	negativeSnapshotFresh := grokSnapshotWithinWindow(snapshot, now, grokNegativeSnapshotFreshWindow)
-	switch snapshot.StatusCode {
-	case 401:
-		if negativeSnapshotFresh {
+	if usage.ErrorCode == "" {
+		switch snapshot.StatusCode {
+		case 401:
 			usage.NeedsReauth = true
 			usage.ErrorCode = "unauthenticated"
-		} else {
-			// 陈旧 401：token 可能已刷新恢复，不再断言需要重新授权。
-			usage.GrokQuotaSnapshotState = "stale"
-		}
-	case 403:
-		if negativeSnapshotFresh {
+		case 403:
 			usage.IsForbidden = true
 			usage.ForbiddenType = "forbidden"
 			usage.ErrorCode = "forbidden"
 			if usage.GrokEntitlementStatus == "" {
 				usage.GrokEntitlementStatus = "forbidden"
 			}
-		} else {
-			// 陈旧 403：xAI 侧可能已恢复放行，继续显示 forbidden 会误标实际可用的账号。
-			usage.GrokQuotaSnapshotState = "stale"
-		}
-	case 429:
-		if snapshot.FreeUsageExhausted {
-			usage.ErrorCode = "free_usage_exhausted"
-			if usage.GrokEntitlementStatus == "" {
-				usage.GrokEntitlementStatus = "free_usage_exhausted"
-			}
-			if usage.Error == "" {
-				usage.Error = "Grok free Build usage exhausted over rolling window"
-			}
-		} else {
+		case 429:
 			usage.ErrorCode = "rate_limited"
 		}
 	}
-	if snapshot.FreeUsageExhausted {
-		usage.ErrorCode = "free_usage_exhausted"
-		if usage.GrokEntitlementStatus == "" {
-			usage.GrokEntitlementStatus = "free_usage_exhausted"
-		}
-	}
+	applyGrokCredentialUsageFallback(usage, account)
 	return usage
 }
 
-// grokSnapshotWithinWindow 报告快照的观测时间是否落在 now 之前的 window 窗口内。
-// 无有效时间戳时保守返回 false（视为陈旧），避免解析失败反而让旧负面状态一直生效。
-func grokSnapshotWithinWindow(snapshot *xai.QuotaSnapshot, now time.Time, window time.Duration) bool {
-	if snapshot == nil {
-		return false
+func applyGrokCredentialUsageFallback(usage *UsageInfo, account *Account) {
+	if usage == nil || account == nil {
+		return
 	}
-	ts := strings.TrimSpace(snapshot.UpdatedAt)
-	if ts == "" {
-		return false
+	if usage.SubscriptionTier == "" {
+		tier := strings.TrimSpace(account.GetCredential("subscription_tier"))
+		usage.SubscriptionTier = tier
+		usage.SubscriptionTierRaw = tier
 	}
-	parsed, err := time.Parse(time.RFC3339, ts)
-	if err != nil {
-		return false
+	if usage.GrokEntitlementStatus == "" {
+		usage.GrokEntitlementStatus = strings.TrimSpace(account.GetCredential("entitlement_status"))
 	}
-	return !parsed.After(now) && now.Sub(parsed) <= window
+}
+
+func grokBillingSnapshotFromExtra(extra map[string]any) (*xai.BillingSummary, error) {
+	if extra == nil {
+		return nil, nil
+	}
+	raw, ok := extra[grokBillingExtraKey]
+	if !ok || raw == nil {
+		return nil, nil
+	}
+	switch snapshot := raw.(type) {
+	case *xai.BillingSummary:
+		return snapshot, nil
+	case xai.BillingSummary:
+		return &snapshot, nil
+	case map[string]any:
+		data, err := json.Marshal(snapshot)
+		if err != nil {
+			return nil, err
+		}
+		var out xai.BillingSummary
+		if err := json.Unmarshal(data, &out); err != nil {
+			return nil, err
+		}
+		return &out, nil
+	default:
+		data, err := json.Marshal(raw)
+		if err != nil {
+			return nil, fmt.Errorf("marshal grok billing snapshot: %w", err)
+		}
+		var out xai.BillingSummary
+		if err := json.Unmarshal(data, &out); err != nil {
+			return nil, err
+		}
+		return &out, nil
+	}
 }
 
 func grokQuotaSnapshotFromExtra(extra map[string]any) (*xai.QuotaSnapshot, error) {

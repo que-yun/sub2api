@@ -55,31 +55,18 @@ describe('useGrokOAuth.exchangeAuthCode', () => {
 })
 
 describe('useGrokOAuth.buildCredentials', () => {
-  it('preserves Grok referrer and OAuth token response extras for account persistence', () => {
+  it('persists the Grok CLI subscription proxy for OAuth inference', () => {
     const oauth = useGrokOAuth()
 
     const credentials = oauth.buildCredentials({
       access_token: 'access-token',
-      refresh_token: 'refresh-token',
       token_type: 'Bearer',
-      expires_at: 123456,
+      expires_at: 1_900_000_000,
       client_id: 'client-id',
       scope: 'openid grok-cli:access',
-      referrer: 'grok-build',
-      oauth_token_response_extra: { team_id: 'team-123' },
-      oauth_token_response_extra_keys: ['team_id'],
-      oauth_token_response_summary: {
-        referrer: 'grok-build',
-        extra_keys: ['team_id']
-      }
+      email: 'grok@example.com'
     })
 
-    expect(credentials.referrer).toBe('grok-build')
-    expect(credentials.oauth_token_response_extra).toEqual({ team_id: 'team-123' })
-    expect(credentials.oauth_token_response_extra_keys).toEqual(['team_id'])
-    expect(credentials.oauth_token_response_summary).toEqual({
-      referrer: 'grok-build',
-      extra_keys: ['team_id']
-    })
+    expect(credentials.base_url).toBe('https://cli-chat-proxy.grok.com/v1')
   })
 })

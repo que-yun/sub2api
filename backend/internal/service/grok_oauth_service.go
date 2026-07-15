@@ -3,16 +3,13 @@ package service
 import (
 	"context"
 	"crypto/subtle"
-	"encoding/base64"
-	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
-	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
-	"go.uber.org/zap"
 )
 
 const grokDefaultAccessTokenTTL = 6 * time.Hour
@@ -94,20 +91,19 @@ type GrokExchangeCodeInput struct {
 }
 
 type GrokTokenInfo struct {
-	AccessToken            string         `json:"access_token"`
-	RefreshToken           string         `json:"refresh_token,omitempty"`
-	IDToken                string         `json:"id_token,omitempty"`
-	TokenType              string         `json:"token_type,omitempty"`
-	ExpiresIn              int64          `json:"expires_in"`
-	ExpiresAt              int64          `json:"expires_at"`
-	ClientID               string         `json:"client_id,omitempty"`
-	Scope                  string         `json:"scope,omitempty"`
-	Referrer               string         `json:"referrer,omitempty"`
-	Email                  string         `json:"email,omitempty"`
-	SubscriptionTier       string         `json:"subscription_tier,omitempty"`
-	EntitlementStatus      string         `json:"entitlement_status,omitempty"`
-	TokenResponseExtra     map[string]any `json:"oauth_token_response_extra,omitempty"`
-	TokenResponseExtraKeys []string       `json:"oauth_token_response_extra_keys,omitempty"`
+	AccessToken       string `json:"access_token"`
+	RefreshToken      string `json:"refresh_token,omitempty"`
+	IDToken           string `json:"id_token,omitempty"`
+	TokenType         string `json:"token_type,omitempty"`
+	ExpiresIn         int64  `json:"expires_in"`
+	ExpiresAt         int64  `json:"expires_at"`
+	ClientID          string `json:"client_id,omitempty"`
+	Scope             string `json:"scope,omitempty"`
+	Email             string `json:"email,omitempty"`
+	Subject           string `json:"sub,omitempty"`
+	TeamID            string `json:"team_id,omitempty"`
+	SubscriptionTier  string `json:"subscription_tier,omitempty"`
+	EntitlementStatus string `json:"entitlement_status,omitempty"`
 }
 
 func (s *GrokOAuthService) ExchangeCode(ctx context.Context, input *GrokExchangeCodeInput) (*GrokTokenInfo, error) {
@@ -153,7 +149,6 @@ func (s *GrokOAuthService) ExchangeCode(ctx context.Context, input *GrokExchange
 	if err != nil {
 		return nil, err
 	}
-	logGrokOAuthTokenResponse("exchange_code", tokenResp, session.ClientID)
 	return s.tokenInfoFromResponse(tokenResp, session.ClientID, nil), nil
 }
 
@@ -166,38 +161,11 @@ func (s *GrokOAuthService) RefreshToken(ctx context.Context, refreshToken, proxy
 	if err != nil {
 		return nil, err
 	}
-	logGrokOAuthTokenResponse("refresh_token", tokenResp, clientID)
 	tokenInfo := s.tokenInfoFromResponse(tokenResp, clientID, nil)
 	if tokenInfo.RefreshToken == "" {
 		tokenInfo.RefreshToken = refreshToken
 	}
 	return tokenInfo, nil
-}
-
-func logGrokOAuthTokenResponse(operation string, tokenResp *xai.TokenResponse, clientID string) {
-	if tokenResp == nil {
-		logger.L().Warn("grok.oauth_token_response",
-			zap.String("component", "service.grok_oauth"),
-			zap.String("operation", operation),
-			zap.Bool("nil_response", true),
-			zap.String("client_id", strings.TrimSpace(clientID)),
-		)
-		return
-	}
-	logger.L().Info("grok.oauth_token_response",
-		zap.String("component", "service.grok_oauth"),
-		zap.String("operation", operation),
-		zap.String("client_id", strings.TrimSpace(clientID)),
-		zap.Bool("has_access_token", strings.TrimSpace(tokenResp.AccessToken) != ""),
-		zap.Bool("has_refresh_token", strings.TrimSpace(tokenResp.RefreshToken) != ""),
-		zap.Bool("has_id_token", strings.TrimSpace(tokenResp.IDToken) != ""),
-		zap.String("token_type", tokenResp.TokenType),
-		zap.Int64("expires_in", tokenResp.ExpiresIn),
-		zap.String("scope", tokenResp.Scope),
-		zap.String("referrer", tokenResp.Referrer),
-		zap.Strings("extra_keys", tokenResp.ExtraKeys),
-		zap.Any("extra", tokenResp.Extra),
-	)
 }
 
 func (s *GrokOAuthService) ValidateRefreshToken(ctx context.Context, refreshToken string, proxyID *int64) (*GrokTokenInfo, error) {
@@ -206,6 +174,18 @@ func (s *GrokOAuthService) ValidateRefreshToken(ctx context.Context, refreshToke
 		return nil, err
 	}
 	return s.RefreshToken(ctx, refreshToken, proxyURL, xai.EffectiveClientID())
+}
+
+func (s *GrokOAuthService) ConvertFromSSO(ctx context.Context, ssoToken string, proxyID *int64) (*GrokTokenInfo, error) {
+	proxyURL, err := s.proxyURL(ctx, proxyID)
+	if err != nil {
+		return nil, err
+	}
+	tokenResp, err := s.oauthClient.ConvertSSOToBuild(ctx, ssoToken, proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	return s.tokenInfoFromResponse(tokenResp, xai.DefaultClientID, nil), nil
 }
 
 func (s *GrokOAuthService) RefreshAccountToken(ctx context.Context, account *Account) (*GrokTokenInfo, error) {
@@ -259,11 +239,14 @@ func (s *GrokOAuthService) BuildAccountCredentials(tokenInfo *GrokTokenInfo) map
 	if tokenInfo.Scope != "" {
 		creds["scope"] = tokenInfo.Scope
 	}
-	if tokenInfo.Referrer != "" {
-		creds["referrer"] = tokenInfo.Referrer
-	}
 	if tokenInfo.Email != "" {
 		creds["email"] = tokenInfo.Email
+	}
+	if tokenInfo.Subject != "" {
+		creds["sub"] = tokenInfo.Subject
+	}
+	if tokenInfo.TeamID != "" {
+		creds["team_id"] = tokenInfo.TeamID
 	}
 	if tokenInfo.SubscriptionTier != "" {
 		creds["subscription_tier"] = tokenInfo.SubscriptionTier
@@ -271,14 +254,7 @@ func (s *GrokOAuthService) BuildAccountCredentials(tokenInfo *GrokTokenInfo) map
 	if tokenInfo.EntitlementStatus != "" {
 		creds["entitlement_status"] = tokenInfo.EntitlementStatus
 	}
-	if len(tokenInfo.TokenResponseExtra) > 0 {
-		creds["oauth_token_response_extra"] = tokenInfo.TokenResponseExtra
-	}
-	if len(tokenInfo.TokenResponseExtraKeys) > 0 {
-		creds["oauth_token_response_extra_keys"] = tokenInfo.TokenResponseExtraKeys
-	}
-	creds["base_url"] = xai.DefaultBaseURL
-	creds["oauth_token_response_summary"] = buildGrokOAuthCredentialSummary(creds)
+	creds["base_url"] = xai.DefaultCLIBaseURL
 	return creds
 }
 
@@ -301,16 +277,6 @@ func (s *GrokOAuthService) tokenInfoFromResponse(tokenResp *xai.TokenResponse, c
 		ExpiresAt:    now.Add(time.Duration(expiresIn) * time.Second).Unix(),
 		ClientID:     strings.TrimSpace(clientID),
 		Scope:        tokenResp.Scope,
-		Referrer:     strings.TrimSpace(tokenResp.Referrer),
-	}
-	if len(tokenResp.Extra) > 0 {
-		info.TokenResponseExtra = tokenResp.Extra
-	}
-	if len(tokenResp.ExtraKeys) > 0 {
-		info.TokenResponseExtraKeys = append([]string(nil), tokenResp.ExtraKeys...)
-	}
-	if info.Referrer == "" {
-		info.Referrer = xai.DefaultReferrer
 	}
 	if info.ClientID == "" {
 		info.ClientID = xai.EffectiveClientID()
@@ -318,12 +284,23 @@ func (s *GrokOAuthService) tokenInfoFromResponse(tokenResp *xai.TokenResponse, c
 	if info.TokenType == "" {
 		info.TokenType = "Bearer"
 	}
-	if email := parseJWTEmailClaim(tokenResp.IDToken); email != "" {
-		info.Email = email
-	}
-	if info.Email == "" && existing != nil {
-		if email, _ := existing["email"].(string); email != "" {
-			info.Email = email
+	applyGrokTokenClaims(info, tokenResp.IDToken)
+	applyGrokTokenClaims(info, tokenResp.AccessToken)
+	if existing != nil {
+		if info.Email == "" {
+			if email, _ := existing["email"].(string); email != "" {
+				info.Email = email
+			}
+		}
+		if info.Subject == "" {
+			if subject, _ := existing["sub"].(string); subject != "" {
+				info.Subject = subject
+			}
+		}
+		if info.TeamID == "" {
+			if teamID, _ := existing["team_id"].(string); teamID != "" {
+				info.TeamID = teamID
+			}
 		}
 	}
 	return info
@@ -338,28 +315,32 @@ func (s *GrokOAuthService) proxyURL(ctx context.Context, proxyID *int64) (string
 	}
 	proxy, err := s.proxyRepo.GetByID(ctx, *proxyID)
 	if err != nil {
-		return "", infraerrors.Newf(http.StatusBadRequest, "GROK_OAUTH_PROXY_NOT_FOUND", "proxy not found: %v", err)
+		if errors.Is(err, ErrProxyNotFound) {
+			return "", infraerrors.New(http.StatusBadRequest, "GROK_OAUTH_PROXY_NOT_FOUND", "configured proxy was not found")
+		}
+		return "", infraerrors.New(http.StatusServiceUnavailable, "GROK_OAUTH_PROXY_LOOKUP_FAILED", "proxy lookup is temporarily unavailable")
 	}
 	if proxy == nil {
-		return "", nil
+		return "", infraerrors.New(http.StatusBadRequest, "GROK_OAUTH_PROXY_NOT_FOUND", "configured proxy was not found")
 	}
 	return proxy.URL(), nil
 }
 
-func parseJWTEmailClaim(token string) string {
-	parts := strings.Split(token, ".")
-	if len(parts) < 2 {
-		return ""
+func applyGrokTokenClaims(info *GrokTokenInfo, token string) {
+	if info == nil || strings.TrimSpace(token) == "" {
+		return
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return ""
+	claims := xai.DecodeJWTClaims(token)
+	if claims == nil {
+		return
 	}
-	var claims struct {
-		Email string `json:"email"`
+	if info.Email == "" {
+		info.Email = xai.JWTClaimString(claims, "email")
 	}
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return ""
+	if info.Subject == "" {
+		info.Subject = xai.JWTClaimString(claims, "sub")
 	}
-	return strings.TrimSpace(claims.Email)
+	if info.TeamID == "" {
+		info.TeamID = xai.JWTClaimString(claims, "team_id")
+	}
 }
