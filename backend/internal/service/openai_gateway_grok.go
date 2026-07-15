@@ -194,11 +194,20 @@ func patchGrokResponsesBody(body []byte, upstreamModel string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	out, err = stripGrokUnsupportedReasoningItems(out)
+	if err != nil {
+		return nil, err
+	}
 	out, err = sanitizeGrokReasoningNullContent(out)
 	if err != nil {
 		return nil, err
 	}
 	out, err = sanitizeGrokResponsesTools(out)
+	if err != nil {
+		return nil, err
+	}
+	// 最终清洗 input：把 Codex/OpenAI 专有 item 归一成 xAI 可反序列化的 ModelInput 变体。
+	out, err = sanitizeGrokResponsesModelInput(out)
 	if err != nil {
 		return nil, err
 	}
@@ -285,6 +294,210 @@ func deleteJSONFields(value any, fields map[string]struct{}) bool {
 	}
 }
 
+
+// sanitizeGrokResponsesModelInput 只处理 xAI Responses ModelInput 明确不能反序列化的
+// OpenAI/Codex 专有 item。普通 message、function_call、function_call_output 原样保留；
+// previous_response_id 也保留，让 Grok 继续使用自己的上一轮响应做上下文锚点。
+func sanitizeGrokResponsesModelInput(body []byte) ([]byte, error) {
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return body, nil
+	}
+
+	items := input.Array()
+	kept := make([]json.RawMessage, 0, len(items))
+	changed := false
+	for _, item := range items {
+		raw, keep, itemChanged, err := normalizeGrokResponsesModelInputItem(item)
+		if err != nil {
+			return nil, err
+		}
+		if itemChanged {
+			changed = true
+		}
+		if !keep {
+			changed = true
+			continue
+		}
+		kept = append(kept, raw)
+	}
+	if !changed {
+		return body, nil
+	}
+	encoded, err := json.Marshal(kept)
+	if err != nil {
+		return nil, err
+	}
+	return sjson.SetRawBytes(body, "input", encoded)
+}
+
+func normalizeGrokResponsesModelInputItem(item gjson.Result) (json.RawMessage, bool, bool, error) {
+	if !item.IsObject() {
+		return json.RawMessage(item.Raw), true, false, nil
+	}
+
+	itemType := strings.TrimSpace(item.Get("type").String())
+	switch itemType {
+	case "item_reference", "additional_tools":
+		return nil, false, true, nil
+	case "web_search_call", "file_search_call", "computer_call", "compaction", "compaction_trigger", "compaction_summary":
+		if text := extractGrokInputItemText(item); text != "" {
+			return marshalGrokModelInputMessage("assistant", text)
+		}
+		return nil, false, true, nil
+	case "input_text":
+		text := strings.TrimSpace(item.Get("text").String())
+		if text == "" {
+			return nil, false, true, nil
+		}
+		return marshalGrokModelInputMessage("user", text)
+	case "output_text":
+		text := strings.TrimSpace(item.Get("text").String())
+		if text == "" {
+			return nil, false, true, nil
+		}
+		return marshalGrokModelInputMessage("assistant", text)
+	case "text":
+		text := strings.TrimSpace(item.Get("text").String())
+		if text == "" {
+			return nil, false, true, nil
+		}
+		return marshalGrokModelInputMessage("user", text)
+	case "reasoning":
+		if text := extractGrokReasoningSummaryText(item); text != "" {
+			return marshalGrokModelInputMessage("assistant", text)
+		}
+		return nil, false, true, nil
+	case "local_shell_call", "tool_search_call", "custom_tool_call", "mcp_tool_call", "tool_call":
+		return marshalGrokFunctionCallLikeItem(item)
+	case "tool_search_output", "custom_tool_call_output", "mcp_tool_call_output":
+		return marshalGrokFunctionCallOutputLikeItem(item)
+	default:
+		return json.RawMessage(item.Raw), true, false, nil
+	}
+}
+
+func marshalGrokModelInputMessage(role, text string) (json.RawMessage, bool, bool, error) {
+	out := map[string]any{
+		"type":    "message",
+		"role":    role,
+		"content": text,
+	}
+	raw, err := json.Marshal(out)
+	return raw, true, true, err
+}
+
+func marshalGrokFunctionCallLikeItem(item gjson.Result) (json.RawMessage, bool, bool, error) {
+	name := strings.TrimSpace(firstNonEmptyString(
+		item.Get("name").String(),
+		item.Get("tool_name").String(),
+		item.Get("function.name").String(),
+	))
+	if name == "" {
+		name = "tool"
+	}
+	callID := strings.TrimSpace(firstNonEmptyString(item.Get("call_id").String(), item.Get("id").String()))
+	arguments := "{}"
+	if item.Get("arguments").Exists() {
+		if item.Get("arguments").Type == gjson.String {
+			arguments = item.Get("arguments").String()
+		} else {
+			arguments = item.Get("arguments").Raw
+		}
+	}
+	out := map[string]any{
+		"type":      "function_call",
+		"name":      name,
+		"arguments": arguments,
+	}
+	if callID != "" {
+		out["call_id"] = callID
+	}
+	raw, err := json.Marshal(out)
+	return raw, true, true, err
+}
+
+func marshalGrokFunctionCallOutputLikeItem(item gjson.Result) (json.RawMessage, bool, bool, error) {
+	callID := strings.TrimSpace(firstNonEmptyString(item.Get("call_id").String(), item.Get("id").String()))
+	output := ""
+	if item.Get("output").Exists() {
+		if item.Get("output").Type == gjson.String {
+			output = item.Get("output").String()
+		} else {
+			output = item.Get("output").Raw
+		}
+	}
+	if callID == "" {
+		if strings.TrimSpace(output) == "" {
+			return nil, false, true, nil
+		}
+		return marshalGrokModelInputMessage("user", output)
+	}
+	out := map[string]any{
+		"type":    "function_call_output",
+		"call_id": callID,
+		"output":  output,
+	}
+	raw, err := json.Marshal(out)
+	return raw, true, true, err
+}
+
+func extractGrokReasoningSummaryText(item gjson.Result) string {
+	var parts []string
+	summary := item.Get("summary")
+	if summary.IsArray() {
+		for _, entry := range summary.Array() {
+			text := strings.TrimSpace(entry.Get("text").String())
+			if text == "" && entry.Type == gjson.String {
+				text = strings.TrimSpace(entry.String())
+			}
+			if text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func extractGrokInputItemText(item gjson.Result) string {
+	candidates := []string{
+		item.Get("text").String(),
+		item.Get("content").String(),
+		item.Get("output").String(),
+		item.Get("result").String(),
+		item.Get("query").String(),
+		item.Get("action.query").String(),
+	}
+	for _, candidate := range candidates {
+		if text := strings.TrimSpace(candidate); text != "" {
+			return text
+		}
+	}
+	if item.Get("content").IsArray() {
+		var parts []string
+		for _, part := range item.Get("content").Array() {
+			if text := strings.TrimSpace(part.Get("text").String()); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n")
+		}
+	}
+	if item.Get("queries").IsArray() {
+		var parts []string
+		for _, query := range item.Get("queries").Array() {
+			if text := strings.TrimSpace(query.String()); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n")
+		}
+	}
+	return ""
+}
+
 // additional_tools is a Codex/Responses Lite private input carrier. xAI's
 // Responses schema accepts ordinary message/function-call input items but
 // rejects this carrier before inference with a ModelInput deserialization
@@ -311,6 +524,37 @@ func sanitizeGrokResponsesInput(body []byte) ([]byte, error) {
 		return body, nil
 	}
 	encoded, err := json.Marshal(filtered)
+	if err != nil {
+		return nil, err
+	}
+	return sjson.SetRawBytes(body, "input", encoded)
+}
+
+
+// stripGrokUnsupportedReasoningItems 移除 input 中携带 encrypted_content 的 reasoning 项。
+//
+// 背景：Codex 以 OpenAI Responses 协议工作，会在每轮把上一轮返回的 reasoning.encrypted_content
+// 原样回传。但 grok/xAI 无法解码 Codex 从普通 /v1/responses 回传的加密推理内容 —— 第二轮起会返回
+// 400 "Could not decode the compaction blob..."。
+// 仅按 encrypted_content 判定，只影响 grok 加密推理场景，不误删普通 message/工具项。
+func stripGrokUnsupportedReasoningItems(body []byte) ([]byte, error) {
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return body, nil
+	}
+	kept := make([]json.RawMessage, 0, len(input.Array()))
+	removed := false
+	for _, item := range input.Array() {
+		if item.Get("type").String() == "reasoning" && item.Get("encrypted_content").Exists() {
+			removed = true
+			continue
+		}
+		kept = append(kept, json.RawMessage(item.Raw))
+	}
+	if !removed {
+		return body, nil
+	}
+	encoded, err := json.Marshal(kept)
 	if err != nil {
 		return nil, err
 	}

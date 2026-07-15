@@ -245,6 +245,45 @@ func TestPatchGrokResponsesBodyDropsCodexAdditionalToolsInputItems(t *testing.T)
 	require.Equal(t, "hello", gjson.GetBytes(patched, "input.1.content.0.text").String())
 }
 
+func TestPatchGrokResponsesBodySanitizesUnsupportedModelInputItems(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model": "gpt-5.5",
+		"previous_response_id": "resp_grok_prev",
+		"input": [
+			{"type": "item_reference", "id": "call_ref_1"},
+			{"type": "additional_tools", "role": "developer", "tools": [{"type": "local_shell"}]},
+			{"type": "input_text", "text": "continue with this"},
+			{"type": "file_search_call", "id": "fs_1", "status": "completed", "queries": ["claude code session manager"]},
+			{"type": "mcp_tool_call_output", "call_id": "call_mcp_1", "output": "{\"ok\":true}"},
+			{"type": "custom_tool_call", "call_id": "call_custom_1", "name": "lookup", "arguments": "{\"q\":\"x\"}"},
+			{"type": "message", "role": "user", "content": "keep raw message"}
+		]
+	}`)
+
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.True(t, json.Valid(patched))
+	require.Equal(t, "resp_grok_prev", gjson.GetBytes(patched, "previous_response_id").String())
+	require.False(t, gjson.GetBytes(patched, `input.#(type=="item_reference")`).Exists())
+	require.False(t, gjson.GetBytes(patched, `input.#(type=="additional_tools")`).Exists())
+	require.Equal(t, "message", gjson.GetBytes(patched, "input.0.type").String())
+	require.Equal(t, "user", gjson.GetBytes(patched, "input.0.role").String())
+	require.Equal(t, "continue with this", gjson.GetBytes(patched, "input.0.content").String())
+	require.Equal(t, "message", gjson.GetBytes(patched, "input.1.type").String())
+	require.Equal(t, "assistant", gjson.GetBytes(patched, "input.1.role").String())
+	require.Equal(t, "claude code session manager", gjson.GetBytes(patched, "input.1.content").String())
+	require.Equal(t, "function_call_output", gjson.GetBytes(patched, "input.2.type").String())
+	require.Equal(t, "call_mcp_1", gjson.GetBytes(patched, "input.2.call_id").String())
+	require.Equal(t, `{"ok":true}`, gjson.GetBytes(patched, "input.2.output").String())
+	require.Equal(t, "function_call", gjson.GetBytes(patched, "input.3.type").String())
+	require.Equal(t, "call_custom_1", gjson.GetBytes(patched, "input.3.call_id").String())
+	require.Equal(t, "lookup", gjson.GetBytes(patched, "input.3.name").String())
+	require.Equal(t, "message", gjson.GetBytes(patched, "input.4.type").String())
+	require.Equal(t, "keep raw message", gjson.GetBytes(patched, "input.4.content").String())
+}
+
 func TestBuildGrokResponsesRequestUsesAccountBaseURLAndBearerToken(t *testing.T) {
 	t.Setenv(xai.EnvAllowUnsafeURLOverrides, "true")
 
