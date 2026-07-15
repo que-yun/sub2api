@@ -604,7 +604,12 @@ var grokResponsesSupportedToolTypes = map[string]struct{}{
 
 func sanitizeGrokResponsesTools(body []byte) ([]byte, error) {
 	tools := gjson.GetBytes(body, "tools")
+	// Codex 可能只带 tool_choice、不带 tools；xAI 会 400：
+	// "A tool_choice was set on the request but no tools were specified."
 	if !tools.Exists() || !tools.IsArray() {
+		if gjson.GetBytes(body, "tool_choice").Exists() {
+			return sjson.DeleteBytes(body, "tool_choice")
+		}
 		return body, nil
 	}
 
@@ -612,7 +617,7 @@ func sanitizeGrokResponsesTools(body []byte) ([]byte, error) {
 	filteredTools := make([]json.RawMessage, 0, len(rawTools))
 	for _, tool := range rawTools {
 		toolType := strings.TrimSpace(tool.Get("type").String())
-		if _, ok := grokResponsesSupportedToolTypes[toolType]; ok {
+		if _, ok := grokResponsesSupportedToolTypes[toolType]; ok && isValidGrokResponsesTool(tool) {
 			filteredTools = append(filteredTools, json.RawMessage(tool.Raw))
 		}
 	}
@@ -645,6 +650,21 @@ func sanitizeGrokResponsesTools(body []byte) ([]byte, error) {
 		}
 	}
 	return body, nil
+}
+
+
+func isValidGrokResponsesTool(tool gjson.Result) bool {
+	if !tool.IsObject() {
+		return false
+	}
+	toolType := strings.TrimSpace(tool.Get("type").String())
+	switch toolType {
+	case "shell":
+		// xAI hosted shell 需要 environment；Codex local shell 无此字段，不能原样透传。
+		return tool.Get("environment").Exists()
+	default:
+		return true
+	}
 }
 
 func shouldDropGrokToolChoice(toolChoice gjson.Result, tools []json.RawMessage) bool {

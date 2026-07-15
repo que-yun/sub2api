@@ -245,6 +245,39 @@ func TestPatchGrokResponsesBodyDropsCodexAdditionalToolsInputItems(t *testing.T)
 	require.Equal(t, "hello", gjson.GetBytes(patched, "input.1.content.0.text").String())
 }
 
+func TestPatchGrokResponsesBodyDropsToolChoiceWhenToolsMissing(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model": "gpt-5.5",
+		"input": "hello",
+		"tool_choice": "auto"
+	}`)
+
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.True(t, json.Valid(patched))
+	require.False(t, gjson.GetBytes(patched, "tools").Exists())
+	require.False(t, gjson.GetBytes(patched, "tool_choice").Exists())
+}
+
+func TestPatchGrokResponsesBodyDropsToolChoiceWhenOnlyInvalidShellToolsRemain(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model": "gpt-5.5",
+		"input": "hello",
+		"tools": [{"type": "shell", "name": "local_shell"}],
+		"tool_choice": "auto"
+	}`)
+
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.True(t, json.Valid(patched))
+	require.False(t, gjson.GetBytes(patched, "tools").Exists())
+	require.False(t, gjson.GetBytes(patched, "tool_choice").Exists())
+}
+
 func TestPatchGrokResponsesBodySanitizesUnsupportedModelInputItems(t *testing.T) {
 	t.Parallel()
 
