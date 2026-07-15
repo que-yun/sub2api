@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -167,6 +168,48 @@ func TestGrokConversationHeaderIsScopedToGrokRequestScheduling(t *testing.T) {
 		(&OpenAIGatewayService{}).GenerateSessionHash(withoutGrokHeader, body),
 		(&OpenAIGatewayService{}).GenerateSessionHash(openAIContext, body),
 	)
+}
+
+func TestApplyGrokFreeFunctionToolCacheRouteInfersFreeFrom2MTokenLimit(t *testing.T) {
+	account := healthyGrokOAuthGatewayTestAccount(910, "access-token")
+	limit := int64(grokFreeRolling24hTokenLimit)
+	remaining := limit
+	account.Extra = map[string]any{
+		grokQuotaSnapshotExtraKey: &xai.QuotaSnapshot{
+			Tokens: &xai.QuotaWindow{Limit: &limit, Remaining: &remaining},
+		},
+	}
+	intentBody := []byte(`{"model":"gpt-5.6-sol","tools":[{"type":"function","name":"exec_command","parameters":{"type":"object"}}],"tool_choice":"auto"}`)
+	patched, err := applyGrokResponsesCacheIdentity(intentBody, intentBody, "isolated-id", true)
+	require.NoError(t, err)
+	// tools already present, so free-tier none-injection is skipped
+	require.Equal(t, "function", gjson.GetBytes(patched, "tools.0.type").String())
+	require.False(t, gjson.GetBytes(patched, `tools.#(type=="web_search")`).Exists())
+
+	out, err := applyGrokFreeMessagesFunctionToolCacheRoute(patched, intentBody, account, "isolated-id")
+	require.NoError(t, err)
+	require.Equal(t, "function", gjson.GetBytes(out, "tools.0.type").String())
+	require.Equal(t, "web_search", gjson.GetBytes(out, `tools.#(type=="web_search").type`).String())
+	require.Equal(t, "x_search", gjson.GetBytes(out, `tools.#(type=="x_search").type`).String())
+	require.Equal(t, "auto", gjson.GetBytes(out, "tool_choice").String())
+}
+
+func TestApplyGrokFreeFunctionToolCacheRouteSkipsPaid53MAccounts(t *testing.T) {
+	account := healthyGrokOAuthGatewayTestAccount(911, "access-token")
+	limit := int64(53_000_000)
+	remaining := limit
+	account.Extra = map[string]any{
+		grokQuotaSnapshotExtraKey: &xai.QuotaSnapshot{
+			Tokens: &xai.QuotaWindow{Limit: &limit, Remaining: &remaining},
+		},
+	}
+	intentBody := []byte(`{"model":"gpt-5.6-sol","tools":[{"type":"function","name":"exec_command","parameters":{"type":"object"}}],"tool_choice":"auto"}`)
+	patched, err := applyGrokResponsesCacheIdentity(intentBody, intentBody, "isolated-id", true)
+	require.NoError(t, err)
+	out, err := applyGrokFreeMessagesFunctionToolCacheRoute(patched, intentBody, account, "isolated-id")
+	require.NoError(t, err)
+	require.Equal(t, 1, len(gjson.GetBytes(out, "tools").Array()))
+	require.False(t, gjson.GetBytes(out, `tools.#(type=="web_search")`).Exists())
 }
 
 func TestApplyGrokCacheIdentityWritesResponsesBodyAndHeader(t *testing.T) {
