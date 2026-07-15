@@ -159,6 +159,11 @@ func (a *Account) IsSchedulable() bool {
 	if a.TempUnschedulableUntil != nil && now.Before(*a.TempUnschedulableUntil) {
 		return false
 	}
+	// Grok entitlement/permission 403 must not silently re-enter the pool when
+	// the temporary timer expires. Require a proven success first.
+	if GrokAccountRequiresSuccessBeforeSchedule(a) {
+		return false
+	}
 	if a.IsAPIKeyOrBedrock() && a.IsQuotaExceeded() {
 		return false
 	}

@@ -107,8 +107,17 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	if result == nil {
 		return errors.New("openai usage result is nil")
 	}
-	if s.rateLimitService != nil && input.Account != nil && input.Account.Platform == PlatformOpenAI {
+	// 成功转发即复位 403 连续计数器：OpenAI 与 Grok 都复用同一计数器做"连续 permission-denied"
+	// 升级判定(见 EscalateGrokForbiddenOn403 / handleOpenAI403)，成功一次即清零，确保只有真正
+	// 持续被拒的账号才会累计到阈值被永久禁用，间歇性 403 不会误升级。
+	if s.rateLimitService != nil && input.Account != nil &&
+		(input.Account.Platform == PlatformOpenAI || input.Account.Platform == PlatformGrok) {
 		s.rateLimitService.ResetOpenAI403Counter(ctx, input.Account.ID)
+	}
+	// Successful Grok traffic is the only auto-recovery signal for sticky
+	// entitlement/permission holds. Do not silently resume on timer expiry.
+	if input.Account != nil && input.Account.Platform == PlatformGrok {
+		ClearGrokHoldAfterSuccess(ctx, s.accountRepo, s.rateLimitService, input.Account)
 	}
 
 	apiKey := input.APIKey

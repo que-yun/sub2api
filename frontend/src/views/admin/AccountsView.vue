@@ -1538,7 +1538,26 @@ const accountMatchesCurrentFilters = (account: Account) => {
     const rateLimitResetAt = account.rate_limit_reset_at ? new Date(account.rate_limit_reset_at).getTime() : Number.NaN
     const isRateLimited = Number.isFinite(rateLimitResetAt) && rateLimitResetAt > now
     const tempUnschedUntil = account.temp_unschedulable_until ? new Date(account.temp_unschedulable_until).getTime() : Number.NaN
-    const isTempUnschedulable = Number.isFinite(tempUnschedUntil) && tempUnschedUntil > now
+    const hold = account.extra?.grok_hold_until_success
+    const hasGrokStickyHold =
+      account.platform === 'grok' && (hold === true || hold === 1 || hold === '1' || hold === 'true')
+    const snap = account.extra?.grok_usage_snapshot as
+      | { status_code?: number; updated_at?: string; last_probe_at?: string }
+      | undefined
+    let hasFreshGrokForbidden = false
+    if (account.platform === 'grok' && snap && Number(snap.status_code) === 403) {
+      const ts = snap.last_probe_at || snap.updated_at
+      if (!ts) {
+        hasFreshGrokForbidden = true
+      } else {
+        const ageMs = now - new Date(ts).getTime()
+        hasFreshGrokForbidden = Number.isNaN(ageMs) || ageMs <= 15 * 60 * 1000
+      }
+    }
+    const isTempUnschedulable =
+      (Number.isFinite(tempUnschedUntil) && tempUnschedUntil > now) ||
+      hasGrokStickyHold ||
+      hasFreshGrokForbidden
 
     if (filters.status === 'active') {
       if (account.status !== 'active' || isRateLimited || isTempUnschedulable || !account.schedulable) return false

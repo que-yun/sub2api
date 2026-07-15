@@ -20,6 +20,21 @@ set -a
 source "${ENV_FILE}"
 set +a
 
+# 在线更新检查：匿名 GitHub API 仅 60 次/小时，易被本机代理出口共享 IP 打满。
+# 优先用 UPDATE_TOKEN；未配置时尝试复用本机 gh 登录态（不落盘、不写 host-run.env）。
+if [[ -z "${UPDATE_TOKEN:-}" ]]; then
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    export UPDATE_TOKEN="${GITHUB_TOKEN}"
+  elif [[ -n "${GH_TOKEN:-}" ]]; then
+    export UPDATE_TOKEN="${GH_TOKEN}"
+  elif command -v gh >/dev/null 2>&1; then
+    if _gh_tok="$(gh auth token 2>/dev/null)" && [[ -n "${_gh_tok}" ]]; then
+      export UPDATE_TOKEN="${_gh_tok}"
+    fi
+    unset _gh_tok
+  fi
+fi
+
 : "${DATA_DIR:?DATA_DIR must be set in ${ENV_FILE}}"
 mkdir -p "${DATA_DIR}"
 

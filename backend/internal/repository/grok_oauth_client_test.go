@@ -17,8 +17,13 @@ import (
 func TestGrokOAuthClientExchangeAndRefreshUseFormFields(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, xai.DefaultCLIUserAgent, r.Header.Get("User-Agent"))
+		require.Equal(t, xai.DefaultCLITokenAuth, r.Header.Get("X-XAI-Token-Auth"))
+		require.Equal(t, xai.DefaultCLIClientIdentifier, r.Header.Get("x-grok-client-identifier"))
+		require.Equal(t, xai.DefaultCLIClientVersion, r.Header.Get("x-grok-client-version"))
 		require.NoError(t, r.ParseForm())
 		require.Equal(t, "client-id", r.Form.Get("client_id"))
+		require.Equal(t, xai.DefaultReferrer, r.Form.Get("referrer"))
 
 		switch r.Form.Get("grant_type") {
 		case "authorization_code":
@@ -33,6 +38,7 @@ func TestGrokOAuthClientExchangeAndRefreshUseFormFields(t *testing.T) {
 				"token_type":    "Bearer",
 				"expires_in":    3600,
 				"scope":         "openid api:access",
+				"referrer":      xai.DefaultReferrer,
 			})
 		case "refresh_token":
 			require.Equal(t, "refresh-token", r.Form.Get("refresh_token"))
@@ -64,6 +70,7 @@ func TestGrokOAuthClientExchangeAndRefreshUseFormFields(t *testing.T) {
 	require.Equal(t, "exchange-refresh", exchanged.RefreshToken)
 	require.Equal(t, int64(3600), exchanged.ExpiresIn)
 	require.Equal(t, "openid api:access", exchanged.Scope)
+	require.Equal(t, xai.DefaultReferrer, exchanged.Referrer)
 
 	refreshed, err := client.RefreshToken(context.Background(), "refresh-token", "", "client-id")
 	require.NoError(t, err)

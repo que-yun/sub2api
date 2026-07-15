@@ -354,6 +354,11 @@
         <span class="inline-block rounded px-1.5 py-0.5 text-[10px] font-medium bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300">
           {{ grokEntitlementLabel || t('admin.accounts.forbidden') }}
         </span>
+        <div v-if="grokQuotaStatusLine" class="text-[10px] text-gray-500 dark:text-gray-400">
+          {{ grokQuotaStatusLine }}
+        </div>
+        <!-- Keep probe available under entitlement 403 so operators can retest without waiting for stale window. -->
+        <GrokQuotaProbeCell :account="account" />
       </div>
       <div v-else-if="usageInfo" class="space-y-1">
         <div v-if="grokEntitlementLabel" class="mb-0.5">

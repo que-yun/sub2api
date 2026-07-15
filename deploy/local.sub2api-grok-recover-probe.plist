@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/local/go/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>GROK_PREFERRED_PROXY_ID</key>
+		<string>6</string>
+		<key>GROK_RECOVER_CONCURRENCY</key>
+		<string>4</string>
+		<key>GROK_RECOVER_FAST_LIMIT</key>
+		<string>80</string>
+		<key>GROK_RECOVER_403_LIMIT</key>
+		<string>120</string>
+		<key>GROK_RECOVER_403_INTERVAL_SEC</key>
+		<string>21600</string>
+	</dict>
+	<key>Label</key>
+	<string>local.sub2api-grok-recover-probe</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/zsh</string>
+		<string>/Users/yunque/services/sub2api-upstream-custom/tools/run_grok_recover_probe.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StartInterval</key>
+	<integer>1800</integer>
+	<key>StandardErrorPath</key>
+	<string>/Users/yunque/Library/Logs/sub2api-grok-recover-probe.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/yunque/Library/Logs/sub2api-grok-recover-probe.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/yunque/services/sub2api-upstream-custom</string>
+</dict>
+</plist>

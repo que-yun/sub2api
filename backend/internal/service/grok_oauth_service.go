@@ -10,7 +10,9 @@ import (
 	"time"
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
+	"go.uber.org/zap"
 )
 
 const grokDefaultAccessTokenTTL = 6 * time.Hour
@@ -92,17 +94,20 @@ type GrokExchangeCodeInput struct {
 }
 
 type GrokTokenInfo struct {
-	AccessToken       string `json:"access_token"`
-	RefreshToken      string `json:"refresh_token,omitempty"`
-	IDToken           string `json:"id_token,omitempty"`
-	TokenType         string `json:"token_type,omitempty"`
-	ExpiresIn         int64  `json:"expires_in"`
-	ExpiresAt         int64  `json:"expires_at"`
-	ClientID          string `json:"client_id,omitempty"`
-	Scope             string `json:"scope,omitempty"`
-	Email             string `json:"email,omitempty"`
-	SubscriptionTier  string `json:"subscription_tier,omitempty"`
-	EntitlementStatus string `json:"entitlement_status,omitempty"`
+	AccessToken            string         `json:"access_token"`
+	RefreshToken           string         `json:"refresh_token,omitempty"`
+	IDToken                string         `json:"id_token,omitempty"`
+	TokenType              string         `json:"token_type,omitempty"`
+	ExpiresIn              int64          `json:"expires_in"`
+	ExpiresAt              int64          `json:"expires_at"`
+	ClientID               string         `json:"client_id,omitempty"`
+	Scope                  string         `json:"scope,omitempty"`
+	Referrer               string         `json:"referrer,omitempty"`
+	Email                  string         `json:"email,omitempty"`
+	SubscriptionTier       string         `json:"subscription_tier,omitempty"`
+	EntitlementStatus      string         `json:"entitlement_status,omitempty"`
+	TokenResponseExtra     map[string]any `json:"oauth_token_response_extra,omitempty"`
+	TokenResponseExtraKeys []string       `json:"oauth_token_response_extra_keys,omitempty"`
 }
 
 func (s *GrokOAuthService) ExchangeCode(ctx context.Context, input *GrokExchangeCodeInput) (*GrokTokenInfo, error) {
@@ -148,6 +153,7 @@ func (s *GrokOAuthService) ExchangeCode(ctx context.Context, input *GrokExchange
 	if err != nil {
 		return nil, err
 	}
+	logGrokOAuthTokenResponse("exchange_code", tokenResp, session.ClientID)
 	return s.tokenInfoFromResponse(tokenResp, session.ClientID, nil), nil
 }
 
@@ -160,11 +166,38 @@ func (s *GrokOAuthService) RefreshToken(ctx context.Context, refreshToken, proxy
 	if err != nil {
 		return nil, err
 	}
+	logGrokOAuthTokenResponse("refresh_token", tokenResp, clientID)
 	tokenInfo := s.tokenInfoFromResponse(tokenResp, clientID, nil)
 	if tokenInfo.RefreshToken == "" {
 		tokenInfo.RefreshToken = refreshToken
 	}
 	return tokenInfo, nil
+}
+
+func logGrokOAuthTokenResponse(operation string, tokenResp *xai.TokenResponse, clientID string) {
+	if tokenResp == nil {
+		logger.L().Warn("grok.oauth_token_response",
+			zap.String("component", "service.grok_oauth"),
+			zap.String("operation", operation),
+			zap.Bool("nil_response", true),
+			zap.String("client_id", strings.TrimSpace(clientID)),
+		)
+		return
+	}
+	logger.L().Info("grok.oauth_token_response",
+		zap.String("component", "service.grok_oauth"),
+		zap.String("operation", operation),
+		zap.String("client_id", strings.TrimSpace(clientID)),
+		zap.Bool("has_access_token", strings.TrimSpace(tokenResp.AccessToken) != ""),
+		zap.Bool("has_refresh_token", strings.TrimSpace(tokenResp.RefreshToken) != ""),
+		zap.Bool("has_id_token", strings.TrimSpace(tokenResp.IDToken) != ""),
+		zap.String("token_type", tokenResp.TokenType),
+		zap.Int64("expires_in", tokenResp.ExpiresIn),
+		zap.String("scope", tokenResp.Scope),
+		zap.String("referrer", tokenResp.Referrer),
+		zap.Strings("extra_keys", tokenResp.ExtraKeys),
+		zap.Any("extra", tokenResp.Extra),
+	)
 }
 
 func (s *GrokOAuthService) ValidateRefreshToken(ctx context.Context, refreshToken string, proxyID *int64) (*GrokTokenInfo, error) {
@@ -226,6 +259,9 @@ func (s *GrokOAuthService) BuildAccountCredentials(tokenInfo *GrokTokenInfo) map
 	if tokenInfo.Scope != "" {
 		creds["scope"] = tokenInfo.Scope
 	}
+	if tokenInfo.Referrer != "" {
+		creds["referrer"] = tokenInfo.Referrer
+	}
 	if tokenInfo.Email != "" {
 		creds["email"] = tokenInfo.Email
 	}
@@ -235,7 +271,14 @@ func (s *GrokOAuthService) BuildAccountCredentials(tokenInfo *GrokTokenInfo) map
 	if tokenInfo.EntitlementStatus != "" {
 		creds["entitlement_status"] = tokenInfo.EntitlementStatus
 	}
+	if len(tokenInfo.TokenResponseExtra) > 0 {
+		creds["oauth_token_response_extra"] = tokenInfo.TokenResponseExtra
+	}
+	if len(tokenInfo.TokenResponseExtraKeys) > 0 {
+		creds["oauth_token_response_extra_keys"] = tokenInfo.TokenResponseExtraKeys
+	}
 	creds["base_url"] = xai.DefaultBaseURL
+	creds["oauth_token_response_summary"] = buildGrokOAuthCredentialSummary(creds)
 	return creds
 }
 
@@ -258,6 +301,16 @@ func (s *GrokOAuthService) tokenInfoFromResponse(tokenResp *xai.TokenResponse, c
 		ExpiresAt:    now.Add(time.Duration(expiresIn) * time.Second).Unix(),
 		ClientID:     strings.TrimSpace(clientID),
 		Scope:        tokenResp.Scope,
+		Referrer:     strings.TrimSpace(tokenResp.Referrer),
+	}
+	if len(tokenResp.Extra) > 0 {
+		info.TokenResponseExtra = tokenResp.Extra
+	}
+	if len(tokenResp.ExtraKeys) > 0 {
+		info.TokenResponseExtraKeys = append([]string(nil), tokenResp.ExtraKeys...)
+	}
+	if info.Referrer == "" {
+		info.Referrer = xai.DefaultReferrer
 	}
 	if info.ClientID == "" {
 		info.ClientID = xai.EffectiveClientID()

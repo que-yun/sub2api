@@ -1299,6 +1299,9 @@ func (h *AccountHandler) ApplyOAuthCredentials(c *gin.Context) {
 		response.ErrorFrom(c, infraerrors.BadRequest("NOT_OAUTH", "cannot apply oauth credentials to non-OAuth account"))
 		return
 	}
+	if existing.Platform == service.PlatformGrok {
+		ensureGrokOAuthCredentialDefaults(req.Credentials)
+	}
 
 	updatedAccount, err := h.adminService.UpdateAccount(ctx, accountID, &service.UpdateAccountInput{
 		Type:        req.Type,
@@ -1346,6 +1349,26 @@ func (h *AccountHandler) ApplyOAuthCredentials(c *gin.Context) {
 	}
 
 	response.Success(c, h.buildAccountResponseWithRuntime(ctx, updatedAccount))
+}
+
+func ensureGrokOAuthCredentialDefaults(credentials map[string]any) {
+	if credentials == nil {
+		return
+	}
+	if strings.TrimSpace(requestCredentialValueString(credentials, "referrer")) == "" {
+		credentials["referrer"] = xai.DefaultReferrer
+	}
+	if strings.TrimSpace(requestCredentialValueString(credentials, "base_url")) == "" {
+		credentials["base_url"] = xai.DefaultBaseURL
+	}
+}
+
+func requestCredentialValueString(credentials map[string]any, key string) string {
+	value, ok := credentials[key]
+	if !ok || value == nil {
+		return ""
+	}
+	return fmt.Sprint(value)
 }
 
 // GetStats handles getting account statistics

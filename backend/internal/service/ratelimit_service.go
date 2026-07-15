@@ -903,6 +903,55 @@ func (s *RateLimitService) handleAntigravity403(ctx context.Context, account *Ac
 	}
 }
 
+// EscalateGrokForbiddenOn403 在 Grok 转发路径出现真·permission-denied(403，且调用方已排除
+// free-usage 限流)时，决定是否把账号永久禁用。
+//
+// 对齐 OpenAI(见 handleOpenAI403)：复用同一个按账号计数的 403 计数器(窗口
+// openAI403CounterWindowMinutes，阈值 openAI403DisableThreshold；成功转发时在 RecordUsage 中复位)。
+// 因此语义是"连续 N 次 403"——达阈值即 SetError 永久移出调度，避免 xAI 回收权限后的死号在
+// "30 分钟冷却 → 放回 → 又 403"里无限 churn，拖垮真实请求并淹没健康账号。返回 true 表示已永久禁用；
+// 返回 false 表示尚未达阈值，由调用方按 Grok 既有语义做临时冷却。
+func (s *RateLimitService) EscalateGrokForbiddenOn403(ctx context.Context, account *Account, upstreamMsg string, responseBody []byte) (disabled bool) {
+	if s == nil || account == nil {
+		return false
+	}
+	msg := buildForbiddenErrorMessage(
+		"Grok access forbidden (403):",
+		upstreamMsg,
+		responseBody,
+		"entitlement denied or account restricted",
+	)
+	// 无计数器依赖时保守处理：不永久禁用，交由调用方临时冷却，避免单发 403 误杀。
+	if s.openAI403CounterCache == nil {
+		return false
+	}
+	count, err := s.openAI403CounterCache.IncrementOpenAI403Count(ctx, account.ID, openAI403CounterWindowMinutes)
+	if err != nil {
+		slog.Warn("grok_403_increment_failed", "account_id", account.ID, "error", err)
+		return false
+	}
+	if count >= openAI403DisableThreshold {
+		msg = fmt.Sprintf("%s | consecutive_403=%d/%d", msg, count, openAI403DisableThreshold)
+		s.handleAuthError(ctx, account, msg)
+		return true
+	}
+	slog.Warn("grok_403_temp_cooldown",
+		"account_id", account.ID,
+		"count", count,
+		"threshold", openAI403DisableThreshold,
+	)
+	return false
+}
+
+// DisableAccountOnAuthError 永久禁用账号(SetError)并广播调度阻塞，供网关侧对不可恢复的鉴权失败
+// (如无 refresh_token 的 Grok 401)复用集中式禁用逻辑，与 OpenAI 保持一致。
+func (s *RateLimitService) DisableAccountOnAuthError(ctx context.Context, account *Account, msg string) {
+	if s == nil || account == nil {
+		return
+	}
+	s.handleAuthError(ctx, account, msg)
+}
+
 // handleCustomErrorCode 处理自定义错误码，停止账号调度
 func (s *RateLimitService) handleCustomErrorCode(ctx context.Context, account *Account, statusCode int, errorMsg string) {
 	msg := "Custom error code " + strconv.Itoa(statusCode) + ": " + errorMsg

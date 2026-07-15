@@ -144,6 +144,17 @@ func ProvideGrokQuotaService(
 	return NewGrokQuotaService(accountRepo, proxyRepo, tokenProvider, httpUpstream)
 }
 
+// ProvideGrokErrorRecoveryService creates and starts the Grok sticky-403 recovery worker.
+func ProvideGrokErrorRecoveryService(
+	accountRepo AccountRepository,
+	quotaSvc *GrokQuotaService,
+	cfg *config.Config,
+) *GrokErrorRecoveryService {
+	svc := NewGrokErrorRecoveryService(accountRepo, quotaSvc, cfg)
+	svc.Start()
+	return svc
+}
+
 // ProvideGeminiTokenProvider creates GeminiTokenProvider with OAuthRefreshAPI injection
 func ProvideGeminiTokenProvider(
 	accountRepo AccountRepository,
@@ -598,6 +609,7 @@ var ProviderSet = wire.NewSet(
 	ProvideOpenAITokenProvider,
 	ProvideOpenAIQuotaService,
 	ProvideGrokQuotaService,
+	ProvideGrokErrorRecoveryService,
 	ProvideClaudeTokenProvider,
 	NewAntigravityGatewayService,
 	ProvideRateLimitService,

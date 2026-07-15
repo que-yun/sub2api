@@ -25,6 +25,15 @@ func (r *updateAccountCredsRepoStub) Update(ctx context.Context, account *Accoun
 	return nil
 }
 
+func (r *updateAccountCredsRepoStub) Create(ctx context.Context, account *Account) error {
+	r.updateCalls++
+	if account.ID == 0 {
+		account.ID = 1
+	}
+	r.account = account
+	return nil
+}
+
 func TestUpdateAccount_PreservesSensitiveCredsWhenIncomingOmits(t *testing.T) {
 	accountID := int64(202)
 	repo := &updateAccountCredsRepoStub{
@@ -114,4 +123,61 @@ func TestUpdateAccount_EmptyCredentialsSkipsUpdate(t *testing.T) {
 
 	require.Equal(t, "rt-existing", repo.account.Credentials["refresh_token"], "空 credentials 不应触碰已有 token")
 	require.Equal(t, "renamed", repo.account.Name)
+}
+
+func TestCreateAccount_GrokOAuthDefaultsReferrerAndBaseURL(t *testing.T) {
+	credsProbe := map[string]any{"access_token": "at"}
+	normalizeGrokOAuthCredentials(PlatformGrok, AccountTypeOAuth, credsProbe)
+	require.Equal(t, "grok-build", credsProbe["referrer"])
+
+	repo := &updateAccountCredsRepoStub{}
+	svc := &adminServiceImpl{accountRepo: repo}
+
+	created, err := svc.CreateAccount(context.Background(), &CreateAccountInput{
+		Name:                 "grok-oauth",
+		Platform:             PlatformGrok,
+		Type:                 AccountTypeOAuth,
+		Credentials:          map[string]any{"access_token": "at"},
+		SkipDefaultGroupBind: true,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, created)
+	require.Equal(t, 1, repo.updateCalls)
+	require.Equal(t, "grok-build", repo.account.Credentials["referrer"])
+	require.Equal(t, "https://api.x.ai/v1", repo.account.Credentials["base_url"])
+}
+
+func TestUpdateAccount_GrokOAuthDefaultsReferrerAndBaseURL(t *testing.T) {
+	accountID := int64(205)
+	repo := &updateAccountCredsRepoStub{
+		account: &Account{
+			ID:       accountID,
+			Platform: PlatformGrok,
+			Type:     AccountTypeOAuth,
+			Status:   StatusActive,
+			Credentials: map[string]any{
+				"access_token": "at-old",
+			},
+		},
+	}
+	svc := &adminServiceImpl{accountRepo: repo}
+
+	updated, err := svc.UpdateAccount(context.Background(), accountID, &UpdateAccountInput{
+		Credentials: map[string]any{
+			"access_token": "at-new",
+			"referrer":     "",
+			"base_url":     "",
+		},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	require.Equal(t, "at-new", repo.account.Credentials["access_token"])
+	require.Equal(t, "grok-build", repo.account.Credentials["referrer"])
+	require.Equal(t, "https://api.x.ai/v1", repo.account.Credentials["base_url"])
+	summary, ok := repo.account.Credentials["oauth_token_response_summary"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, true, summary["has_access_token"])
+	require.Equal(t, "grok-build", summary["referrer"])
 }

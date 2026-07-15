@@ -5,10 +5,12 @@ import (
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 type GrokOAuthHandler struct {
@@ -72,6 +74,7 @@ func (h *GrokOAuthHandler) ExchangeCode(c *gin.Context) {
 		response.ErrorFrom(c, err)
 		return
 	}
+	logGrokOAuthTokenInfo("exchange_code_response", tokenInfo)
 	response.Success(c, tokenInfo)
 }
 
@@ -109,6 +112,7 @@ func (h *GrokOAuthHandler) RefreshToken(c *gin.Context) {
 		response.ErrorFrom(c, err)
 		return
 	}
+	logGrokOAuthTokenInfo("refresh_token_response", tokenInfo)
 	response.Success(c, tokenInfo)
 }
 
@@ -136,6 +140,7 @@ func (h *GrokOAuthHandler) RefreshAccountToken(c *gin.Context) {
 		response.ErrorFrom(c, err)
 		return
 	}
+	logGrokOAuthTokenInfo("refresh_account_token_response", tokenInfo)
 	newCredentials := h.grokOAuthService.BuildAccountCredentials(tokenInfo)
 	newCredentials = service.MergeCredentials(account.Credentials, newCredentials)
 	if baseURL := strings.TrimSpace(account.GetCredential("base_url")); baseURL != "" {
@@ -178,6 +183,7 @@ func (h *GrokOAuthHandler) CreateAccountFromOAuth(c *gin.Context) {
 		response.ErrorFrom(c, err)
 		return
 	}
+	logGrokOAuthTokenInfo("create_from_oauth_response", tokenInfo)
 	credentials := h.grokOAuthService.BuildAccountCredentials(tokenInfo)
 
 	name := strings.TrimSpace(req.Name)
@@ -203,6 +209,35 @@ func (h *GrokOAuthHandler) CreateAccountFromOAuth(c *gin.Context) {
 		return
 	}
 	response.Success(c, dto.AccountFromService(account))
+}
+
+func logGrokOAuthTokenInfo(operation string, tokenInfo *service.GrokTokenInfo) {
+	if tokenInfo == nil {
+		logger.L().Warn("grok.oauth_token_info_response",
+			zap.String("component", "handler.admin.grok_oauth"),
+			zap.String("operation", operation),
+			zap.Bool("nil_response", true),
+		)
+		return
+	}
+	logger.L().Info("grok.oauth_token_info_response",
+		zap.String("component", "handler.admin.grok_oauth"),
+		zap.String("operation", operation),
+		zap.Bool("has_access_token", strings.TrimSpace(tokenInfo.AccessToken) != ""),
+		zap.Bool("has_refresh_token", strings.TrimSpace(tokenInfo.RefreshToken) != ""),
+		zap.Bool("has_id_token", strings.TrimSpace(tokenInfo.IDToken) != ""),
+		zap.String("token_type", tokenInfo.TokenType),
+		zap.Int64("expires_in", tokenInfo.ExpiresIn),
+		zap.Int64("expires_at", tokenInfo.ExpiresAt),
+		zap.String("client_id", strings.TrimSpace(tokenInfo.ClientID)),
+		zap.String("scope", tokenInfo.Scope),
+		zap.String("referrer", tokenInfo.Referrer),
+		zap.String("email", tokenInfo.Email),
+		zap.String("subscription_tier", tokenInfo.SubscriptionTier),
+		zap.String("entitlement_status", tokenInfo.EntitlementStatus),
+		zap.Strings("extra_keys", tokenInfo.TokenResponseExtraKeys),
+		zap.Any("extra", tokenInfo.TokenResponseExtra),
+	)
 }
 
 func (h *GrokOAuthHandler) QueryQuota(c *gin.Context) {

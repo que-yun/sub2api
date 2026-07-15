@@ -32,10 +32,14 @@ export interface GrokTokenInfo {
   expires_at?: number | string
   expires_in?: number
   scope?: string
+  referrer?: string
   client_id?: string
   email?: string
   subscription_tier?: string
   entitlement_status?: string
+  oauth_token_response_extra?: Record<string, unknown>
+  oauth_token_response_extra_keys?: string[]
+  oauth_token_response_summary?: Record<string, unknown>
   [key: string]: unknown
 }
 

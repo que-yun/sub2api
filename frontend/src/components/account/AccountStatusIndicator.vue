@@ -278,8 +278,35 @@ const isOverloaded = computed(() => {
   return new Date(props.account.overload_until) > new Date()
 })
 
-// Computed: is temp unschedulable
+// Grok entitlement/permission denials can outlive the temporary timer.
+// Until a successful request clears `extra.grok_hold_until_success`, keep the
+// account out of the "正常" bucket so operators can trust the badge.
+const hasGrokStickyHold = computed(() => {
+  if (props.account.platform !== 'grok') return false
+  const hold = props.account.extra?.grok_hold_until_success
+  return hold === true || hold === 1 || hold === '1' || hold === 'true'
+})
+
+// Fresh Grok 403 snapshots (probe/test/live) should not still look "正常".
+const hasFreshGrokForbiddenSnapshot = computed(() => {
+  if (props.account.platform !== 'grok') return false
+  const snap = props.account.extra?.grok_usage_snapshot as
+    | { status_code?: number; updated_at?: string; last_probe_at?: string }
+    | undefined
+  if (!snap || Number(snap.status_code) !== 403) return false
+  const ts = snap.last_probe_at || snap.updated_at
+  if (!ts) return true
+  const ageMs = Date.now() - new Date(ts).getTime()
+  if (Number.isNaN(ageMs)) return true
+  // Align with backend negative-snapshot freshness window (15m).
+  return ageMs <= 15 * 60 * 1000
+})
+
+// Computed: is temp unschedulable / effectively unavailable for scheduling
 const isTempUnschedulable = computed(() => {
+  if (hasGrokStickyHold.value || hasFreshGrokForbiddenSnapshot.value) {
+    return true
+  }
   if (!props.account.temp_unschedulable_until) return false
   return new Date(props.account.temp_unschedulable_until) > new Date()
 })

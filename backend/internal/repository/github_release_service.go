@@ -18,6 +18,7 @@ import (
 type githubReleaseClient struct {
 	httpClient         *http.Client
 	downloadHTTPClient *http.Client
+	token              string
 }
 
 type githubReleaseClientError struct {
@@ -29,9 +30,10 @@ type githubReleaseClientError struct {
 // 代理配置失败时行为由 allowDirectOnProxyError 控制：
 //   - false（默认）：返回错误占位客户端，禁止回退到直连
 //   - true：回退到直连（仅限管理员显式开启）
-func NewGitHubReleaseClient(proxyURL string, allowDirectOnProxyError bool) service.GitHubReleaseClient {
+func NewGitHubReleaseClient(proxyURL string, allowDirectOnProxyError bool, token string) service.GitHubReleaseClient {
 	// 安全说明：httpclient.GetClient 的错误链（url.Parse / proxyutil）不含明文代理凭据，
 	// 但仍通过 slog 仅在服务端日志记录，不会暴露给 HTTP 响应。
+	// token 只用于 Authorization 头，不写日志。
 	sharedClient, err := httpclient.GetClient(httpclient.Options{
 		Timeout:  30 * time.Second,
 		ProxyURL: proxyURL,
@@ -60,6 +62,16 @@ func NewGitHubReleaseClient(proxyURL string, allowDirectOnProxyError bool) servi
 	return &githubReleaseClient{
 		httpClient:         sharedClient,
 		downloadHTTPClient: downloadClient,
+		token:              strings.TrimSpace(token),
+	}
+}
+
+// setGitHubAPIHeaders 设置 GitHub API 请求头；有 token 时走认证配额（约 5000/h）。
+func (c *githubReleaseClient) setGitHubAPIHeaders(req *http.Request) {
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	req.Header.Set("User-Agent", "Sub2API-Updater")
+	if c != nil && c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 }
 
@@ -86,8 +98,7 @@ func (c *githubReleaseClient) FetchLatestRelease(ctx context.Context, repo strin
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	req.Header.Set("User-Agent", "Sub2API-Updater")
+	c.setGitHubAPIHeaders(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -120,8 +131,7 @@ func (c *githubReleaseClient) FetchRecentReleases(ctx context.Context, repo stri
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	req.Header.Set("User-Agent", "Sub2API-Updater")
+	c.setGitHubAPIHeaders(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

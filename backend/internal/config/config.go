@@ -88,6 +88,7 @@ type Config struct {
 	UsageCleanup            UsageCleanupConfig            `mapstructure:"usage_cleanup"`
 	Concurrency             ConcurrencyConfig             `mapstructure:"concurrency"`
 	TokenRefresh            TokenRefreshConfig            `mapstructure:"token_refresh"`
+	GrokErrorRecovery       GrokErrorRecoveryConfig       `mapstructure:"grok_error_recovery"`
 	RunMode                 string                        `mapstructure:"run_mode" yaml:"run_mode"`
 	Timezone                string                        `mapstructure:"timezone"` // e.g. "Asia/Shanghai", "UTC"
 	Gemini                  GeminiConfig                  `mapstructure:"gemini"`
@@ -155,6 +156,9 @@ type UpdateConfig struct {
 	// 支持 http/https/socks5/socks5h 协议
 	// 例如: "http://127.0.0.1:7890", "socks5://127.0.0.1:1080"
 	ProxyURL string `mapstructure:"proxy_url"`
+	// Token 可选 GitHub token，用于提升 api.github.com 速率配额（避免匿名 60/h 限流）
+	// 环境变量：UPDATE_TOKEN；也可用 GITHUB_TOKEN / GH_TOKEN 由启动脚本注入
+	Token string `mapstructure:"token"`
 }
 
 type IdempotencyConfig struct {
@@ -580,6 +584,23 @@ type TokenRefreshConfig struct {
 	MaxRetries int `mapstructure:"max_retries"`
 	// 重试退避基础时间（秒）
 	RetryBackoffSeconds int `mapstructure:"retry_backoff_seconds"`
+}
+
+// GrokErrorRecoveryConfig 周期性探测 Grok OAuth entitlement/403 error 账号并尝试恢复。
+// 与 token_refresh 分离：token keep-alive 只管 active；本配置只管 sticky 403 恢复队列。
+type GrokErrorRecoveryConfig struct {
+	// 是否启用后台恢复
+	Enabled bool `mapstructure:"enabled"`
+	// 检查间隔（小时）
+	CheckIntervalHours float64 `mapstructure:"check_interval_hours"`
+	// 同一账号两次 probe 的最小间隔（小时）
+	MinReprobeIntervalHours float64 `mapstructure:"min_reprobe_interval_hours"`
+	// 单轮并发 probe 数
+	Concurrency int `mapstructure:"concurrency"`
+	// 单轮最多 probe 的账号数（控成本）
+	MaxAccountsPerCycle int `mapstructure:"max_accounts_per_cycle"`
+	// 启动时是否立即跑一轮
+	RunOnStart bool `mapstructure:"run_on_start"`
 }
 
 type PricingConfig struct {
@@ -2082,6 +2103,14 @@ func setDefaults() {
 	viper.SetDefault("token_refresh.refresh_before_expiry_hours", 0.5) // 提前30分钟刷新（适配Google 1小时token）
 	viper.SetDefault("token_refresh.max_retries", 3)                   // 最多重试3次
 	viper.SetDefault("token_refresh.retry_backoff_seconds", 2)         // 重试退避基础2秒
+
+	// GrokErrorRecovery: sticky entitlement/403 recovery (not full-pool token refresh)
+	viper.SetDefault("grok_error_recovery.enabled", true)
+	viper.SetDefault("grok_error_recovery.check_interval_hours", 6)         // 每 6 小时一轮
+	viper.SetDefault("grok_error_recovery.min_reprobe_interval_hours", 6) // 单号最短 6 小时再探
+	viper.SetDefault("grok_error_recovery.concurrency", 4)
+	viper.SetDefault("grok_error_recovery.max_accounts_per_cycle", 120)
+	viper.SetDefault("grok_error_recovery.run_on_start", false)
 
 	// Gemini OAuth - configure via environment variables or config file
 	// GEMINI_OAUTH_CLIENT_ID and GEMINI_OAUTH_CLIENT_SECRET

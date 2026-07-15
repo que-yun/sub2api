@@ -711,8 +711,7 @@ func (s *AccountTestService) testGrokAccountConnection(c *gin.Context, account *
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Authorization", "Bearer "+authToken)
-	req.Header.Set("User-Agent", "sub2api-grok/1.0")
-	xai.MaybeApplyCLIChatProxyHeaders(req.Header, account.GetGrokBaseURL())
+	xai.ApplyGrokBuildHeaders(req.Header)
 
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {
@@ -725,7 +724,11 @@ func (s *AccountTestService) testGrokAccountConnection(c *gin.Context, account *
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if snapshot := xai.ParseQuotaHeaders(resp.Header, resp.StatusCode); snapshot != nil && s.accountRepo != nil {
+	snapshot := xai.ParseQuotaHeaders(resp.Header, resp.StatusCode)
+	if snapshot == nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+		snapshot = xai.ObserveQuotaHeaders(resp.Header, resp.StatusCode, "account_test")
+	}
+	if snapshot != nil && s.accountRepo != nil {
 		_ = s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{
 			grokQuotaSnapshotExtraKey: snapshot,
 		})
@@ -733,9 +736,14 @@ func (s *AccountTestService) testGrokAccountConnection(c *gin.Context, account *
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		// Manual/admin tests must update readiness like live traffic:
+		// 403 must leave the account temporarily unschedulable, not "正常".
+		ApplyGrokProbeOrTestStatus(ctx, s.accountRepo, nil, account, resp.StatusCode, resp.Header, body, "account_test")
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Grok Responses API returned %d: %s", resp.StatusCode, string(body)))
 	}
 
+	// Successful test is a recovery signal for sticky entitlement holds.
+	ApplyGrokProbeOrTestStatus(ctx, s.accountRepo, nil, account, resp.StatusCode, resp.Header, nil, "account_test")
 	return s.processOpenAIStream(c, resp.Body)
 }
 

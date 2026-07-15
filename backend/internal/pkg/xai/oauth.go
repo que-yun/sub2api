@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +28,7 @@ const (
 	DefaultClientID     = "b1a00492-073a-47ea-816f-4c329264a828"
 	DefaultScope        = "openid profile email offline_access grok-cli:access api:access"
 	DefaultRedirectURI  = "http://127.0.0.1:56121/callback"
+	DefaultReferrer     = "grok-build"
 	SessionTTL          = 30 * time.Minute
 
 	EnvAuthorizeURL               = "XAI_OAUTH_AUTHORIZE_URL"
@@ -375,7 +378,7 @@ func BuildAuthorizationURL(state, codeChallenge, redirectURI, nonce string) (str
 	params.Set("code_challenge", codeChallenge)
 	params.Set("code_challenge_method", "S256")
 	params.Set("plan", "generic")
-	params.Set("referrer", "sub2api")
+	params.Set("referrer", DefaultReferrer)
 
 	return fmt.Sprintf("%s?%s", authorizeURL, params.Encode()), nil
 }
@@ -475,10 +478,72 @@ func BuildVideoURL(baseURL, requestID string) (string, error) {
 
 // TokenResponse represents xAI OAuth token responses.
 type TokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	IDToken      string `json:"id_token,omitempty"`
-	TokenType    string `json:"token_type,omitempty"`
-	ExpiresIn    int64  `json:"expires_in,omitempty"`
-	Scope        string `json:"scope,omitempty"`
+	AccessToken  string         `json:"access_token"`
+	RefreshToken string         `json:"refresh_token,omitempty"`
+	IDToken      string         `json:"id_token,omitempty"`
+	TokenType    string         `json:"token_type,omitempty"`
+	ExpiresIn    int64          `json:"expires_in,omitempty"`
+	Scope        string         `json:"scope,omitempty"`
+	Referrer     string         `json:"referrer,omitempty"`
+	Extra        map[string]any `json:"-"`
+	ExtraKeys    []string       `json:"-"`
+}
+
+var tokenResponseKnownFields = map[string]struct{}{
+	"access_token":  {},
+	"refresh_token": {},
+	"id_token":      {},
+	"token_type":    {},
+	"expires_in":    {},
+	"scope":         {},
+	"referrer":      {},
+}
+
+var tokenResponseExtraSensitiveKeys = []string{
+	"accessToken",
+	"refreshToken",
+	"idToken",
+	"bearerToken",
+	"sessionToken",
+	"token",
+	"jwt",
+	"secret",
+	"authorization",
+	"cookie",
+}
+
+func (r *TokenResponse) UnmarshalJSON(data []byte) error {
+	type tokenResponseAlias TokenResponse
+	var alias tokenResponseAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	*r = TokenResponse(alias)
+	r.Extra = nil
+	r.ExtraKeys = nil
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	extra := make(map[string]any)
+	keys := make([]string, 0)
+	for key, value := range raw {
+		if _, ok := tokenResponseKnownFields[key]; ok {
+			continue
+		}
+		var decoded any
+		if err := json.Unmarshal(value, &decoded); err != nil {
+			decoded = string(value)
+		}
+		extra[key] = decoded
+		keys = append(keys, key)
+	}
+	if len(extra) == 0 {
+		return nil
+	}
+	sort.Strings(keys)
+	r.Extra = logredact.RedactMap(extra, tokenResponseExtraSensitiveKeys...)
+	r.ExtraKeys = keys
+	return nil
 }

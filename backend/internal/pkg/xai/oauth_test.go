@@ -3,6 +3,7 @@
 package xai
 
 import (
+	"encoding/json"
 	"net/url"
 	"testing"
 
@@ -63,6 +64,34 @@ func TestParseAuthorizationInput(t *testing.T) {
 	}
 }
 
+func TestTokenResponseCapturesRedactedExtraFields(t *testing.T) {
+	raw := []byte(`{
+		"access_token":"access-secret",
+		"refresh_token":"refresh-secret",
+		"token_type":"Bearer",
+		"expires_in":3600,
+		"scope":"openid",
+		"referrer":"grok-build",
+		"team_id":"team-123",
+		"user_id":"user-456",
+		"accessToken":"extra-access-secret",
+		"nested":{"refreshToken":"extra-refresh-secret","plan":"free"}
+	}`)
+
+	var resp TokenResponse
+	require.NoError(t, json.Unmarshal(raw, &resp))
+	require.Equal(t, "access-secret", resp.AccessToken)
+	require.Equal(t, "grok-build", resp.Referrer)
+	require.Equal(t, "team-123", resp.Extra["team_id"])
+	require.Equal(t, "***", resp.Extra["accessToken"])
+
+	nested, ok := resp.Extra["nested"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "***", nested["refreshToken"])
+	require.Equal(t, "free", nested["plan"])
+	require.Equal(t, []string{"accessToken", "nested", "team_id", "user_id"}, resp.ExtraKeys)
+}
+
 func TestBuildAuthorizationURLIncludesHermesCompatibleParameters(t *testing.T) {
 	t.Setenv(EnvAuthorizeURL, "https://auth.example.test/oauth2/authorize")
 	t.Setenv(EnvClientID, "client-id")
@@ -87,7 +116,7 @@ func TestBuildAuthorizationURLIncludesHermesCompatibleParameters(t *testing.T) {
 	require.Equal(t, "challenge", values.Get("code_challenge"))
 	require.Equal(t, "S256", values.Get("code_challenge_method"))
 	require.Equal(t, "generic", values.Get("plan"))
-	require.Equal(t, "sub2api", values.Get("referrer"))
+	require.Equal(t, DefaultReferrer, values.Get("referrer"))
 }
 
 func TestValidateXAIURLsAllowOfficialOAuthAndGatewayHosts(t *testing.T) {

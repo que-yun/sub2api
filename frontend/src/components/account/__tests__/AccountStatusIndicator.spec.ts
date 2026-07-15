@@ -160,3 +160,60 @@ describe('AccountStatusIndicator', () => {
     expect(wrapper.text()).toContain('admin.accounts.status.creditsExhausted')
   })
 })
+
+  it('Grok sticky entitlement hold is not shown as active/normal', () => {
+    const wrapper = mount(AccountStatusIndicator, {
+      props: {
+        account: makeAccount({
+          id: 5,
+          name: 'grok-hold',
+          platform: 'grok',
+          status: 'active',
+          schedulable: true,
+          temp_unschedulable_until: null,
+          temp_unschedulable_reason: null,
+          extra: {
+            grok_hold_until_success: true
+          }
+        })
+      },
+      global: {
+        stubs: {
+          Icon: true
+        }
+      }
+    })
+
+    expect(wrapper.text()).toContain('admin.accounts.status.tempUnschedulable')
+    expect(wrapper.text()).not.toContain('admin.accounts.status.active')
+  })
+
+  it('fresh Grok 403 probe snapshot is not shown as active/normal', () => {
+    const wrapper = mount(AccountStatusIndicator, {
+      props: {
+        account: makeAccount({
+          id: 6,
+          name: 'grok-403',
+          platform: 'grok',
+          status: 'active',
+          schedulable: true,
+          temp_unschedulable_until: null,
+          extra: {
+            grok_usage_snapshot: {
+              status_code: 403,
+              updated_at: new Date().toISOString(),
+              last_probe_at: new Date().toISOString()
+            }
+          }
+        })
+      },
+      global: {
+        stubs: {
+          Icon: true
+        }
+      }
+    })
+
+    expect(wrapper.text()).toContain('admin.accounts.status.tempUnschedulable')
+  })
+

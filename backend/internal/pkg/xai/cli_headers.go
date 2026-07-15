@@ -10,8 +10,8 @@ import (
 // Without them the upstream returns HTTP 426 "Grok CLI version (none) is outdated".
 const (
 	DefaultCLIClientVersion    = "0.2.93"
-	DefaultCLIClientIdentifier = "grok-shell"
-	DefaultCLIUserAgent        = "grok-shell/" + DefaultCLIClientVersion + " (linux; x86_64)"
+	DefaultCLIClientIdentifier = "grok-pager"
+	DefaultCLIUserAgent        = "grok-pager/" + DefaultCLIClientVersion + " grok-shell/" + DefaultCLIClientVersion + " (linux; x86_64)"
 	DefaultCLITokenAuth        = "xai-grok-cli"
 	DefaultCLIAuthenticateResp = "authenticate-response"
 )
@@ -33,9 +33,9 @@ func IsCLIChatProxyBaseURL(baseURL string) bool {
 	return host == "cli-chat-proxy.grok.com"
 }
 
-// ApplyCLIChatProxyHeaders sets the minimum Grok CLI headers required by cli-chat-proxy.
+// ApplyGrokBuildHeaders sets the Grok Build client headers expected by xAI.
 // Existing non-empty headers are preserved.
-func ApplyCLIChatProxyHeaders(h http.Header) {
+func ApplyGrokBuildHeaders(h http.Header) {
 	if h == nil {
 		return
 	}
@@ -54,6 +54,12 @@ func ApplyCLIChatProxyHeaders(h http.Header) {
 	if strings.TrimSpace(h.Get("x-authenticateresponse")) == "" {
 		h.Set("x-authenticateresponse", DefaultCLIAuthenticateResp)
 	}
+}
+
+// ApplyCLIChatProxyHeaders sets the minimum Grok CLI headers required by cli-chat-proxy.
+// Existing non-empty headers are preserved.
+func ApplyCLIChatProxyHeaders(h http.Header) {
+	ApplyGrokBuildHeaders(h)
 }
 
 // MaybeApplyCLIChatProxyHeaders applies CLI headers only when baseURL is cli-chat-proxy.

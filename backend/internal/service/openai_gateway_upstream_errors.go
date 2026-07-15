@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
@@ -114,6 +115,240 @@ func isOpenAIInstructionsRequiredError(upstreamStatusCode int, upstreamMsg strin
 	}
 
 	return false
+}
+
+func logGrokModelInputDebug(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	upstreamStatusCode int,
+	requestBody []byte,
+	upstreamBody []byte,
+) {
+	if account == nil || account.Platform != PlatformGrok || upstreamStatusCode != http.StatusUnprocessableEntity {
+		return
+	}
+	if !strings.Contains(string(upstreamBody), "ModelInput") {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	userAgent := ""
+	originator := ""
+	if c != nil {
+		userAgent = strings.TrimSpace(c.GetHeader("User-Agent"))
+		originator = strings.TrimSpace(c.GetHeader("originator"))
+	}
+
+	logger.FromContext(ctx).With(
+		zap.String("component", "service.openai_gateway"),
+		zap.Int64("account_id", account.ID),
+		zap.String("account_name", strings.TrimSpace(account.Name)),
+		zap.Int("upstream_status_code", upstreamStatusCode),
+		zap.String("request_user_agent", userAgent),
+		zap.Bool("codex_official_client_match", openai.IsCodexOfficialClientByHeaders(userAgent, originator)),
+		zap.Any("request_shape", summarizeGrokRequestShape(requestBody)),
+	).Warn("Grok 上游无法反序列化 Responses input，已记录脱敏请求结构")
+}
+
+func summarizeGrokRequestShape(body []byte) map[string]any {
+	shape := map[string]any{
+		"body_bytes": len(body),
+		"valid_json": json.Valid(body),
+	}
+	if !json.Valid(body) {
+		return shape
+	}
+
+	root := gjson.ParseBytes(body)
+	if root.IsObject() {
+		shape["top_level_keys"] = sortedGJSONObjectKeys(root)
+	}
+	shape["model"] = root.Get("model").String()
+	shape["stream"] = root.Get("stream").Bool()
+	if root.Get("previous_response_id").Exists() {
+		shape["has_previous_response_id"] = true
+	}
+	if tools := root.Get("tools"); tools.Exists() {
+		shape["tools"] = summarizeGrokJSONArray(tools, 20, summarizeGrokToolShape)
+	}
+	if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
+		shape["tool_choice_type"] = gjsonTypeName(toolChoice)
+	}
+
+	input := root.Get("input")
+	shape["input_type"] = gjsonTypeName(input)
+	if input.IsArray() {
+		items := input.Array()
+		shape["input_count"] = len(items)
+		shape["input_items"] = summarizeGrokJSONArray(input, 80, summarizeGrokInputItemShape)
+	} else if input.Type == gjson.String {
+		shape["input_text_bytes"] = len(input.String())
+	}
+	return shape
+}
+
+func summarizeGrokJSONArray(value gjson.Result, limit int, fn func(gjson.Result) map[string]any) []map[string]any {
+	if !value.IsArray() || limit <= 0 {
+		return nil
+	}
+	items := value.Array()
+	out := make([]map[string]any, 0, minInt(len(items), limit))
+	for i, item := range items {
+		if i >= limit {
+			break
+		}
+		summary := fn(item)
+		summary["index"] = i
+		out = append(out, summary)
+	}
+	return out
+}
+
+func summarizeGrokInputItemShape(item gjson.Result) map[string]any {
+	shape := map[string]any{
+		"json_type": gjsonTypeName(item),
+	}
+	if !item.IsObject() {
+		if item.Type == gjson.String {
+			shape["text_bytes"] = len(item.String())
+		}
+		return shape
+	}
+
+	shape["keys"] = sortedGJSONObjectKeys(item)
+	itemType := strings.TrimSpace(item.Get("type").String())
+	shape["type"] = itemType
+	for _, field := range []string{"id", "call_id", "status", "role", "name"} {
+		if v := strings.TrimSpace(item.Get(field).String()); v != "" {
+			shape[field] = v
+		}
+	}
+	if content := item.Get("content"); content.Exists() {
+		shape["content_type"] = gjsonTypeName(content)
+		if content.IsArray() {
+			shape["content_count"] = len(content.Array())
+			shape["content_items"] = summarizeGrokJSONArray(content, 20, summarizeGrokContentItemShape)
+		} else if content.Type == gjson.String {
+			shape["content_bytes"] = len(content.String())
+		}
+	}
+	if summary := item.Get("summary"); summary.Exists() {
+		shape["summary_type"] = gjsonTypeName(summary)
+		if summary.IsArray() {
+			shape["summary_count"] = len(summary.Array())
+		}
+	}
+	if queries := item.Get("queries"); queries.Exists() {
+		shape["queries_type"] = gjsonTypeName(queries)
+		if queries.IsArray() {
+			shape["queries_count"] = len(queries.Array())
+		}
+	}
+	if tools := item.Get("tools"); tools.Exists() {
+		shape["tools_type"] = gjsonTypeName(tools)
+		if tools.IsArray() {
+			shape["tools_count"] = len(tools.Array())
+			shape["tools"] = summarizeGrokJSONArray(tools, 40, summarizeGrokToolShape)
+		}
+	}
+	for _, field := range []string{"text", "output", "result", "arguments"} {
+		if v := item.Get(field); v.Exists() {
+			shape[field+"_type"] = gjsonTypeName(v)
+			if v.Type == gjson.String {
+				shape[field+"_bytes"] = len(v.String())
+			}
+		}
+	}
+	return shape
+}
+
+func summarizeGrokContentItemShape(item gjson.Result) map[string]any {
+	shape := map[string]any{
+		"json_type": gjsonTypeName(item),
+	}
+	if item.IsObject() {
+		shape["keys"] = sortedGJSONObjectKeys(item)
+		if t := strings.TrimSpace(item.Get("type").String()); t != "" {
+			shape["type"] = t
+		}
+		for _, field := range []string{"text", "input_text", "output_text"} {
+			if v := item.Get(field); v.Exists() {
+				shape[field+"_type"] = gjsonTypeName(v)
+				if v.Type == gjson.String {
+					shape[field+"_bytes"] = len(v.String())
+				}
+			}
+		}
+		return shape
+	}
+	if item.Type == gjson.String {
+		shape["text_bytes"] = len(item.String())
+	}
+	return shape
+}
+
+func summarizeGrokToolShape(item gjson.Result) map[string]any {
+	shape := map[string]any{
+		"json_type": gjsonTypeName(item),
+	}
+	if !item.IsObject() {
+		return shape
+	}
+	shape["keys"] = sortedGJSONObjectKeys(item)
+	for _, field := range []string{"type", "name"} {
+		if v := strings.TrimSpace(item.Get(field).String()); v != "" {
+			shape[field] = v
+		}
+	}
+	if fnName := strings.TrimSpace(item.Get("function.name").String()); fnName != "" {
+		shape["function_name"] = fnName
+	}
+	return shape
+}
+
+func sortedGJSONObjectKeys(value gjson.Result) []string {
+	if !value.IsObject() {
+		return nil
+	}
+	keys := make([]string, 0)
+	value.ForEach(func(key, _ gjson.Result) bool {
+		keys = append(keys, key.String())
+		return true
+	})
+	sort.Strings(keys)
+	return keys
+}
+
+func gjsonTypeName(value gjson.Result) string {
+	if !value.Exists() {
+		return "missing"
+	}
+	switch {
+	case value.IsArray():
+		return "array"
+	case value.IsObject():
+		return "object"
+	case value.Type == gjson.String:
+		return "string"
+	case value.Type == gjson.Number:
+		return "number"
+	case value.Type == gjson.True || value.Type == gjson.False:
+		return "bool"
+	case value.Type == gjson.Null:
+		return "null"
+	default:
+		return "json"
+	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func isOpenAITransientProcessingError(upstreamStatusCode int, upstreamMsg string, upstreamBody []byte) bool {
@@ -315,6 +550,7 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 	}
 	setOpsUpstreamError(c, resp.StatusCode, upstreamMsg, upstreamDetail)
 	logOpenAIInstructionsRequiredDebug(ctx, c, account, resp.StatusCode, upstreamMsg, requestBody, body)
+	logGrokModelInputDebug(ctx, c, account, resp.StatusCode, requestBody, body)
 
 	if s.cfg != nil && s.cfg.Gateway.LogUpstreamErrorBody {
 		logger.LegacyPrintf("service.openai_gateway",

@@ -566,6 +566,43 @@ describe('AccountUsageCell', () => {
 		expect(badges.some(node => node.attributes('title') === 'usage.userBilled')).toBe(true)
   })
 
+  it('Grok OAuth 在 forbidden 状态仍保留探测入口', async () => {
+    getUsage.mockResolvedValue({
+      is_forbidden: true,
+      forbidden_type: 'forbidden',
+      grok_entitlement_status: 'forbidden',
+      grok_last_status_code: 403,
+      grok_last_quota_probe_at: '2026-07-13T04:20:00Z',
+      grok_quota_snapshot_state: 'no_headers'
+    })
+
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({
+          id: 3862,
+          platform: 'grok',
+          type: 'oauth',
+          extra: {}
+        })
+      },
+      global: {
+        stubs: {
+          UsageProgressBar: true,
+          AccountQuotaInfo: true,
+          GrokQuotaProbeCell: {
+            template: '<div data-test="grok-probe-cell">probe</div>'
+          }
+        }
+      }
+    })
+
+    await flushPromises()
+
+    expect(getUsage).toHaveBeenCalledWith(3862)
+    expect(wrapper.text()).toContain('forbidden')
+    expect(wrapper.find('[data-test="grok-probe-cell"]').exists()).toBe(true)
+  })
+
   it('Grok OAuth 会展示本地 user billed 用量并保留超限百分比', async () => {
     getUsage.mockResolvedValue({
       grok_local_usage: {

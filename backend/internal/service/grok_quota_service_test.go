@@ -26,13 +26,35 @@ type grokQuotaAccountRepo struct {
 	rateLimitCalls        int
 	lastRateLimitID       int64
 	lastRateLimitUntil    time.Time
+	setErrorCalls         int
+	lastErrorID           int64
+	lastErrorMsg          string
+	clearErrorCalls       int
+	lastClearErrorID      int64
+	setSchedulableCalls   int
+	lastSetSchedulableID  int64
+	lastSetSchedulable    bool
 }
 
 func (r *grokQuotaAccountRepo) UpdateExtra(_ context.Context, id int64, updates map[string]any) error {
 	if r.updates == nil {
 		r.updates = make(map[int64]map[string]any)
 	}
-	r.updates[id] = updates
+	cur := r.updates[id]
+	if cur == nil {
+		cur = make(map[string]any)
+		r.updates[id] = cur
+	}
+	for k, v := range updates {
+		cur[k] = v
+	}
+	return nil
+}
+
+func (r *grokQuotaAccountRepo) ClearTempUnschedulable(_ context.Context, id int64) error {
+	r.lastTempUnschedID = id
+	r.lastTempUnschedUntil = time.Time{}
+	r.lastTempUnschedReason = ""
 	return nil
 }
 
@@ -41,6 +63,26 @@ func (r *grokQuotaAccountRepo) SetTempUnschedulable(_ context.Context, id int64,
 	r.lastTempUnschedID = id
 	r.lastTempUnschedUntil = until
 	r.lastTempUnschedReason = reason
+	return nil
+}
+
+func (r *grokQuotaAccountRepo) SetError(_ context.Context, id int64, errorMsg string) error {
+	r.setErrorCalls++
+	r.lastErrorID = id
+	r.lastErrorMsg = errorMsg
+	return nil
+}
+
+func (r *grokQuotaAccountRepo) ClearError(_ context.Context, id int64) error {
+	r.clearErrorCalls++
+	r.lastClearErrorID = id
+	return nil
+}
+
+func (r *grokQuotaAccountRepo) SetSchedulable(_ context.Context, id int64, schedulable bool) error {
+	r.setSchedulableCalls++
+	r.lastSetSchedulableID = id
+	r.lastSetSchedulable = schedulable
 	return nil
 }
 

@@ -1134,3 +1134,7 @@ update:
   # Leave empty for direct connection (recommended for overseas servers)
   # 留空表示直连（适用于海外服务器）
   proxy_url: ""
+  # Optional GitHub token for api.github.com authenticated rate limit (~5000/h).
+  # 可选：用于避免匿名 60/h 限流。环境变量 UPDATE_TOKEN。
+  # 注意：不要把真实 token 提交进仓库。
+  token: ""

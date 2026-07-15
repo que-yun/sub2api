@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +15,7 @@ import (
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 )
 
 // Account management implementations
@@ -68,6 +71,111 @@ func normalizeAccountConcurrency(platform, accountType string, concurrency int) 
 	return concurrency
 }
 
+func normalizeGrokOAuthCredentials(platform, accountType string, credentials map[string]any) {
+	if platform != PlatformGrok || accountType != AccountTypeOAuth || credentials == nil {
+		return
+	}
+	if strings.TrimSpace(credentialValueString(credentials, "referrer")) == "" {
+		credentials["referrer"] = xai.DefaultReferrer
+	}
+	if strings.TrimSpace(credentialValueString(credentials, "base_url")) == "" {
+		credentials["base_url"] = xai.DefaultBaseURL
+	}
+	credentials["oauth_token_response_summary"] = buildGrokOAuthCredentialSummary(credentials)
+}
+
+func credentialValueString(credentials map[string]any, key string) string {
+	value, ok := credentials[key]
+	if !ok || value == nil {
+		return ""
+	}
+	return fmt.Sprint(value)
+}
+
+func buildGrokOAuthCredentialSummary(credentials map[string]any) map[string]any {
+	summary := map[string]any{
+		"has_access_token":  strings.TrimSpace(credentialValueString(credentials, "access_token")) != "",
+		"has_refresh_token": strings.TrimSpace(credentialValueString(credentials, "refresh_token")) != "",
+		"has_id_token":      strings.TrimSpace(credentialValueString(credentials, "id_token")) != "",
+	}
+	for _, key := range []string{
+		"token_type",
+		"expires_in",
+		"expires_at",
+		"client_id",
+		"scope",
+		"referrer",
+		"email",
+		"subscription_tier",
+		"entitlement_status",
+	} {
+		if value, ok := credentials[key]; ok && value != nil && strings.TrimSpace(fmt.Sprint(value)) != "" {
+			summary[key] = value
+		}
+	}
+	if value, ok := credentials["oauth_token_response_extra_keys"]; ok && value != nil {
+		summary["extra_keys"] = value
+	}
+	if claims := grokOAuthJWTClaimsSummary(credentialValueString(credentials, "access_token"), grokAccessTokenClaimAllowlist); len(claims) > 0 {
+		summary["access_token_claims"] = claims
+	}
+	if claims := grokOAuthJWTClaimsSummary(credentialValueString(credentials, "id_token"), grokIDTokenClaimAllowlist); len(claims) > 0 {
+		summary["id_token_claims"] = claims
+	}
+	return summary
+}
+
+var grokAccessTokenClaimAllowlist = map[string]struct{}{
+	"iss":            {},
+	"sub":            {},
+	"aud":            {},
+	"exp":            {},
+	"iat":            {},
+	"scope":          {},
+	"principal_type": {},
+	"principal_id":   {},
+	"client_id":      {},
+	"jti":            {},
+	"tier":           {},
+	"team_id":        {},
+	"referrer":       {},
+}
+
+var grokIDTokenClaimAllowlist = map[string]struct{}{
+	"iss":            {},
+	"sub":            {},
+	"aud":            {},
+	"exp":            {},
+	"iat":            {},
+	"nonce":          {},
+	"given_name":     {},
+	"family_name":    {},
+	"email":          {},
+	"email_verified": {},
+}
+
+func grokOAuthJWTClaimsSummary(token string, allowlist map[string]struct{}) map[string]any {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) < 2 {
+		return nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil
+	}
+	summary := make(map[string]any, len(allowlist))
+	for key := range allowlist {
+		if value, ok := claims[key]; ok {
+			summary[key] = value
+		}
+	}
+	return summary
+}
+
 func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccountInput) (*Account, error) {
 	// 绑定分组
 	groupIDs := input.GroupIDs
@@ -96,6 +204,7 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	if err := NormalizeHeaderOverrideCredentials(input.Credentials); err != nil {
 		return nil, err
 	}
+	normalizeGrokOAuthCredentials(input.Platform, input.Type, input.Credentials)
 
 	account := &Account{
 		Name:        input.Name,
@@ -231,6 +340,7 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		if err := NormalizeHeaderOverrideCredentials(account.Credentials); err != nil {
 			return nil, err
 		}
+		normalizeGrokOAuthCredentials(account.Platform, account.Type, account.Credentials)
 	}
 	// Extra 使用 map：需要区分“未提供(nil)”与“显式清空({})”。
 	// 关闭配额限制时前端会删除 quota_* 键并提交 extra:{}，此时也必须落库。

@@ -134,3 +134,40 @@ func TestGrokQuotaFetcherClassifiesForbiddenAndReauth(t *testing.T) {
 		})
 	}
 }
+
+func TestGrokQuotaFetcherStaleNegativeSnapshotNotAsserted(t *testing.T) {
+	t.Parallel()
+
+	staleTs := time.Now().Add(-2 * grokNegativeSnapshotFreshWindow).UTC().Format(time.RFC3339)
+	freshTs := time.Now().UTC().Format(time.RFC3339)
+
+	newAccount := func(status int, ts string) *Account {
+		return &Account{
+			Platform: PlatformGrok,
+			Type:     AccountTypeOAuth,
+			Extra: map[string]any{
+				grokQuotaSnapshotExtraKey: xai.QuotaSnapshot{
+					StatusCode:      status,
+					HeadersObserved: true,
+					UpdatedAt:       ts,
+				},
+			},
+		}
+	}
+
+	// 陈旧 403：不再断言 forbidden，标记 stale，避免把已恢复的账号误红标。
+	staleForbidden := NewGrokQuotaFetcher().BuildUsageInfo(newAccount(http.StatusForbidden, staleTs))
+	require.False(t, staleForbidden.IsForbidden, "陈旧 403 不应再判定 forbidden")
+	require.NotEqual(t, "forbidden", staleForbidden.GrokEntitlementStatus)
+	require.Equal(t, "stale", staleForbidden.GrokQuotaSnapshotState)
+
+	// 新鲜 403：仍正常判定 forbidden。
+	freshForbidden := NewGrokQuotaFetcher().BuildUsageInfo(newAccount(http.StatusForbidden, freshTs))
+	require.True(t, freshForbidden.IsForbidden, "新鲜 403 仍应判定 forbidden")
+	require.Equal(t, "forbidden", freshForbidden.GrokEntitlementStatus)
+
+	// 陈旧 401：不再断言 needs_reauth。
+	staleReauth := NewGrokQuotaFetcher().BuildUsageInfo(newAccount(http.StatusUnauthorized, staleTs))
+	require.False(t, staleReauth.NeedsReauth, "陈旧 401 不应再判定 needs_reauth")
+	require.Equal(t, "stale", staleReauth.GrokQuotaSnapshotState)
+}

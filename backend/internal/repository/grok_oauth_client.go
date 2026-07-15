@@ -39,14 +39,15 @@ func (c *grokOAuthClient) ExchangeCode(ctx context.Context, code, codeVerifier, 
 	formData.Set("code", code)
 	formData.Set("redirect_uri", xai.EffectiveRedirectURI(redirectURI))
 	formData.Set("code_verifier", codeVerifier)
+	formData.Set("referrer", xai.DefaultReferrer)
 
 	var tokenResp xai.TokenResponse
-	resp, err := client.R().
+	req := client.R().
 		SetContext(ctx).
-		SetHeader("User-Agent", "sub2api-grok-oauth/1.0").
 		SetFormDataFromValues(formData).
-		SetSuccessResult(&tokenResp).
-		Post(c.tokenURL)
+		SetSuccessResult(&tokenResp)
+	setGrokOAuthClientHeaders(req)
+	resp, err := req.Post(c.tokenURL)
 	if err != nil {
 		return nil, infraerrors.Newf(http.StatusBadGateway, "GROK_OAUTH_REQUEST_FAILED", "request failed: %v", err)
 	}
@@ -71,14 +72,15 @@ func (c *grokOAuthClient) RefreshToken(ctx context.Context, refreshToken, proxyU
 	formData.Set("grant_type", "refresh_token")
 	formData.Set("client_id", clientID)
 	formData.Set("refresh_token", refreshToken)
+	formData.Set("referrer", xai.DefaultReferrer)
 
 	var tokenResp xai.TokenResponse
-	resp, err := client.R().
+	req := client.R().
 		SetContext(ctx).
-		SetHeader("User-Agent", "sub2api-grok-oauth/1.0").
 		SetFormDataFromValues(formData).
-		SetSuccessResult(&tokenResp).
-		Post(c.tokenURL)
+		SetSuccessResult(&tokenResp)
+	setGrokOAuthClientHeaders(req)
+	resp, err := req.Post(c.tokenURL)
 	if err != nil {
 		return nil, infraerrors.Newf(http.StatusBadGateway, "GROK_OAUTH_REQUEST_FAILED", "request failed: %v", err)
 	}
@@ -93,6 +95,17 @@ func createGrokReqClient(proxyURL string) (*req.Client, error) {
 		ProxyURL: proxyURL,
 		Timeout:  60 * time.Second,
 	})
+}
+
+func setGrokOAuthClientHeaders(r *req.Request) {
+	if r == nil {
+		return
+	}
+	r.SetHeader("User-Agent", xai.DefaultCLIUserAgent).
+		SetHeader("X-XAI-Token-Auth", xai.DefaultCLITokenAuth).
+		SetHeader("x-grok-client-identifier", xai.DefaultCLIClientIdentifier).
+		SetHeader("x-grok-client-version", xai.DefaultCLIClientVersion).
+		SetHeader("x-authenticateresponse", xai.DefaultCLIAuthenticateResp)
 }
 
 func grokOAuthStatusError(code, message string, resp *req.Response) error {

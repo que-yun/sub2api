@@ -54,6 +54,9 @@ func (s *OpsService) GetAccountAvailabilityStats(ctx context.Context, platformFi
 		if acc.TempUnschedulableUntil != nil && now.Before(*acc.TempUnschedulableUntil) {
 			isTempUnsched = true
 		}
+		if GrokAccountRequiresSuccessBeforeSchedule(&acc) {
+			isTempUnsched = true
+		}
 
 		isRateLimited := acc.RateLimitResetAt != nil && now.Before(*acc.RateLimitResetAt)
 		isOverloaded := acc.OverloadUntil != nil && now.Before(*acc.OverloadUntil)

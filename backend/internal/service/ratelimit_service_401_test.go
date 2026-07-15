@@ -333,3 +333,50 @@ func TestRateLimitService_HandleUpstreamError_OAuth401NoRefreshTokenSetsError(t 
 		require.Len(t, invalidator.accounts, 1)
 	})
 }
+
+// TestRateLimitService_EscalateGrokForbiddenOn403 覆盖对齐 OpenAI 的 Grok 403 连续计数升级：
+// 未达阈值仅返回 false(交由调用方临时冷却，不永久禁用)；连续达阈值 → SetError 永久禁用。
+func TestRateLimitService_EscalateGrokForbiddenOn403(t *testing.T) {
+	newGrokAccount := func() *Account {
+		return &Account{ID: 700, Platform: PlatformGrok, Type: AccountTypeOAuth,
+			Credentials: map[string]any{"refresh_token": "rt-700"}}
+	}
+
+	t.Run("below_threshold_does_not_disable", func(t *testing.T) {
+		repo := &rateLimitAccountRepoStub{}
+		service := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+		service.SetOpenAI403CounterCache(&openAI403CounterCacheStub{counts: []int64{1}})
+
+		disabled := service.EscalateGrokForbiddenOn403(context.Background(), newGrokAccount(),
+			"permission-denied", []byte(`{"code":"permission-denied"}`))
+
+		require.False(t, disabled, "首次 403 不应永久禁用")
+		require.Equal(t, 0, repo.setErrorCalls)
+	})
+
+	t.Run("at_threshold_disables", func(t *testing.T) {
+		repo := &rateLimitAccountRepoStub{}
+		service := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+		service.SetOpenAI403CounterCache(&openAI403CounterCacheStub{counts: []int64{openAI403DisableThreshold}})
+
+		disabled := service.EscalateGrokForbiddenOn403(context.Background(), newGrokAccount(),
+			"permission-denied", []byte(`{"code":"permission-denied"}`))
+
+		require.True(t, disabled, "连续达阈值应永久禁用")
+		require.Equal(t, 1, repo.setErrorCalls)
+		require.Equal(t, int64(700), repo.lastErrorID)
+		require.Contains(t, repo.lastErrorMsg, "consecutive_403")
+	})
+
+	t.Run("no_counter_cache_stays_recoverable", func(t *testing.T) {
+		repo := &rateLimitAccountRepoStub{}
+		service := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+		// 不注入计数器：保守不永久禁用
+
+		disabled := service.EscalateGrokForbiddenOn403(context.Background(), newGrokAccount(),
+			"permission-denied", []byte(`{"code":"permission-denied"}`))
+
+		require.False(t, disabled)
+		require.Equal(t, 0, repo.setErrorCalls)
+	})
+}

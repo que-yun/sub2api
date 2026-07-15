@@ -82,8 +82,7 @@ func (s *GrokQuotaService) ProbeUsage(ctx context.Context, accountID int64) (*Gr
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "sub2api-grok-quota-probe/1.0")
-	xai.MaybeApplyCLIChatProxyHeaders(req.Header, account.GetGrokBaseURL())
+	xai.ApplyGrokBuildHeaders(req.Header)
 
 	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, maxInt(account.Concurrency, 1))
 	if err != nil {
@@ -105,11 +104,13 @@ func (s *GrokQuotaService) ProbeUsage(ctx context.Context, accountID int64) (*Gr
 		ResetSupported:  false,
 		FetchedAt:       time.Now().Unix(),
 	}
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	// Probe is an operator action: 403 must mark the account unschedulable.
+	ApplyGrokProbeOrTestStatus(ctx, s.accountRepo, nil, account, resp.StatusCode, resp.Header, bodyBytes, "active_probe")
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return result, nil
 	}
 	if resp.StatusCode >= 400 {
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 240))
 		bodyText := truncate(strings.TrimSpace(string(bodyBytes)), 240)
 		slog.Warn("grok_quota_probe_failed", "account_id", account.ID, "model", probeModel, "status", resp.StatusCode, "body", bodyText)
 		return nil, infraerrors.Newf(mapUpstreamStatus(resp.StatusCode), "GROK_QUOTA_PROBE_UPSTREAM_ERROR", "upstream returned %d for probe model %q: %s", resp.StatusCode, probeModel, bodyText)
