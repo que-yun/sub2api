@@ -120,13 +120,12 @@ export function useGrokOAuth() {
       expires_at: tokenInfo.expires_at,
       client_id: tokenInfo.client_id,
       scope: tokenInfo.scope,
-      referrer: tokenInfo.referrer,
       email: tokenInfo.email,
+      sub: tokenInfo.sub,
+      team_id: tokenInfo.team_id,
       subscription_tier: tokenInfo.subscription_tier,
       entitlement_status: tokenInfo.entitlement_status,
-      oauth_token_response_extra: tokenInfo.oauth_token_response_extra,
-      oauth_token_response_extra_keys: tokenInfo.oauth_token_response_extra_keys,
-      oauth_token_response_summary: tokenInfo.oauth_token_response_summary
+      base_url: 'https://cli-chat-proxy.grok.com/v1'
     }
     if (tokenInfo.refresh_token) credentials.refresh_token = tokenInfo.refresh_token
     if (tokenInfo.id_token) credentials.id_token = tokenInfo.id_token
