@@ -1425,6 +1425,13 @@ func isNonRetryableRefreshError(err error) bool {
 		"unknown scope",
 		"subscription required",
 		"no active grok subscription",
+		// Anthropic token endpoint 常见终态：refresh_token 已失效/被拒时返回 401/403
+		// forbidden + "Request not allowed"。需停止无意义重试并提示重新授权。
+		"request not allowed",
+		"token refresh failed: status 401",
+		"token refresh failed: status 403",
+		"token exchange failed: status 401",
+		"token exchange failed: status 403",
 	}
 	for _, needle := range nonRetryable {
 		if strings.Contains(msg, needle) {

@@ -371,7 +371,7 @@ func TestClaudeTokenProvider_WrongPlatform(t *testing.T) {
 
 	token, err := provider.GetAccessToken(context.Background(), account)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "not an anthropic oauth or service account")
+	require.Contains(t, err.Error(), "not an anthropic oauth")
 	require.Empty(t, token)
 }
 
@@ -385,22 +385,27 @@ func TestClaudeTokenProvider_WrongAccountType(t *testing.T) {
 
 	token, err := provider.GetAccessToken(context.Background(), account)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "not an anthropic oauth or service account")
+	require.Contains(t, err.Error(), "not an anthropic oauth")
 	require.Empty(t, token)
 }
 
 func TestClaudeTokenProvider_SetupTokenType(t *testing.T) {
+	// setup-token access_token 同为 8h 短期令牌，应与 oauth 一样走 provider。
+	expiresAt := time.Now().Add(1 * time.Hour).Format(time.RFC3339)
 	provider := NewClaudeTokenProvider(nil, nil, nil)
 	account := &Account{
 		ID:       106,
 		Platform: PlatformAnthropic,
 		Type:     AccountTypeSetupToken,
+		Credentials: map[string]any{
+			"access_token": "setup-token-value",
+			"expires_at":   expiresAt,
+		},
 	}
 
 	token, err := provider.GetAccessToken(context.Background(), account)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "not an anthropic oauth or service account")
-	require.Empty(t, token)
+	require.NoError(t, err)
+	require.Equal(t, "setup-token-value", token)
 }
 
 func TestClaudeTokenProvider_NilCache(t *testing.T) {
@@ -936,4 +941,62 @@ func TestClaudeTokenProvider_Real_NilCredentials(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "access_token not found")
 	require.Empty(t, token)
+}
+
+func TestClaudeTokenProvider_ExpiredSetupTokenHardFailsOnRefresh403(t *testing.T) {
+	// setup-token 已过期时，token endpoint 403 不能 soft-return 旧 access_token。
+	expiresAt := time.Now().Add(-2 * time.Minute).Format(time.RFC3339)
+	account := &Account{
+		ID:       1062,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeSetupToken,
+		Status:   StatusActive,
+		Credentials: map[string]any{
+			"access_token":  "stale-setup-token",
+			"refresh_token": "rt-dead",
+			"expires_at":    expiresAt,
+		},
+	}
+	repo := &refreshAPIAccountRepo{account: account}
+	cache := newClaudeTokenCacheStub()
+	executor := &refreshAPIExecutorStub{
+		needsRefresh: true,
+		err: errors.New(`token refresh failed: status 403, body: { "error": { "type": "forbidden", "message": "Request not allowed" } }`),
+	}
+	provider := NewClaudeTokenProvider(repo, cache, nil)
+	provider.SetRefreshAPI(NewOAuthRefreshAPI(repo, cache), executor)
+
+	token, err := provider.GetAccessToken(context.Background(), account)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Request not allowed")
+	require.Empty(t, token)
+	require.Equal(t, 0, int(atomic.LoadInt32(&cache.setCalled)), "must not cache stale token after terminal refresh failure")
+}
+
+func TestClaudeTokenProvider_NearExpiryNonTerminalMaySoftUseExisting(t *testing.T) {
+	// 尚未过期且错误非终端时，仍可短 TTL 使用现有 token（兼容上游 soft policy）。
+	expiresAt := time.Now().Add(10 * time.Minute).Format(time.RFC3339)
+	account := &Account{
+		ID:       1063,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeSetupToken,
+		Status:   StatusActive,
+		Credentials: map[string]any{
+			"access_token":  "still-valid-setup-token",
+			"refresh_token": "rt",
+			"expires_at":    expiresAt,
+		},
+	}
+	repo := &refreshAPIAccountRepo{account: account}
+	cache := newClaudeTokenCacheStub()
+	executor := &refreshAPIExecutorStub{
+		needsRefresh: true,
+		err:          errors.New("network timeout"),
+	}
+	provider := NewClaudeTokenProvider(repo, cache, nil)
+	provider.SetRefreshAPI(NewOAuthRefreshAPI(repo, cache), executor)
+
+	token, err := provider.GetAccessToken(context.Background(), account)
+	require.NoError(t, err)
+	require.Equal(t, "still-valid-setup-token", token)
 }

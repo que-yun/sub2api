@@ -56,8 +56,8 @@ func (p *ClaudeTokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	if account == nil {
 		return "", errors.New("account is nil")
 	}
-	if account.Platform != PlatformAnthropic || (account.Type != AccountTypeOAuth && account.Type != AccountTypeServiceAccount) {
-		return "", errors.New("not an anthropic oauth or service account")
+	if account.Platform != PlatformAnthropic || (account.Type != AccountTypeOAuth && account.Type != AccountTypeSetupToken && account.Type != AccountTypeServiceAccount) {
+		return "", errors.New("not an anthropic oauth, setup-token or service account")
 	}
 	if account.Type == AccountTypeServiceAccount {
 		return p.getServiceAccountAccessToken(ctx, account)
@@ -85,7 +85,13 @@ func (p *ClaudeTokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	if needsRefresh && p.refreshAPI != nil && p.executor != nil {
 		result, err := p.refreshAPI.RefreshIfNeeded(ctx, account, p.executor, claudeTokenRefreshSkew)
 		if err != nil {
-			if p.refreshPolicy.OnRefreshError == ProviderRefreshErrorReturn {
+			// 终端凭证错误（invalid_grant / token endpoint 403 等）必须硬失败，
+			// 不能继续返回旧 access_token 伪装可用。
+			if p.refreshPolicy.OnRefreshError == ProviderRefreshErrorReturn || isNonRetryableRefreshError(err) {
+				return "", err
+			}
+			// 已过期或缺少 expires_at 时，旧 token 无继续服务价值。
+			if expiresAt == nil || time.Until(*expiresAt) <= 0 {
 				return "", err
 			}
 			slog.Warn("claude_token_refresh_failed", "account_id", account.ID, "error", err)

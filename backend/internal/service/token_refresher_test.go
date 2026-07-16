@@ -195,10 +195,10 @@ func TestClaudeTokenRefresher_CanRefresh(t *testing.T) {
 			want:     true,
 		},
 		{
-			name:     "anthropic setup-token - must preserve long-lived token",
+			name:     "anthropic setup-token - can refresh",
 			platform: PlatformAnthropic,
 			accType:  AccountTypeSetupToken,
-			want:     false,
+			want:     true,
 		},
 		{
 			name:     "anthropic api-key - cannot refresh",

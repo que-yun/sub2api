@@ -262,11 +262,14 @@ func (s *claudeOAuthService) RefreshToken(ctx context.Context, refreshToken, pro
 }
 
 func createReqClient(proxyURL string) (*req.Client, error) {
-	// 禁用 CookieJar，确保每次授权都是干净的会话
+	// token 端点与 claude.ai 网页会话不同：
+	// 1) 请求体/头已按 axios JSON 约定构造，不需要再 ImpersonateChrome
+	// 2) Chrome TLS 指纹在部分出口/WAF 下会触发 token endpoint 403 "Request not allowed"
+	//    而标准 HTTPS 客户端可正常 refresh；因此这里保持普通 TLS。
+	// 3) 禁用 CookieJar，确保每次授权都是干净的会话
 	client := req.C().
 		SetTimeout(60 * time.Second).
-		ImpersonateChrome().
-		SetCookieJar(nil) // 禁用 CookieJar
+		SetCookieJar(nil)
 
 	trimmed, _, err := proxyurl.Parse(proxyURL)
 	if err != nil {

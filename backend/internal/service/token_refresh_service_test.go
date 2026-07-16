@@ -941,6 +941,8 @@ func TestIsNonRetryableRefreshError(t *testing.T) {
 		{name: "invalid_scope", err: errors.New("invalid_scope: requested scope is not allowed"), expected: true},
 		{name: "invalid_grant_with_desc", err: errors.New("Error: invalid_grant - token revoked"), expected: true},
 		{name: "case_insensitive", err: errors.New("INVALID_GRANT"), expected: true},
+		{name: "claude_token_refresh_403_request_not_allowed", err: errors.New(`token refresh failed: status 403, body: { "error": { "type": "forbidden", "message": "Request not allowed" } }`), expected: true},
+		{name: "claude_token_refresh_401", err: errors.New("token refresh failed: status 401, body: unauthorized"), expected: true},
 	}
 
 	for _, tt := range tests {
