@@ -10,6 +10,21 @@ This directory contains files for deploying Sub2API on Linux servers and Apple-s
 | **Apple container** | Native local stack on macOS 26 | Not needed (auto-setup) |
 | **Binary Install** | Production servers, systemd | Web-based wizard |
 
+## Host binary / VPS standby (this repo)
+
+**唯一入口在仓库根目录：**
+
+```bash
+make            # 帮助
+make build      # 一键编译前后端（强制 embed）
+make run        # 本机启动
+make deploy     # 编译并推 VPS standby，校验 /health 与 /
+```
+
+本目录下 `run_host_local.sh` / `deploy_vps_binary.sh` 只是 `make` 的内部实现，不要当入口直接用。
+
+---
+
 ## Files
 
 | File | Description |
