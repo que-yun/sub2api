@@ -1081,6 +1081,13 @@ export interface AccountUsageInfo {
   grok_local_usage_7d?: WindowStats | null
   grok_local_usage_monthly?: WindowStats | null
   grok_billing?: GrokBillingSummary | null
+  grok_lifetime_stats?: {
+    requests: number
+    tokens: number
+    cost: number
+    standard_cost: number
+    user_cost: number
+  } | null
   subscription_tier?: string
   subscription_tier_raw?: string
   ai_credits?: Array<{

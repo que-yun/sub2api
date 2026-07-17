@@ -1143,3 +1143,37 @@ func (r *usageLogRepository) GetAccountUsageStats(ctx context.Context, accountID
 	}
 	return resp, nil
 }
+
+// GetAccountLifetimeStats returns all-time totals for an account.
+func (r *usageLogRepository) GetAccountLifetimeStats(ctx context.Context, accountID int64) (*usagestats.AccountStats, error) {
+	query := `
+		SELECT
+			COUNT(*) as requests,
+			COALESCE(SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens), 0) as tokens,
+			COALESCE(SUM(total_cost), 0) as cost,
+			COALESCE(SUM(COALESCE(account_stats_cost, total_cost) * COALESCE(account_rate_multiplier, 1)), 0) as standard_cost,
+			COALESCE(SUM(actual_cost), 0) as user_cost
+		FROM usage_logs
+		WHERE account_id = $1
+	`
+	var stats usagestats.AccountStats
+	rows, err := r.sql.QueryContext(ctx, query, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return &stats, nil
+	}
+	err = rows.Scan(
+		&stats.Requests,
+		&stats.Tokens,
+		&stats.Cost,
+		&stats.StandardCost,
+		&stats.UserCost,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &stats, nil
+}

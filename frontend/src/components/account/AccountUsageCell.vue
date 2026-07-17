@@ -386,6 +386,26 @@
             </span>
           </div>
         </div>
+        <div v-if="grokLifetimeStats" class="mb-0.5 flex items-center">
+          <div class="flex items-center gap-1.5 text-[9px] text-gray-400 dark:text-gray-500">
+            <span class="rounded bg-gray-50 px-1.5 py-0.5 dark:bg-gray-900">
+              total {{ formatWindowRequests(grokLifetimeStats) }} req
+            </span>
+            <span class="rounded bg-gray-50 px-1.5 py-0.5 dark:bg-gray-900">
+              {{ formatWindowTokens(grokLifetimeStats) }}
+            </span>
+            <span class="rounded bg-gray-50 px-1.5 py-0.5 dark:bg-gray-900" :title="t('usage.accountBilled')">
+              A ${{ formatWindowCost(grokLifetimeStats) }}
+            </span>
+            <span
+              v-if="grokLifetimeStats.user_cost != null"
+              class="rounded bg-gray-50 px-1.5 py-0.5 dark:bg-gray-900"
+              :title="t('usage.userBilled')"
+            >
+              U ${{ formatWindowUserCost(grokLifetimeStats) }}
+            </span>
+          </div>
+        </div>
         <UsageProgressBar
           v-if="grokWeeklyBillingBar"
           label="7d"
@@ -1115,6 +1135,7 @@ const grokLocalUsage = computed(() => {
     usageInfo.value?.grok_local_usage_monthly ||
     null
 })
+const grokLifetimeStats = computed(() => usageInfo.value?.grok_lifetime_stats || null)
 const grokFreeTokenBar = computed(() => {
   if (!grokIsFree.value || !grokFreeQuotaUsage.value) return null
   const used = Math.max(0, grokFreeQuotaUsage.value.tokens || 0)

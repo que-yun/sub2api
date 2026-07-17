@@ -72,6 +72,9 @@ type UsageLogRepository interface {
 	// Account stats
 	GetAccountUsageStats(ctx context.Context, accountID int64, startTime, endTime time.Time) (*usagestats.AccountUsageStatsResponse, error)
 
+	// Lifetime stats (all-time totals)
+	GetAccountLifetimeStats(ctx context.Context, accountID int64) (*usagestats.AccountStats, error)
+
 	// Aggregated stats (optimized)
 	GetUserStatsAggregated(ctx context.Context, userID int64, startTime, endTime time.Time) (*usagestats.UsageStats, error)
 	GetAPIKeyStatsAggregated(ctx context.Context, apiKeyID int64, startTime, endTime time.Time) (*usagestats.UsageStats, error)
@@ -199,19 +202,20 @@ type UsageInfo struct {
 	AntigravityQuota map[string]*AntigravityModelQuota `json:"antigravity_quota,omitempty"`
 
 	// Grok / xAI 被动额度快照
-	GrokRequestQuota       *xai.QuotaWindow    `json:"grok_request_quota,omitempty"`
-	GrokTokenQuota         *xai.QuotaWindow    `json:"grok_token_quota,omitempty"`
-	GrokRetryAfterSeconds  *int                `json:"grok_retry_after_seconds,omitempty"`
-	GrokEntitlementStatus  string              `json:"grok_entitlement_status,omitempty"`
-	GrokQuotaSnapshotState string              `json:"grok_quota_snapshot_state,omitempty"`
-	GrokLastQuotaProbeAt   string              `json:"grok_last_quota_probe_at,omitempty"`
-	GrokLastHeadersSeenAt  string              `json:"grok_last_headers_seen_at,omitempty"`
-	GrokLastStatusCode     int                 `json:"grok_last_status_code,omitempty"`
-	GrokLocalUsage         *WindowStats        `json:"grok_local_usage,omitempty"`
-	GrokLocalUsage24h      *WindowStats        `json:"grok_local_usage_24h,omitempty"`
-	GrokLocalUsage7d       *WindowStats        `json:"grok_local_usage_7d,omitempty"`
-	GrokLocalUsageMonthly  *WindowStats        `json:"grok_local_usage_monthly,omitempty"`
-	GrokBilling            *xai.BillingSummary `json:"grok_billing,omitempty"`
+	GrokRequestQuota       *xai.QuotaWindow         `json:"grok_request_quota,omitempty"`
+	GrokTokenQuota         *xai.QuotaWindow         `json:"grok_token_quota,omitempty"`
+	GrokRetryAfterSeconds  *int                     `json:"grok_retry_after_seconds,omitempty"`
+	GrokEntitlementStatus  string                   `json:"grok_entitlement_status,omitempty"`
+	GrokQuotaSnapshotState string                   `json:"grok_quota_snapshot_state,omitempty"`
+	GrokLastQuotaProbeAt   string                   `json:"grok_last_quota_probe_at,omitempty"`
+	GrokLastHeadersSeenAt  string                   `json:"grok_last_headers_seen_at,omitempty"`
+	GrokLastStatusCode     int                      `json:"grok_last_status_code,omitempty"`
+	GrokLocalUsage         *WindowStats             `json:"grok_local_usage,omitempty"`
+	GrokLocalUsage24h      *WindowStats             `json:"grok_local_usage_24h,omitempty"`
+	GrokLocalUsage7d       *WindowStats             `json:"grok_local_usage_7d,omitempty"`
+	GrokLocalUsageMonthly  *WindowStats             `json:"grok_local_usage_monthly,omitempty"`
+	GrokBilling            *xai.BillingSummary      `json:"grok_billing,omitempty"`
+	GrokLifetimeStats      *usagestats.AccountStats `json:"grok_lifetime_stats,omitempty"`
 
 	// Antigravity 账号级信息
 	SubscriptionTier    string `json:"subscription_tier,omitempty"`     // 归一化订阅等级: FREE/PRO/ULTRA/UNKNOWN
@@ -985,6 +989,9 @@ func (s *AccountUsageService) getGrokUsage(ctx context.Context, account *Account
 		if s.usageLogRepo != nil {
 			if stats, err := s.usageLogRepo.GetAccountTodayStats(ctx, account.ID); err == nil && stats != nil {
 				usage.GrokLocalUsage = windowStatsFromAccountStats(stats)
+			}
+			if stats, err := s.usageLogRepo.GetAccountLifetimeStats(ctx, account.ID); err == nil && stats != nil {
+				usage.GrokLifetimeStats = stats
 			}
 		}
 		if billingProbeResult != nil {
