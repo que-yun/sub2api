@@ -47,6 +47,7 @@ var (
 )
 
 type oauthRefreshRequestPathKey struct{}
+type oauthRefreshAllowInactiveKey struct{}
 
 func withOAuthRefreshRequestPath(ctx context.Context) context.Context {
 	return context.WithValue(ctx, oauthRefreshRequestPathKey{}, true)
@@ -55,6 +56,17 @@ func withOAuthRefreshRequestPath(ctx context.Context) context.Context {
 func isOAuthRefreshRequestPath(ctx context.Context) bool {
 	requestPath, _ := ctx.Value(oauthRefreshRequestPathKey{}).(bool)
 	return requestPath
+}
+
+// withOAuthRefreshAllowInactive allows Grok OAuth refresh for non-active accounts.
+// Used by operator/recovery probes that intentionally target sticky error accounts.
+func withOAuthRefreshAllowInactive(ctx context.Context) context.Context {
+	return context.WithValue(ctx, oauthRefreshAllowInactiveKey{}, true)
+}
+
+func isOAuthRefreshAllowInactive(ctx context.Context) bool {
+	allow, _ := ctx.Value(oauthRefreshAllowInactiveKey{}).(bool)
+	return allow
 }
 
 type contextMutex struct {
@@ -225,13 +237,18 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 	if freshAccount.ID != account.ID {
 		return nil, fmt.Errorf("%w: account identity mismatch", errOAuthRefreshAccountRereadFailed)
 	}
+	allowInactive := isOAuthRefreshAllowInactive(ctx) && freshAccount.IsGrokOAuth()
 	if !freshAccount.IsActive() {
-		if requestPath {
-			return nil, fmt.Errorf("%w: account is not active", errOAuthRefreshAccountStateChanged)
+		// Operator recovery probes may refresh sticky Grok error accounts.
+		// Production request path still rejects inactive accounts.
+		if !(allowInactive && strings.TrimSpace(freshAccount.GetGrokRefreshToken()) != "") {
+			if requestPath {
+				return nil, fmt.Errorf("%w: account is not active", errOAuthRefreshAccountStateChanged)
+			}
+			return &OAuthRefreshResult{Account: freshAccount}, nil
 		}
-		return &OAuthRefreshResult{Account: freshAccount}, nil
 	}
-	if requestPath && freshAccount.Platform == PlatformGrok {
+	if requestPath && freshAccount.Platform == PlatformGrok && !allowInactive {
 		if eligibilityErr := grokOAuthRequestAccountEligibilityError(freshAccount); eligibilityErr != nil {
 			return nil, withGrokCredentialFailureSnapshot(eligibilityErr, freshAccount)
 		}

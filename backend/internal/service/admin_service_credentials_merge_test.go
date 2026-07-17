@@ -146,6 +146,28 @@ func TestCreateAccount_GrokOAuthDefaultsReferrerAndBaseURL(t *testing.T) {
 	require.Equal(t, 1, repo.updateCalls)
 	require.Equal(t, "grok-build", repo.account.Credentials["referrer"])
 	require.Equal(t, "https://api.x.ai/v1", repo.account.Credentials["base_url"])
+	modelMapping, ok := repo.account.Credentials["model_mapping"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "grok-4.5", modelMapping["gpt-5.5"])
+	require.Equal(t, "grok-4.5", modelMapping["gpt-*"])
+	require.Equal(t, "grok-4.5", modelMapping["*"])
+}
+
+func TestCreateAccount_GrokOAuthPreservesExplicitModelMapping(t *testing.T) {
+	repo := &updateAccountCredsRepoStub{}
+	svc := &adminServiceImpl{accountRepo: repo}
+
+	created, err := svc.CreateAccount(context.Background(), &CreateAccountInput{
+		Name:                 "grok-oauth-custom",
+		Platform:             PlatformGrok,
+		Type:                 AccountTypeOAuth,
+		Credentials:          map[string]any{"access_token": "at", "model_mapping": map[string]any{"custom": "grok-4.5"}},
+		SkipDefaultGroupBind: true,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, created)
+	require.Equal(t, map[string]any{"custom": "grok-4.5"}, repo.account.Credentials["model_mapping"])
 }
 
 func TestUpdateAccount_GrokOAuthDefaultsReferrerAndBaseURL(t *testing.T) {

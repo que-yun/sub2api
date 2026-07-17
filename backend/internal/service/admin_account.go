@@ -16,6 +16,7 @@ import (
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 )
 
 // Account management implementations
@@ -64,6 +65,106 @@ func (s *adminServiceImpl) GetAccountsByIDs(ctx context.Context, ids []int64) ([
 
 const maxAccountNameRunes = 100
 const duplicateAccountOperationIDExtraKey = "duplicate_operation_id"
+
+func defaultGrokOAuthCodexModelMapping() map[string]any {
+	return map[string]any{
+		"*":                            "grok-4.5",
+		"gpt-*":                        "grok-4.5",
+		"gpt-5.5":                      "grok-4.5",
+		"gpt-5.4":                      "grok-4.5",
+		"gpt-5.4-mini":                 "grok-4.5",
+		"gpt-5.6-sol":                  "grok-4.5",
+		"claude-*":                     "grok-4.5",
+		"grok":                         "grok-4.5",
+		"grok-latest":                  "grok-4.5",
+		"grok-4.5":                     "grok-4.5",
+		"grok-4.5-latest":              "grok-4.5",
+		"grok-4.3":                     "grok-4.5",
+		"grok-build":                   "grok-4.5",
+		"grok-build-0.1":               "grok-4.5",
+		"grok-build-latest":            "grok-4.5",
+		"grok-composer":                "grok-4.5",
+		"composer-2.5":                 "grok-4.5",
+		"grok-composer-2.5-fast":       "grok-4.5",
+		"grok-4.20-reasoning":          "grok-4.5",
+		"grok-4.20-non-reasoning":      "grok-4.5",
+		"grok-4.20-0309-reasoning":     "grok-4.5",
+		"grok-4.20-0309-non-reasoning": "grok-4.5",
+		"grok-4.20-multi-agent-0309":   "grok-4.5",
+		"grok-imagine":                 "grok-imagine",
+		"grok-imagine-image":           "grok-imagine-image",
+		"grok-imagine-image-quality":   "grok-imagine-image-quality",
+		"grok-imagine-edit":            "grok-imagine-edit",
+		"grok-imagine-video":           "grok-imagine-video",
+		"grok-imagine-video-1.5":       "grok-imagine-video-1.5",
+	}
+}
+
+func hasNonEmptyModelMapping(credentials map[string]any) bool {
+	raw, ok := credentials["model_mapping"]
+	if !ok || raw == nil {
+		return false
+	}
+	switch mapping := raw.(type) {
+	case map[string]any:
+		return len(mapping) > 0
+	case map[string]string:
+		return len(mapping) > 0
+	default:
+		return false
+	}
+}
+
+func normalizeGrokOAuthCredentials(platform, accountType string, credentials map[string]any) {
+	if platform != PlatformGrok || accountType != AccountTypeOAuth || credentials == nil {
+		return
+	}
+	if strings.TrimSpace(credentialValueString(credentials, "referrer")) == "" {
+		credentials["referrer"] = xai.DefaultReferrer
+	}
+	if strings.TrimSpace(credentialValueString(credentials, "base_url")) == "" {
+		credentials["base_url"] = xai.DefaultBaseURL
+	}
+	if !hasNonEmptyModelMapping(credentials) {
+		credentials["model_mapping"] = defaultGrokOAuthCodexModelMapping()
+	}
+	credentials["oauth_token_response_summary"] = buildGrokOAuthCredentialSummary(credentials)
+}
+
+func credentialValueString(credentials map[string]any, key string) string {
+	value, ok := credentials[key]
+	if !ok || value == nil {
+		return ""
+	}
+	if str, ok := value.(string); ok {
+		return str
+	}
+	return fmt.Sprint(value)
+}
+
+func buildGrokOAuthCredentialSummary(credentials map[string]any) map[string]any {
+	summary := map[string]any{
+		"has_access_token":  strings.TrimSpace(credentialValueString(credentials, "access_token")) != "",
+		"has_refresh_token": strings.TrimSpace(credentialValueString(credentials, "refresh_token")) != "",
+		"has_id_token":      strings.TrimSpace(credentialValueString(credentials, "id_token")) != "",
+	}
+	for _, key := range []string{
+		"token_type",
+		"expires_in",
+		"expires_at",
+		"client_id",
+		"scope",
+		"referrer",
+		"email",
+		"subscription_tier",
+		"entitlement_status",
+	} {
+		if value, ok := credentials[key]; ok && value != nil && strings.TrimSpace(fmt.Sprint(value)) != "" {
+			summary[key] = value
+		}
+	}
+	return summary
+}
 
 func duplicateAccountName(sourceName string) string {
 	const suffix = " (Copy)"
@@ -472,6 +573,7 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	if err := NormalizeHeaderOverrideCredentials(input.Credentials); err != nil {
 		return nil, err
 	}
+	normalizeGrokOAuthCredentials(input.Platform, input.Type, input.Credentials)
 
 	account, err := buildAccountForCreate(input, accountExtra)
 	if err != nil {
@@ -576,6 +678,7 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		if err := NormalizeHeaderOverrideCredentials(account.Credentials); err != nil {
 			return nil, err
 		}
+		normalizeGrokOAuthCredentials(account.Platform, account.Type, account.Credentials)
 	}
 	// Extra 使用 map：需要区分“未提供(nil)”与“显式清空({})”。
 	// 关闭配额限制时前端会删除 quota_* 键并提交 extra:{}，此时也必须落库。
