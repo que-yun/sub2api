@@ -7,7 +7,7 @@
 		<key>PATH</key>
 		<string>/usr/local/go/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 		<key>GROK_PREFERRED_PROXY_ID</key>
-		<string>6</string>
+		<string>13</string>
 		<key>GROK_RECOVER_CONCURRENCY</key>
 		<string>4</string>
 		<key>GROK_RECOVER_FAST_LIMIT</key>

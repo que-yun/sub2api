@@ -26,6 +26,8 @@ START_STANDBY_AFTER_SYNC="${START_STANDBY_AFTER_SYNC:-false}"
 STANDBY_IGNORE_PROXY_IDS="${STANDBY_IGNORE_PROXY_IDS:-}"
 STANDBY_CLEAR_OPENAI_OAUTH_PROXY_IDS="${STANDBY_CLEAR_OPENAI_OAUTH_PROXY_IDS:-true}"
 STANDBY_CLEAR_OPENAI_APIKEY_PROXY_IDS="${STANDBY_CLEAR_OPENAI_APIKEY_PROXY_IDS:-true}"
+STANDBY_CLEAR_GROK_PROXY_IDS="${STANDBY_CLEAR_GROK_PROXY_IDS:-true}"
+STANDBY_CLEAR_LOCALHOST_PROXY_IDS="${STANDBY_CLEAR_LOCALHOST_PROXY_IDS:-13}"
 PULL_STANDBY_OPENAI_OAUTH_TOKENS="${PULL_STANDBY_OPENAI_OAUTH_TOKENS:-false}"
 PULL_STANDBY_RUNTIME_RECORDS="${PULL_STANDBY_RUNTIME_RECORDS:-false}"
 STANDBY_RUNTIME_PULL_LOOKBACK_HOURS="${STANDBY_RUNTIME_PULL_LOOKBACK_HOURS:-48}"
@@ -296,11 +298,10 @@ COPY (
     provider_error_code, provider_error_type, network_error_type,
     retry_after_seconds, duration_ms, time_to_first_token_ms,
     auth_latency_ms, routing_latency_ms, upstream_latency_ms,
-    response_latency_ms, request_body, request_headers,
-    request_body_truncated, request_body_bytes, is_retryable, retry_count,
-    created_at, upstream_errors, is_count_tokens, resolved, resolved_at,
-    resolved_by_user_id, resolved_retry_id, inbound_endpoint, upstream_endpoint,
-    requested_model, upstream_model, request_type
+    response_latency_ms, created_at, upstream_errors, is_count_tokens,
+    resolved, resolved_at, resolved_by_user_id, inbound_endpoint, upstream_endpoint,
+    requested_model, upstream_model, request_type,
+    attempted_key_prefix, deleted_key_owner_user_id, deleted_key_name, api_key_prefix
   FROM public.ops_error_logs
   WHERE created_at >= now() - make_interval(hours => (${lookback_hours_sql})::int)
   ORDER BY created_at, id
@@ -393,11 +394,10 @@ SELECT
   provider_error_code, provider_error_type, network_error_type,
   retry_after_seconds, duration_ms, time_to_first_token_ms,
   auth_latency_ms, routing_latency_ms, upstream_latency_ms,
-  response_latency_ms, request_body, request_headers,
-  request_body_truncated, request_body_bytes, is_retryable, retry_count,
-  created_at, upstream_errors, is_count_tokens, resolved, resolved_at,
-  resolved_by_user_id, resolved_retry_id, inbound_endpoint, upstream_endpoint,
-  requested_model, upstream_model, request_type
+  response_latency_ms, created_at, upstream_errors, is_count_tokens,
+  resolved, resolved_at, resolved_by_user_id, inbound_endpoint, upstream_endpoint,
+  requested_model, upstream_model, request_type,
+  attempted_key_prefix, deleted_key_owner_user_id, deleted_key_name, api_key_prefix
 FROM public.ops_error_logs
 WHERE false;
 
@@ -413,11 +413,10 @@ WITH inserted AS (
     provider_error_code, provider_error_type, network_error_type,
     retry_after_seconds, duration_ms, time_to_first_token_ms,
     auth_latency_ms, routing_latency_ms, upstream_latency_ms,
-    response_latency_ms, request_body, request_headers,
-    request_body_truncated, request_body_bytes, is_retryable, retry_count,
-    created_at, upstream_errors, is_count_tokens, resolved, resolved_at,
-    resolved_by_user_id, resolved_retry_id, inbound_endpoint, upstream_endpoint,
-    requested_model, upstream_model, request_type
+    response_latency_ms, created_at, upstream_errors, is_count_tokens,
+    resolved, resolved_at, resolved_by_user_id, inbound_endpoint, upstream_endpoint,
+    requested_model, upstream_model, request_type,
+    attempted_key_prefix, deleted_key_owner_user_id, deleted_key_name, api_key_prefix
   )
   SELECT
     t.request_id, t.client_request_id, t.user_id, t.api_key_id, t.account_id, t.group_id,
@@ -428,11 +427,10 @@ WITH inserted AS (
     t.provider_error_code, t.provider_error_type, t.network_error_type,
     t.retry_after_seconds, t.duration_ms, t.time_to_first_token_ms,
     t.auth_latency_ms, t.routing_latency_ms, t.upstream_latency_ms,
-    t.response_latency_ms, t.request_body, t.request_headers,
-    t.request_body_truncated, t.request_body_bytes, t.is_retryable, t.retry_count,
-    t.created_at, t.upstream_errors, t.is_count_tokens, t.resolved, t.resolved_at,
-    t.resolved_by_user_id, t.resolved_retry_id, t.inbound_endpoint, t.upstream_endpoint,
-    t.requested_model, t.upstream_model, t.request_type
+    t.response_latency_ms, t.created_at, t.upstream_errors, t.is_count_tokens,
+    t.resolved, t.resolved_at, t.resolved_by_user_id, t.inbound_endpoint, t.upstream_endpoint,
+    t.requested_model, t.upstream_model, t.request_type,
+    t.attempted_key_prefix, t.deleted_key_owner_user_id, t.deleted_key_name, t.api_key_prefix
   FROM standby_ops_error_logs t
   WHERE NOT EXISTS (
     SELECT 1
@@ -594,6 +592,46 @@ WITH updated AS (
 )
 SELECT 'standby_cleared_openai_apikey_proxy_accounts=' || count(*) FROM updated;\"
 fi
+
+if [[ $(shell_quote "${STANDBY_CLEAR_GROK_PROXY_IDS}") == true ]]; then
+  docker exec sub2api-standby-postgres psql -U $(shell_quote "${PGUSER}") -d $(shell_quote "${PGDATABASE}") -v ON_ERROR_STOP=1 -c \"
+WITH updated AS (
+  UPDATE public.accounts
+  SET proxy_id = NULL, updated_at = now()
+  WHERE deleted_at IS NULL
+    AND platform = 'grok'
+    AND proxy_id IS NOT NULL
+  RETURNING id
+)
+SELECT 'standby_cleared_grok_proxy_accounts=' || count(*) FROM updated;\"
+fi
+if [[ -n $(shell_quote "${STANDBY_CLEAR_LOCALHOST_PROXY_IDS}") ]]; then
+  docker exec sub2api-standby-postgres psql -U $(shell_quote "${PGUSER}") -d $(shell_quote "${PGDATABASE}") -v ON_ERROR_STOP=1 -c \"
+WITH bad_proxy_ids AS (
+  SELECT DISTINCT trim(value)::bigint AS id
+  FROM regexp_split_to_table($(sql_literal "${STANDBY_CLEAR_LOCALHOST_PROXY_IDS}"), ',') AS value
+  WHERE trim(value) ~ '^[0-9]+$'
+),
+updated AS (
+  UPDATE public.accounts
+  SET proxy_id = NULL, updated_at = now()
+  WHERE deleted_at IS NULL
+    AND proxy_id IN (SELECT id FROM bad_proxy_ids)
+  RETURNING id
+)
+SELECT 'standby_cleared_localhost_proxy_accounts=' || count(*) FROM updated;\"
+  docker exec sub2api-standby-postgres psql -U $(shell_quote "${PGUSER}") -d $(shell_quote "${PGDATABASE}") -v ON_ERROR_STOP=1 -c \"
+UPDATE public.proxies
+SET status = 'inactive', updated_at = now()
+WHERE deleted_at IS NULL
+  AND id IN (
+    SELECT DISTINCT trim(value)::bigint
+    FROM regexp_split_to_table($(sql_literal "${STANDBY_CLEAR_LOCALHOST_PROXY_IDS}"), ',') AS value
+    WHERE trim(value) ~ '^[0-9]+$'
+  )
+  AND status <> 'inactive';
+SELECT 'standby_inactivated_localhost_proxies_ok' AS result;\"
+fi
 docker exec sub2api-standby-postgres psql -U $(shell_quote "${PGUSER}") -d $(shell_quote "${PGDATABASE}") -v ON_ERROR_STOP=1 -c \"
 DO \\\$\\\$
 DECLARE
@@ -714,6 +752,46 @@ WITH updated AS (
   RETURNING id
 )
 SELECT 'standby_cleared_openai_apikey_proxy_accounts=' || count(*) FROM updated;\"
+fi
+
+if [[ $(shell_quote "${STANDBY_CLEAR_GROK_PROXY_IDS}") == true ]]; then
+  docker exec sub2api-standby-postgres psql -U $(shell_quote "${PGUSER}") -d \"\${restore_db}\" -v ON_ERROR_STOP=1 -c \"
+WITH updated AS (
+  UPDATE public.accounts
+  SET proxy_id = NULL, updated_at = now()
+  WHERE deleted_at IS NULL
+    AND platform = 'grok'
+    AND proxy_id IS NOT NULL
+  RETURNING id
+)
+SELECT 'standby_cleared_grok_proxy_accounts=' || count(*) FROM updated;\"
+fi
+if [[ -n $(shell_quote "${STANDBY_CLEAR_LOCALHOST_PROXY_IDS}") ]]; then
+  docker exec sub2api-standby-postgres psql -U $(shell_quote "${PGUSER}") -d \"\${restore_db}\" -v ON_ERROR_STOP=1 -c \"
+WITH bad_proxy_ids AS (
+  SELECT DISTINCT trim(value)::bigint AS id
+  FROM regexp_split_to_table($(sql_literal "${STANDBY_CLEAR_LOCALHOST_PROXY_IDS}"), ',') AS value
+  WHERE trim(value) ~ '^[0-9]+$'
+),
+updated AS (
+  UPDATE public.accounts
+  SET proxy_id = NULL, updated_at = now()
+  WHERE deleted_at IS NULL
+    AND proxy_id IN (SELECT id FROM bad_proxy_ids)
+  RETURNING id
+)
+SELECT 'standby_cleared_localhost_proxy_accounts=' || count(*) FROM updated;\"
+  docker exec sub2api-standby-postgres psql -U $(shell_quote "${PGUSER}") -d \"\${restore_db}\" -v ON_ERROR_STOP=1 -c \"
+UPDATE public.proxies
+SET status = 'inactive', updated_at = now()
+WHERE deleted_at IS NULL
+  AND id IN (
+    SELECT DISTINCT trim(value)::bigint
+    FROM regexp_split_to_table($(sql_literal "${STANDBY_CLEAR_LOCALHOST_PROXY_IDS}"), ',') AS value
+    WHERE trim(value) ~ '^[0-9]+$'
+  )
+  AND status <> 'inactive';
+SELECT 'standby_inactivated_localhost_proxies_ok' AS result;\"
 fi
 docker exec sub2api-standby-postgres psql -U $(shell_quote "${PGUSER}") -d \"\${restore_db}\" -v ON_ERROR_STOP=1 -c \"
 DO \\\$\\\$

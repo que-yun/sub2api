@@ -20,16 +20,23 @@ if [[ ! -x "${LINUX_BIN}" ]]; then
   exit 1
 fi
 
-# 拒绝推送非 embed 二进制
+# 拒绝推送非 embed 二进制。
+# 注意：pipefail 下 strings|grep -q 会在大二进制上因 SIGPIPE 误报，
+# 所以把结果落到临时文件再判断。
 if command -v strings >/dev/null 2>&1; then
-  if strings "${LINUX_BIN}" | grep -F -q "Frontend not embedded"; then
+  strings_tmp="$(mktemp)"
+  strings "${LINUX_BIN}" > "${strings_tmp}" || true
+  if grep -F -q "Frontend not embedded" "${strings_tmp}"; then
+    rm -f "${strings_tmp}"
     echo "Refusing non-embed binary: ${LINUX_BIN}" >&2
     exit 1
   fi
-  if ! strings "${LINUX_BIN}" | grep -F -q "__CSP_NONCE_VALUE__"; then
+  if ! grep -F -q "__CSP_NONCE_VALUE__" "${strings_tmp}"; then
+    rm -f "${strings_tmp}"
     echo "Refusing binary without frontend embed markers: ${LINUX_BIN}" >&2
     exit 1
   fi
+  rm -f "${strings_tmp}"
 fi
 
 ssh_args=(
@@ -77,10 +84,27 @@ done
 systemctl is-active '${SERVICE_NAME}'
 sha256sum '${REMOTE_BIN}'
 
-curl -fsS --max-time 5 '${HEALTH_URL}' >/tmp/sub2api-health.out
+for i in \$(seq 1 30); do
+  if curl -fsS --max-time 5 '${HEALTH_URL}' >/tmp/sub2api-health.out; then
+    break
+  fi
+  if [[ \"\${i}\" == \"30\" ]]; then
+    echo \"Health check failed after waiting for service port: ${HEALTH_URL}\" >&2
+    journalctl -u '${SERVICE_NAME}' -n 80 --no-pager >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
 echo \"health=\$(cat /tmp/sub2api-health.out)\"
 
-code=\$(curl -sS -o /tmp/sub2api-page.out -w '%{http_code}' --max-time 5 '${PAGE_URL}')
+code=000
+for i in \$(seq 1 10); do
+  code=\$(curl -sS -o /tmp/sub2api-page.out -w '%{http_code}' --max-time 5 '${PAGE_URL}' || echo 000)
+  if [[ \"\${code}\" == \"200\" ]]; then
+    break
+  fi
+  sleep 1
+done
 head=\$(head -c 120 /tmp/sub2api-page.out | tr '\\n' ' ')
 echo \"page_http=\${code} body=\${head}\"
 if [[ \"\${code}\" != \"200\" ]]; then
