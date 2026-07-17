@@ -9,6 +9,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -341,6 +342,8 @@ func (s *OpenAIGatewayService) ForwardGrokMedia(
 			}
 			upstreamReq.Header.Set("Content-Type", ct)
 		}
+		// 账号级请求头覆写最后应用，配置值优先于内置默认头。
+		account.ApplyHeaderOverrides(upstreamReq.Header)
 		upstreamStart := time.Now()
 		currentResp, doErr := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
 		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
@@ -390,6 +393,11 @@ func (s *OpenAIGatewayService) ForwardGrokMedia(
 		VideoResolution:      usage.VideoResolution,
 		VideoDurationSeconds: usage.VideoDurationSeconds,
 	}, nil
+}
+
+func isGrokCLIProxyTarget(rawURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	return err == nil && strings.EqualFold(parsed.Hostname(), "cli-chat-proxy.grok.com")
 }
 
 func prepareGrokMediaForwardBody(endpoint GrokMediaEndpoint, body []byte, contentType string) ([]byte, string, error) {

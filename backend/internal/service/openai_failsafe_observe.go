@@ -130,7 +130,7 @@ func (s *OpenAIGatewayService) selectionForOpenAIFailsafeRouteAccount(ctx contex
 	if fresh == nil {
 		return nil, ErrNoAvailableAccounts
 	}
-	fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, PlatformOpenAI, requestedModel, false, OpenAIEndpointCapabilityChatCompletions)
+	fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, groupID, PlatformOpenAI, requestedModel, false, OpenAIEndpointCapabilityChatCompletions)
 	if fresh == nil || !accountSupportsOpenAICapabilities(fresh, OpenAIEndpointCapabilityChatCompletions, "") {
 		return nil, ErrNoAvailableAccounts
 	}

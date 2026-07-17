@@ -116,12 +116,13 @@ func (s *OpenAIGatewayService) failoverOpenAIUpstreamHTTPError(
 	if account.Platform != PlatformGrok {
 		s.handleOpenAIAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody, upstreamModel)
 	}
-	return &UpstreamFailoverError{
-		StatusCode:             resp.StatusCode,
-		ResponseBody:           respBody,
-		ResponseHeaders:        resp.Header.Clone(),
-		RetryableOnSameAccount: account.IsPoolMode() && (account.IsPoolModeRetryableStatus(resp.StatusCode) || isOpenAITransientProcessingError(resp.StatusCode, upstreamMsg, respBody)),
-	}
+	return newOpenAIUpstreamFailoverError(
+		resp.StatusCode,
+		resp.Header,
+		respBody,
+		upstreamMsg,
+		account.IsPoolMode() && (account.IsPoolModeRetryableStatus(resp.StatusCode) || isOpenAITransientProcessingError(resp.StatusCode, upstreamMsg, respBody)),
+	)
 }
 
 // openAIChatCompletionsTargetURL 解析账号的（非 Grok）Chat Completions 上游端点。
@@ -196,8 +197,6 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 		upstreamReq.Header.Set("user-agent", userAgent)
 	}
 
-	// 账号级请求头覆写（仅 openai api_key 账号启用时生效）
-	account.ApplyHeaderOverrides(upstreamReq.Header)
 	if account.Platform == PlatformGrok {
 		// CLI identity headers follow the actual target host, not the account default.
 		// Same-account 403 fallback may retry api.x.ai and must stay clean there.
@@ -208,6 +207,9 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 		}
 		applyGrokCacheHeaders(upstreamReq.Header, grokCacheIdentity)
 	}
+	// 账号级请求头覆写：放在所有内置默认头（含 Grok CLI 身份头）之后应用，
+	// 使配置值获得除共享传输层强制头之外的最高优先级。
+	account.ApplyHeaderOverrides(upstreamReq.Header)
 
 	proxyURL := ""
 	if account.Proxy != nil {

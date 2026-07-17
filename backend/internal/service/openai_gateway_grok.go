@@ -61,8 +61,8 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	if err != nil {
 		return nil, fmt.Errorf("apply grok prompt cache identity: %w", err)
 	}
-	// Codex/Responses 与 Messages 共用 Free 抬升：function tools 场景补 native search tools，
-	// 尽量避开 xAI 的 non-cacheable grok-4.5-build-free 路径。
+	// Free OAuth + client function tools: Codex/Responses 与 Messages 共用 Free 抬升，
+	// function tools 场景补 native search tools，尽量避开 non-cacheable build-free 路径。
 	patchedBody, err = applyGrokFreeMessagesFunctionToolCacheRoute(patchedBody, body, account, cacheIdentity)
 	if err != nil {
 		return nil, fmt.Errorf("apply grok Free function-tool cache route: %w", err)
@@ -1538,6 +1538,9 @@ func buildGrokResponsesRequestWithBase(ctx context.Context, c *gin.Context, acco
 			req.Header.Set("OpenAI-Beta", v)
 		}
 	}
+	// 账号级请求头覆写最后应用，使配置值优先于上面的内置默认头；
+	// 打到官方 CLI 网关时身份头仍由共享传输层最终强制。
+	account.ApplyHeaderOverrides(req.Header)
 	return req, nil
 }
 

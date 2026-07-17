@@ -14,6 +14,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/domain"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 )
 
@@ -88,6 +89,13 @@ const (
 	OpenAIEndpointCapabilityChatCompletions OpenAIEndpointCapability = "chat_completions"
 	OpenAIEndpointCapabilityEmbeddings      OpenAIEndpointCapability = "embeddings"
 	OpenAIEndpointCapabilityVision          OpenAIEndpointCapability = "vision"
+	OpenAIEndpointCapabilityAlphaSearch     OpenAIEndpointCapability = "alpha_search"
+	// OpenAIEndpointCapabilityResponses 表示上游确实提供 /v1/responses 端点。
+	// 与其他能力不同：支持状态来自 accounts.extra 的自动探测标记
+	// （openai_responses_supported / openai_responses_mode），而非
+	// credentials["openai_capabilities"] 配置集。仅用于生图意图的 /v1/responses
+	// 调度，避免把请求调度到会在 forward 阶段被降级为 Chat Completions 的账号（#4417）。
+	OpenAIEndpointCapabilityResponses OpenAIEndpointCapability = "responses"
 )
 
 const openAIEndpointCapabilitiesCredentialKey = "openai_capabilities"
@@ -1313,6 +1321,8 @@ func (a *Account) GetOpenAIRefreshToken() string {
 //
 // OAuth traffic always starts on cli-chat-proxy. Same-account fallback to
 // https://api.x.ai/v1 is handled by the gateway when the CLI proxy returns 403.
+// Credential lifecycle traffic (OAuth authorization and token refresh) always
+// uses the official auth endpoints regardless of stored base_url.
 func (a *Account) GetGrokBaseURL() string {
 	if !a.IsGrok() {
 		return ""
@@ -1320,7 +1330,7 @@ func (a *Account) GetGrokBaseURL() string {
 	if a.IsGrokOAuth() {
 		return xai.DefaultCLIBaseURL
 	}
-	baseURL := a.GetCredential("base_url")
+	baseURL := strings.TrimSpace(a.GetCredential("base_url"))
 	if baseURL != "" {
 		return baseURL
 	}
@@ -1330,7 +1340,8 @@ func (a *Account) GetGrokBaseURL() string {
 // GetGrokMediaBaseURL selects the upstream used by Grok Imagine APIs.
 //
 // OAuth media credentials share the same default as text traffic: start on the
-// CLI proxy. API-key accounts retain their configured public/custom upstream.
+// CLI proxy, then fall back to api.x.ai on 403. API-key accounts retain their
+// configured public/custom upstream.
 func (a *Account) GetGrokMediaBaseURL() string {
 	if !a.IsGrok() {
 		return ""
@@ -1440,6 +1451,25 @@ func (a *Account) SupportsOpenAIEndpointCapability(capability OpenAIEndpointCapa
 	}
 	switch capability {
 	case OpenAIEndpointCapabilityChatCompletions:
+	case OpenAIEndpointCapabilityResponses:
+		// Responses 支持状态由 accounts.extra 的自动探测标记决定，而非
+		// credentials 能力集。已探测确认不支持 /v1/responses 的 APIKey 上游
+		// 必须排除——否则会在 forward 阶段被静默降级为 Chat Completions，
+		// 无法完成生图（#4417）。未探测/OAuth 账号保留旧行为（不排除）。
+		if a.Type == AccountTypeAPIKey && !openai_compat.ShouldUseResponsesAPI(a.Extra) {
+			return false
+		}
+		// 支持 Responses 的上游同样需具备 chat 能力：复用下方 chat_completions
+		// 配置集校验。
+		capability = OpenAIEndpointCapabilityChatCompletions
+	case OpenAIEndpointCapabilityAlphaSearch:
+		// alpha/search 的转发按账号类型分流：OAuth/PAT 走
+		// chatgpt.com/backend-api/codex/alpha/search，API key 走
+		// {base_url}/v1/alpha/search（见 openAIAlphaSearchURL），两类账号
+		// 都可承接独立搜索请求。上游不支持该端点时由转发层 failover 兜底。
+		if a.Type != AccountTypeOAuth && a.Type != AccountTypeAPIKey {
+			return false
+		}
 	case OpenAIEndpointCapabilityEmbeddings:
 		if a.Type != AccountTypeAPIKey {
 			return false
@@ -1454,6 +1484,9 @@ func (a *Account) SupportsOpenAIEndpointCapability(capability OpenAIEndpointCapa
 		// Vision must be explicit. Text-only compatibility is the safer default
 		// for third-party OpenAI-compatible providers.
 		return capability != OpenAIEndpointCapabilityVision
+	}
+	if capability == OpenAIEndpointCapabilityAlphaSearch && configured[string(OpenAIEndpointCapabilityChatCompletions)] {
+		return true
 	}
 	return configured[string(capability)]
 }
