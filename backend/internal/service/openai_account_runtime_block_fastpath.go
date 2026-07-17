@@ -14,13 +14,17 @@ const (
 	openAIOAuth429StormWindow             = 10 * time.Second
 	openAIOAuth429StormThreshold          = 20
 	openAIOAuth429StormMaxAccountSwitches = 1
+	// Grok OAuth 429 时允许在单次请求内继续换号的次数（不含首个失败号）。
+	// 旧逻辑只允许 1 次 follow-up，容易粘死热号后立刻 429 回客户端。
+	grokOAuth429MaxFollowupSwitches = 8
 )
 
 // OpenAIOAuth429FailoverState tracks the request-local follow-up budget after
-// the first Grok OAuth 429. Once that 429 occurs, exactly one different account
-// may be attempted; any failure from that follow-up account ends failover.
+// the first Grok OAuth 429. Once that 429 occurs, additional accounts may be
+// attempted up to grokOAuth429MaxFollowupSwitches before failover stops.
 type OpenAIOAuth429FailoverState struct {
-	grokOAuth429FollowupPending bool
+	grokOAuth429FollowupsRemaining int
+	grokOAuth429BudgetArmed        bool
 }
 
 func openAIAccountStateContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -221,12 +225,18 @@ func (s *OpenAIGatewayService) ShouldStopOpenAIOAuth429Failover(account *Account
 	if failedSwitches < openAIOAuth429StormMaxAccountSwitches {
 		return false
 	}
-	if state != nil && state.grokOAuth429FollowupPending {
-		// The follow-up budget was armed by a Grok OAuth 429. Consume it on
-		// any failing follow-up account, even if a mixed pool selected an API-key
-		// account next.
-		return true
+
+	// Grok OAuth 429 budget: after the first 429, allow a bounded number of
+	// additional account switches before returning 429 to the client.
+	if state != nil && state.grokOAuth429BudgetArmed {
+		if state.grokOAuth429FollowupsRemaining <= 0 {
+			return true
+		}
+		state.grokOAuth429FollowupsRemaining--
+		// Keep budget armed so mixed-pool follow-up failures still consume it.
+		return false
 	}
+
 	if isGrokOAuthAccount(account) {
 		if state == nil {
 			// Preserve the old threshold for callers that have not adopted the
@@ -234,7 +244,10 @@ func (s *OpenAIGatewayService) ShouldStopOpenAIOAuth429Failover(account *Account
 			return statusCode == http.StatusTooManyRequests && failedSwitches >= 2
 		}
 		if statusCode == http.StatusTooManyRequests {
-			state.grokOAuth429FollowupPending = true
+			state.grokOAuth429BudgetArmed = true
+			// failedSwitches already counts the current 429 account; remaining
+			// budget is pure follow-up attempts on other accounts.
+			state.grokOAuth429FollowupsRemaining = grokOAuth429MaxFollowupSwitches
 		}
 		return false
 	}

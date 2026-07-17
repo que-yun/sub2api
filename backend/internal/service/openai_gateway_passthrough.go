@@ -81,6 +81,13 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	if sanitized {
 		body = sanitizedBody
 	}
+	if preparedBody, prepared, prepareErr := prepareOpenAICompatibleResponsesBody(account, body); prepareErr != nil {
+		return nil, prepareErr
+	} else if prepared {
+		body = preparedBody
+		reqStream = gjson.GetBytes(body, "stream").Bool()
+		logger.LegacyPrintf("service.openai_gateway", "[OpenAI passthrough] Normalized Codex tools/input for account=%d model=%s", account.ID, reqModel)
+	}
 
 	// Apply OpenAI fast policy to the passthrough body (filter/block by service_tier).
 	// 统一使用 upstream 视角的 model：透传路径下 body 已经过 compact 映射 +

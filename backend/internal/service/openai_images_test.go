@@ -483,6 +483,7 @@ func TestAccountSupportsOpenAIEndpointCapability(t *testing.T) {
 
 		require.True(t, account.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityChatCompletions))
 		require.True(t, account.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityEmbeddings))
+		require.False(t, account.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityVision))
 	})
 
 	t.Run("OpenAI OAuth 默认仅兼容 chat", func(t *testing.T) {
@@ -493,6 +494,7 @@ func TestAccountSupportsOpenAIEndpointCapability(t *testing.T) {
 
 		require.True(t, account.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityChatCompletions))
 		require.False(t, account.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityEmbeddings))
+		require.False(t, account.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityVision))
 	})
 
 	t.Run("显式列表支持同时声明 chat 和 embeddings", func(t *testing.T) {
@@ -544,6 +546,76 @@ func TestAccountSupportsOpenAIEndpointCapability(t *testing.T) {
 		}
 
 		require.False(t, account.SupportsOpenAIEndpointCapability(OpenAIEndpointCapability("unknown")))
+	})
+}
+
+func TestAccountSupportsOpenAIVisionModel(t *testing.T) {
+	t.Run("vision capability without model whitelist allows mapped model", func(t *testing.T) {
+		account := &Account{
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeAPIKey,
+			Credentials: map[string]any{
+				"model_mapping": map[string]any{"gpt-*": "kimi-k2.7-code"},
+				"openai_capabilities": map[string]any{
+					"chat_completions": true,
+					"vision":           true,
+				},
+			},
+		}
+
+		require.True(t, account.SupportsOpenAIVisionModel("gpt-5.5"))
+	})
+
+	t.Run("vision model whitelist checks mapped model", func(t *testing.T) {
+		account := &Account{
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeAPIKey,
+			Credentials: map[string]any{
+				"model_mapping": map[string]any{"gpt-*": "glm-5.2"},
+				"openai_capabilities": map[string]any{
+					"chat_completions": true,
+					"vision":           true,
+				},
+				"vision_models": []any{"kimi-*", "mimo-v2.5"},
+			},
+		}
+
+		require.False(t, account.SupportsOpenAIVisionModel("gpt-5.5"))
+	})
+
+	t.Run("vision model whitelist accepts wildcard mapped model", func(t *testing.T) {
+		account := &Account{
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeAPIKey,
+			Credentials: map[string]any{
+				"model_mapping": map[string]any{"gpt-*": "kimi-k2.7-code"},
+				"openai_capabilities": map[string]any{
+					"chat_completions": true,
+					"vision":           true,
+				},
+				"vision_models": []any{"kimi-*", "mimo-v2.5"},
+			},
+		}
+
+		require.True(t, account.SupportsOpenAIVisionModel("gpt-5.5"))
+	})
+
+	t.Run("vision model whitelist checks vision mapping before text mapping", func(t *testing.T) {
+		account := &Account{
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeAPIKey,
+			Credentials: map[string]any{
+				"model_mapping":        map[string]any{"gpt-*": "glm-5.2"},
+				"vision_model_mapping": map[string]any{"gpt-*": "kimi-k2.7-code"},
+				"openai_capabilities": map[string]any{
+					"chat_completions": true,
+					"vision":           true,
+				},
+				"vision_models": []any{"kimi-*"},
+			},
+		}
+
+		require.True(t, account.SupportsOpenAIVisionModel("gpt-5.5"))
 	})
 }
 

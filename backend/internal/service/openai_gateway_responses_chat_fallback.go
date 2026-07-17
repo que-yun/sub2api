@@ -26,6 +26,19 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 ) (*OpenAIForwardResult, error) {
 	startTime := time.Now()
 
+	// Third-party OpenAI-compatible chat fallbacks still need Codex shell tools
+	// rewritten into function tools before Responses->Chat conversion.
+	if shouldSanitizeOpenAICompatibleResponsesModelInput(account) {
+		if normalizedBody, changed, normErr := normalizeOpenAICompatibleCodexToolsOnly(body); normErr != nil {
+			return nil, normErr
+		} else if changed {
+			body = normalizedBody
+			logger.L().Debug("openai responses chat fallback: normalized codex tools",
+				zap.Int64("account_id", account.ID),
+			)
+		}
+	}
+
 	var responsesReq apicompat.ResponsesRequest
 	if err := json.Unmarshal(body, &responsesReq); err != nil {
 		writeOpenAIResponsesFallbackError(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
@@ -58,7 +71,7 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 		return nil, fmt.Errorf("convert responses to chat completions: %w", err)
 	}
 
-	billingModel := resolveOpenAIForwardModel(account, originalModel, "")
+	billingModel := resolveOpenAIForwardModelForContext(ctx, account, originalModel, "")
 	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
 	reasoningEffort := extractOpenAIReasoningEffortFromBody(body, upstreamModel, billingModel, originalModel)
 	// 国产模型默认 effort 补充：需要 mappedModel 判定，推迟到 billingModel 算出之后。

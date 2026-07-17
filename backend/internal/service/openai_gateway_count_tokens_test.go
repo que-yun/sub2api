@@ -103,7 +103,7 @@ func TestOpenAIGatewayService_ForwardCountTokensAsAnthropic_OAuthFallsBackWhenPl
 		Schedulable: true,
 	}
 
-	prepared, err := prepareOpenAIInputTokensCountRequest(body, account, "gpt-5.4")
+	prepared, err := prepareOpenAIInputTokensCountRequest(context.Background(), body, account, "gpt-5.4")
 	require.NoError(t, err)
 	expectedEstimate, err := estimateOpenAIInputTokens(prepared.Request)
 	require.NoError(t, err)
@@ -288,7 +288,7 @@ func TestEstimateOpenAIInputTokens_CompareWithOpenAIAPI(t *testing.T) {
 	account := &Account{Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			prepared, err := prepareOpenAIInputTokensCountRequest(tc.anthropicBody, account, tc.defaultOpenAIModel)
+			prepared, err := prepareOpenAIInputTokensCountRequest(context.Background(), tc.anthropicBody, account, tc.defaultOpenAIModel)
 			require.NoError(t, err)
 
 			estimated, err := estimateOpenAIInputTokens(prepared.Request)

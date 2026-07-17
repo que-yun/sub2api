@@ -1,6 +1,9 @@
 package service
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestResolveOpenAIForwardModel(t *testing.T) {
 	tests := []struct {
@@ -151,6 +154,43 @@ func TestResolveOpenAIForwardModel(t *testing.T) {
 				t.Fatalf("resolveOpenAIForwardModel(...) = %q, want %q", got, tt.expectedModel)
 			}
 		})
+	}
+}
+
+func TestResolveOpenAIForwardModelForContext_ImageInputUsesVisionMapping(t *testing.T) {
+	account := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"model_mapping":        map[string]any{"gpt-*": "glm-5.2"},
+			"vision_model_mapping": map[string]any{"gpt-*": "kimi-k2.7-code"},
+		},
+	}
+
+	if got := resolveOpenAIForwardModelForContext(context.Background(), account, "gpt-5.5", ""); got != "glm-5.2" {
+		t.Fatalf("text request resolved model = %q, want %q", got, "glm-5.2")
+	}
+
+	visionCtx := WithOpenAIImageInputIntent(context.Background())
+	if got := resolveOpenAIForwardModelForContext(visionCtx, account, "gpt-5.5", ""); got != "kimi-k2.7-code" {
+		t.Fatalf("image request resolved model = %q, want %q", got, "kimi-k2.7-code")
+	}
+}
+
+func TestResolveOpenAIForwardModelForContext_ImageInputTriesMessagesDispatchModel(t *testing.T) {
+	account := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"model_mapping":        map[string]any{"claude-*": "glm-5.2"},
+			"vision_model_mapping": map[string]any{"gpt-*": "kimi-k2.7-code"},
+		},
+	}
+
+	visionCtx := WithOpenAIImageInputIntent(context.Background())
+	got := resolveOpenAIForwardModelForContext(visionCtx, account, "claude-sonnet-4-6", "gpt-5.5")
+	if got != "kimi-k2.7-code" {
+		t.Fatalf("image messages dispatch resolved model = %q, want %q", got, "kimi-k2.7-code")
 	}
 }
 

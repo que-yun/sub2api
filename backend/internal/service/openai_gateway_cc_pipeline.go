@@ -196,16 +196,15 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 		upstreamReq.Header.Set("user-agent", userAgent)
 	}
 
-	// Free Grok Build (cli-chat-proxy) requires Grok CLI client headers.
-	if account != nil && account.Platform == PlatformGrok {
-		xai.ApplyGrokBuildHeaders(upstreamReq.Header)
-	}
-
 	// 账号级请求头覆写（仅 openai api_key 账号启用时生效）
 	account.ApplyHeaderOverrides(upstreamReq.Header)
 	if account.Platform == PlatformGrok {
+		// CLI identity headers follow the actual target host, not the account default.
+		// Same-account 403 fallback may retry api.x.ai and must stay clean there.
 		if account.IsGrokOAuth() {
-			applyGrokCLIHeaders(upstreamReq.Header)
+			applyGrokOAuthUpstreamHeadersForBaseURL(account, upstreamReq.Header, targetURL)
+		} else if xai.IsCLIChatProxyBaseURL(targetURL) {
+			xai.ApplyGrokBuildHeaders(upstreamReq.Header)
 		}
 		applyGrokCacheHeaders(upstreamReq.Header, grokCacheIdentity)
 	}

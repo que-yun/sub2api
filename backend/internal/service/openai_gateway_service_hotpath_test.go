@@ -103,6 +103,32 @@ func TestOpenAIRequestView_HasPatches(t *testing.T) {
 	require.False(t, view.HasPatches())
 }
 
+func TestShouldSanitizeOpenAICompatibleResponsesModelInput(t *testing.T) {
+	require.False(t, shouldSanitizeOpenAICompatibleResponsesModelInput(&Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"api_key": "sk-test",
+		},
+	}))
+	require.False(t, shouldSanitizeOpenAICompatibleResponsesModelInput(&Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"api_key":  "sk-test",
+			"base_url": "https://api.openai.com/v1",
+		},
+	}))
+	require.True(t, shouldSanitizeOpenAICompatibleResponsesModelInput(&Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"api_key":  "sk-test",
+			"base_url": "https://ollama.com/v1",
+		},
+	}))
+}
+
 func TestOpenAIGatewayService_Forward_HTTPPatchPathKeepsLargeInputRaw(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	upstream := &httpUpstreamRecorder{
@@ -184,6 +210,149 @@ func TestOpenAIGatewayService_Forward_DecodedMutationKeepsLaterFieldDeletes(t *t
 	require.Equal(t, "png", gjson.GetBytes(upstream.lastBody, "tools.0.output_format").String())
 }
 
+func TestOpenAIGatewayService_Forward_APIKeyCompatibleSanitizesCodexToolItems(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := &httpUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"usage":{"input_tokens":1,"output_tokens":2}}`)),
+		},
+	}
+	cfg := &config.Config{}
+	cfg.Security.URLAllowlist.Enabled = false
+	svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: upstream}
+	account := &Account{
+		ID:          21521,
+		Name:        "ollama-cloud-pro",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key":  "sk-test",
+			"base_url": "https://ollama.com/v1",
+		},
+		Extra: map[string]any{"use_responses_api": true},
+	}
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	SetOpenAIClientTransport(c, OpenAIClientTransportHTTP)
+
+	body := []byte(`{
+		"model":"gpt-5.5",
+		"stream":false,
+		"input":[
+			{"type":"message","role":"user","content":"continue"},
+			{"type":"custom_tool_call","call_id":"call_custom","name":"lookup","input":"{\"q\":\"x\"}"},
+			{"type":"custom_tool_call_output","call_id":"call_custom","output":"{\"ok\":true}"},
+			{"type":"web_search_call","id":"ws_1","query":"latest"},
+			{"type":"item_reference","id":"item_1"}
+		]
+	}`)
+
+	result, err := svc.Forward(context.Background(), c, account, body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotContains(t, string(upstream.lastBody), "custom_tool_call")
+	require.NotContains(t, string(upstream.lastBody), "custom_tool_call_output")
+	require.False(t, gjson.GetBytes(upstream.lastBody, `input.#(type=="item_reference")`).Exists())
+	require.Equal(t, "function_call", gjson.GetBytes(upstream.lastBody, "input.1.type").String())
+	require.Equal(t, "call_custom", gjson.GetBytes(upstream.lastBody, "input.1.call_id").String())
+	require.Equal(t, "lookup", gjson.GetBytes(upstream.lastBody, "input.1.name").String())
+	require.Equal(t, `{"q":"x"}`, gjson.GetBytes(upstream.lastBody, "input.1.arguments").String())
+	require.Equal(t, "function_call_output", gjson.GetBytes(upstream.lastBody, "input.2.type").String())
+	require.Equal(t, `{"ok":true}`, gjson.GetBytes(upstream.lastBody, "input.2.output").String())
+	require.Equal(t, "message", gjson.GetBytes(upstream.lastBody, "input.3.type").String())
+	require.Equal(t, "assistant", gjson.GetBytes(upstream.lastBody, "input.3.role").String())
+	require.Equal(t, "latest", gjson.GetBytes(upstream.lastBody, "input.3.content").String())
+}
+
+func TestPrepareOpenAICompatibleResponsesBody_NormalizesCodexShellTools(t *testing.T) {
+	account := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"api_key":  "sk-test",
+			"base_url": "https://ollama.com/v1",
+		},
+	}
+	body := []byte(`{
+		"model":"gpt-5.5",
+		"tools":[
+			{"type":"local_shell"},
+			{"type":"function","name":"read_file","parameters":{"type":"object"}}
+		],
+		"tool_choice":"auto",
+		"input":[{"type":"message","role":"user","content":"list files"}]
+	}`)
+	out, changed, err := prepareOpenAICompatibleResponsesBody(account, body)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, "function", gjson.GetBytes(out, "tools.0.type").String())
+	require.Equal(t, "exec_command", gjson.GetBytes(out, "tools.0.name").String())
+	require.Equal(t, "function", gjson.GetBytes(out, "tools.1.type").String())
+	require.Equal(t, "read_file", gjson.GetBytes(out, "tools.1.name").String())
+	require.Equal(t, "required", gjson.GetBytes(out, "tool_choice").String())
+
+	official := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"api_key":  "sk-test",
+			"base_url": "https://api.openai.com/v1",
+		},
+	}
+	out, changed, err = prepareOpenAICompatibleResponsesBody(official, body)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.JSONEq(t, string(body), string(out))
+}
+
+func TestOpenAIGatewayService_Forward_APIKeyCompatibleNormalizesCodexShellTools(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := &httpUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"usage":{"input_tokens":1,"output_tokens":2}}`)),
+		},
+	}
+	cfg := &config.Config{}
+	cfg.Security.URLAllowlist.Enabled = false
+	svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: upstream}
+	account := &Account{
+		ID:          21521,
+		Name:        "ollama-cloud-pro",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key":  "sk-test",
+			"base_url": "https://ollama.com/v1",
+		},
+		Extra: map[string]any{"use_responses_api": true},
+	}
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	SetOpenAIClientTransport(c, OpenAIClientTransportHTTP)
+
+	body := []byte(`{
+		"model":"gpt-5.5",
+		"stream":false,
+		"tools":[{"type":"local_shell"},{"type":"function","name":"read_file","parameters":{"type":"object"}}],
+		"tool_choice":"auto",
+		"input":[{"type":"message","role":"user","content":"run ls"}]
+	}`)
+	result, err := svc.Forward(context.Background(), c, account, body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "function", gjson.GetBytes(upstream.lastBody, "tools.0.type").String())
+	require.Equal(t, "exec_command", gjson.GetBytes(upstream.lastBody, "tools.0.name").String())
+	require.Equal(t, "required", gjson.GetBytes(upstream.lastBody, "tool_choice").String())
+}
+
 func TestOpenAIGatewayService_Forward_MappedImageModelUsesImageGate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	upstream := &httpUpstreamRecorder{
@@ -239,6 +408,50 @@ func TestOpenAIGatewayService_Forward_MappedImageModelUsesImageGate(t *testing.T
 	cached, known = getOpenAIImageIntentHint(c)
 	require.True(t, known)
 	require.False(t, cached)
+}
+
+func TestOpenAIGatewayService_Forward_ImageInputUsesVisionModelMapping(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := &httpUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}, "x-request-id": []string{"rid_vision_mapping"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"id":"resp_vision_mapping","object":"response","model":"kimi-k2.7-code","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":20,"output_tokens":10,"total_tokens":30}}`,
+			)),
+		},
+	}
+	cfg := &config.Config{}
+	cfg.Security.URLAllowlist.Enabled = false
+	svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: upstream}
+	account := &Account{
+		ID:          5,
+		Name:        "openai-apikey",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key":              "sk-test",
+			"base_url":             "https://example.com",
+			"model_mapping":        map[string]any{"gpt-*": "glm-5.2"},
+			"vision_model_mapping": map[string]any{"gpt-*": "kimi-k2.7-code"},
+		},
+		Extra: map[string]any{"use_responses_api": true},
+	}
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+	SetOpenAIClientTransport(c, OpenAIClientTransportHTTP)
+
+	body := []byte(`{"model":"gpt-5.5","stream":false,"input":[{"type":"message","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":"data:image/png;base64,abc"}]}]}`)
+	result, err := svc.Forward(WithOpenAIImageInputIntent(context.Background()), c, account, body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, upstream.lastReq)
+	require.Equal(t, "kimi-k2.7-code", gjson.GetBytes(upstream.lastBody, "model").String())
+	require.NotEqual(t, "glm-5.2", gjson.GetBytes(upstream.lastBody, "model").String())
+	require.Equal(t, "kimi-k2.7-code", result.BillingModel)
+	require.Equal(t, "kimi-k2.7-code", result.UpstreamModel)
 }
 
 func TestOpenAIGatewayService_Forward_TextResponsesSetsBillingModelToMappedModel(t *testing.T) {
@@ -717,6 +930,40 @@ func TestOpenAIRequestBodyMayContainEmptyBase64InputImageSeesEscapedInputPrefix(
 	body := []byte(`{"input":[{"type":"message","content":[{"type":"inp` + "\\u0075" + `t_image","image_url":"data:image/png;base64,   "}]}]}`)
 
 	require.True(t, openAIRequestBodyMayContainEmptyBase64InputImage(body))
+}
+
+func TestOpenAIRequestBodyHasImageInput(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+		want bool
+	}{
+		{
+			name: "responses input image",
+			body: []byte(`{"input":[{"type":"message","content":[{"type":"input_text","text":"what is this"},{"type":"input_image","image_url":"data:image/png;base64,abc"}]}]}`),
+			want: true,
+		},
+		{
+			name: "chat completions image url",
+			body: []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}]}]}`),
+			want: true,
+		},
+		{
+			name: "anthropic messages image block",
+			body: []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"what is this"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]}]}`),
+			want: true,
+		},
+		{
+			name: "plain text",
+			body: []byte(`{"input":[{"type":"message","content":[{"type":"input_text","text":"hello"}]}]}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, OpenAIRequestBodyHasImageInput(tt.body))
+		})
+	}
 }
 
 func TestOpenAIGatewayService_Forward_ImageOnlyModelKeepsSupportedVerbosity(t *testing.T) {

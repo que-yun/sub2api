@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -73,7 +74,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 	serviceTier := extractOpenAIServiceTierFromBody(body)
 
 	// 2. Resolve model mapping (same as ForwardAsChatCompletions)
-	billingModel := resolveOpenAIForwardModel(account, originalModel, defaultMappedModel)
+	billingModel := resolveOpenAIForwardModelForContext(ctx, account, originalModel, defaultMappedModel)
 	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
 	grokCacheIdentity := ""
 	if account.Platform == PlatformGrok {
@@ -154,51 +155,88 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 		zap.Bool("stream", clientStream),
 	)
 
-	// 5. Build and send upstream request via the shared CC pipeline
-	targetURL, err := s.rawChatCompletionsURL(account)
-	if err != nil {
-		return nil, err
-	}
+	// 5. Build and send upstream request via the shared CC pipeline.
+	// Grok OAuth starts on cli-chat-proxy and falls back to api.x.ai on 403.
 	SetActualOpenAIUpstreamEndpoint(c, grokChatRawEndpoint)
 	customUA := account.GetOpenAIUserAgent()
 	if customUA == "" && account.IsGrokOAuth() {
 		customUA = "sub2api-grok/1.0"
 	}
-	resp, err := s.sendCCUpstreamRequest(ctx, c, account, targetURL, upstreamBody, clientStream, token, customUA, grokCacheIdentity)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
 
-	// 7. Handle error response with failover
-	if resp.StatusCode >= 400 {
-		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
+	tryBaseURLs := []string{}
+	if account.Platform == PlatformGrok {
+		tryBaseURLs = append(tryBaseURLs, account.GetGrokBaseURL())
+		if account.IsGrokOAuth() && xai.IsCLIChatProxyBaseURL(tryBaseURLs[0]) {
+			tryBaseURLs = append(tryBaseURLs, xai.DefaultBaseURL)
+		}
+	} else {
+		tryBaseURLs = append(tryBaseURLs, "")
+	}
+
+	var resp *http.Response
+	for i, baseURL := range tryBaseURLs {
+		var targetURL string
+		var urlErr error
 		if account.Platform == PlatformGrok {
+			targetURL, urlErr = buildGrokChatCompletionsURLWithBase(account, s.cfg, baseURL)
+			if urlErr != nil {
+				return nil, fmt.Errorf("invalid grok base_url: %w", urlErr)
+			}
+		} else {
+			targetURL, urlErr = s.rawChatCompletionsURL(account)
+			if urlErr != nil {
+				return nil, urlErr
+			}
+		}
+
+		currentResp, doErr := s.sendCCUpstreamRequest(ctx, c, account, targetURL, upstreamBody, clientStream, token, customUA, grokCacheIdentity)
+		if doErr != nil {
+			return nil, doErr
+		}
+		if currentResp.StatusCode < 400 {
+			resp = currentResp
+			break
+		}
+
+		respBody, upstreamMsg := s.readOpenAIUpstreamError(currentResp)
+		if account.Platform == PlatformGrok {
+			requestID := firstNonEmpty(currentResp.Header.Get("x-request-id"), currentResp.Header.Get("xai-request-id"))
+			if i == 0 && canFallbackGrokCLIProxyToPublicAPI(account, baseURL, currentResp.StatusCode) && len(tryBaseURLs) > 1 {
+				_ = currentResp.Body.Close()
+				appendGrokCLIProxyFallbackOpsEvent(c, account, currentResp.StatusCode, requestID, "cli-chat-proxy 403, retrying same account on api.x.ai")
+				continue
+			}
 			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
 				Platform:           account.Platform,
 				AccountID:          account.ID,
 				AccountName:        account.Name,
-				UpstreamStatusCode: resp.StatusCode,
-				UpstreamRequestID:  firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id")),
+				UpstreamStatusCode: currentResp.StatusCode,
+				UpstreamRequestID:  requestID,
 				Kind:               "failover",
 				Message:            upstreamMsg,
 			})
-			s.handleGrokAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody)
-			if s.shouldFailoverUpstreamError(resp.StatusCode) {
+			s.handleGrokAccountUpstreamError(ctx, account, currentResp.StatusCode, currentResp.Header, respBody)
+			if s.shouldFailoverUpstreamError(currentResp.StatusCode) {
+				_ = currentResp.Body.Close()
 				return nil, &UpstreamFailoverError{
-					StatusCode:             resp.StatusCode,
+					StatusCode:             currentResp.StatusCode,
 					ResponseBody:           respBody,
-					ResponseHeaders:        resp.Header.Clone(),
-					RetryableOnSameAccount: account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode),
+					ResponseHeaders:        currentResp.Header.Clone(),
+					RetryableOnSameAccount: account.IsPoolMode() && account.IsPoolModeRetryableStatus(currentResp.StatusCode),
 				}
 			}
-			return s.handleChatCompletionsErrorResponse(resp, c, account, billingModel)
+			return s.handleChatCompletionsErrorResponse(currentResp, c, account, billingModel)
 		}
-		if foErr := s.failoverOpenAIUpstreamHTTPError(ctx, c, account, resp, respBody, upstreamMsg, upstreamModel); foErr != nil {
+		if foErr := s.failoverOpenAIUpstreamHTTPError(ctx, c, account, currentResp, respBody, upstreamMsg, upstreamModel); foErr != nil {
+			_ = currentResp.Body.Close()
 			return nil, foErr
 		}
-		return s.handleChatCompletionsErrorResponse(resp, c, account, billingModel)
+		return s.handleChatCompletionsErrorResponse(currentResp, c, account, billingModel)
 	}
+	if resp == nil {
+		return nil, fmt.Errorf("upstream returned no successful response")
+	}
+	defer func() { _ = resp.Body.Close() }()
 
 	if account.Platform == PlatformGrok {
 		s.updateGrokUsageFromResponse(ctx, account, resp.Header, resp.StatusCode)

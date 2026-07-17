@@ -134,6 +134,15 @@ func resolveOpenAIUpstreamOriginator(c *gin.Context, isOfficialClient bool) stri
 	return "opencode"
 }
 
+// ClearStickySession drops the session -> account sticky binding so the next
+// selection can leave a rate-limited or failed hot account.
+func (s *OpenAIGatewayService) ClearStickySession(ctx context.Context, groupID *int64, sessionHash string) error {
+	if sessionHash == "" {
+		return nil
+	}
+	return s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
+}
+
 // BindStickySession sets session -> account binding with standard TTL.
 func (s *OpenAIGatewayService) BindStickySession(ctx context.Context, groupID *int64, sessionHash string, accountID int64) error {
 	if sessionHash == "" || accountID <= 0 {
@@ -231,13 +240,22 @@ func isOpenAICompatibleAccountEligibleForRequest(ctx context.Context, account *A
 			return false
 		}
 	}
-	if requestedModel != "" && !account.IsModelSupported(requestedModel) {
-		return false
+	if requestedModel != "" {
+		modelSupported := account.IsModelSupported(requestedModel)
+		if !modelSupported && OpenAIImageInputIntentFromContext(ctx) {
+			_, modelSupported = account.ResolveVisionMappedModel(requestedModel)
+		}
+		if !modelSupported {
+			return false
+		}
 	}
 	if !account.SupportsOpenAIEndpointCapability(requiredCapability) {
 		return false
 	}
 	if requireCompact && (!account.IsOpenAI() || openAICompactSupportTier(account) == 0) {
+		return false
+	}
+	if OpenAIImageInputIntentFromContext(ctx) && !account.SupportsOpenAIVisionModel(requestedModel) {
 		return false
 	}
 	return true
@@ -560,7 +578,16 @@ func prioritizeOpenAICompactAccounts(accounts []*Account) []*Account {
 // would be sent for a given request, honouring compact-only mappings when the
 // caller is on the /responses/compact path.
 func resolveOpenAIAccountUpstreamModelForRequest(account *Account, requestedModel string, requireCompact bool) string {
-	upstreamModel := resolveOpenAIForwardModel(account, requestedModel, "")
+	upstreamModel := resolveOpenAIAccountUpstreamModelForRequestWithContext(context.Background(), account, requestedModel, requireCompact)
+	return upstreamModel
+}
+
+// resolveOpenAIAccountUpstreamModelForRequestWithContext resolves the upstream
+// model for scheduling-time checks. It must match forwarding resolution so
+// capability and channel-restriction decisions are made against the same model
+// that the upstream will receive.
+func resolveOpenAIAccountUpstreamModelForRequestWithContext(ctx context.Context, account *Account, requestedModel string, requireCompact bool) string {
+	upstreamModel := resolveOpenAIForwardModelForContext(ctx, account, requestedModel, "")
 	if upstreamModel == "" {
 		return ""
 	}

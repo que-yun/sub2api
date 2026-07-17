@@ -67,6 +67,9 @@ func (a *Account) modelRateLimitKeysForRequest(ctx context.Context, requestedMod
 	}
 
 	modelKey := a.GetMappedModel(requestedModel)
+	if a.Platform == PlatformOpenAI {
+		modelKey = resolveOpenAIForwardModelForContext(ctx, a, requestedModel, "")
+	}
 	if a.Platform == PlatformAntigravity {
 		modelKey = resolveFinalAntigravityModelKey(ctx, a, requestedModel)
 	}
@@ -117,6 +120,23 @@ func OpenAIImageGenerationIntentFromContext(ctx context.Context) bool {
 		return false
 	}
 	enabled, ok := ctx.Value(ctxkey.OpenAIImageGenerationIntent).(bool)
+	return ok && enabled
+}
+
+type openAIImageInputIntentCtxKey struct{}
+
+func WithOpenAIImageInputIntent(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, openAIImageInputIntentCtxKey{}, true)
+}
+
+func OpenAIImageInputIntentFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	enabled, ok := ctx.Value(openAIImageInputIntentCtxKey{}).(bool)
 	return ok && enabled
 }
 
