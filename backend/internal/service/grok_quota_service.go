@@ -77,19 +77,39 @@ func NewGrokQuotaService(
 
 // QueryQuota combines xAI billing data with an active quota-header probe for
 // Free accounts, whose billing response does not include usage_percent.
+//
+// forceActiveProbe=true always runs the chat/readiness probe. Recovery tooling
+// must use that path; paid billing snapshots alone can look healthy while chat
+// entitlement is still 403.
 func (s *GrokQuotaService) QueryQuota(ctx context.Context, accountID int64) (*GrokQuotaProbeResult, error) {
+	return s.queryQuota(ctx, accountID, false)
+}
+
+// QueryQuotaActiveProbe forces the chat readiness probe used by recovery scans.
+func (s *GrokQuotaService) QueryQuotaActiveProbe(ctx context.Context, accountID int64) (*GrokQuotaProbeResult, error) {
+	return s.queryQuota(ctx, accountID, true)
+}
+
+func (s *GrokQuotaService) queryQuota(ctx context.Context, accountID int64, forceActiveProbe bool) (*GrokQuotaProbeResult, error) {
 	billingResult, billingErr := s.ProbeBilling(ctx, accountID)
-	if billingErr == nil && billingResult != nil && grokBillingHasAuthoritativeQuota(billingResult.Billing) {
+	if !forceActiveProbe && billingErr == nil && billingResult != nil && grokBillingHasAuthoritativeQuota(billingResult.Billing) {
 		return billingResult, nil
 	}
 
 	probeResult, probeErr := s.ProbeUsage(ctx, accountID)
 	if probeErr != nil {
-		if billingResult != nil && billingResult.Billing != nil {
-			billingResult.ProbeError = probeErr.Error()
-			return billingResult, nil
+		// Hard readiness failures (401/403/token) must not be masked by billing.
+		// Soft failures may still return billing with probe_error for diagnostics
+		// when the caller is not doing an explicit readiness/recovery probe.
+		if forceActiveProbe || isHardGrokActiveProbeFailure(probeErr) || billingResult == nil || billingResult.Billing == nil {
+			return nil, probeErr
 		}
-		return nil, probeErr
+		billingResult.ProbeError = probeErr.Error()
+		if code := infraerrors.Code(probeErr); code > 0 {
+			// Keep admin clients from treating billing-only 200 as chat-usable.
+			billingResult.StatusCode = code
+		}
+		return billingResult, nil
 	}
 	if probeResult == nil {
 		if billingErr != nil {
@@ -106,6 +126,24 @@ func (s *GrokQuotaService) QueryQuota(ctx context.Context, accountID int64) (*Gr
 		probeResult.Persisted = probeResult.Persisted || billingResult.Persisted
 	}
 	return probeResult, nil
+}
+
+// isHardGrokActiveProbeFailure reports readiness failures that mean the account
+// is not currently usable for chat, even if billing endpoints still answer.
+func isHardGrokActiveProbeFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	reason := infraerrors.Reason(err)
+	code := infraerrors.Code(err)
+	switch reason {
+	case "GROK_QUOTA_TOKEN_UNAVAILABLE":
+		return true
+	case "GROK_QUOTA_PROBE_UPSTREAM_ERROR":
+		return code == http.StatusUnauthorized || code == http.StatusForbidden || code == http.StatusNotFound
+	default:
+		return false
+	}
 }
 
 func grokBillingHasAuthoritativeQuota(billing *xai.BillingSummary) bool {
@@ -149,9 +187,7 @@ func (s *GrokQuotaService) probeUsage(ctx context.Context, accountID int64) (*Gr
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if account.IsGrokOAuth() {
-		applyGrokCLIHeaders(req.Header)
-	}
+	applyGrokOAuthUpstreamHeaders(account, req.Header)
 
 	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, maxInt(account.Concurrency, 1))
 	if err != nil {
@@ -183,25 +219,32 @@ func (s *GrokQuotaService) probeUsage(ctx context.Context, accountID int64) (*Gr
 		FetchedAt:       time.Now().Unix(),
 		Persisted:       persistErr == nil,
 	}
+	// Read a small body prefix for readiness classification (403 vs free-usage etc).
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	// Operator/admin probes must apply the same readiness side effects as production:
+	// HTTP 200 clears sticky hold/error; true entitlement 403 marks error.
+	ApplyGrokProbeOrTestStatus(ctx, s.accountRepo, nil, account, resp.StatusCode, resp.Header, bodyBytes, "active_probe")
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return result, nil
 	}
 	if resp.StatusCode >= 400 {
 		const reason = "GROK_QUOTA_PROBE_UPSTREAM_ERROR"
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		bodyText := truncate(strings.TrimSpace(string(bodyBytes)), 240)
 		slog.Warn(
 			"grok_quota_probe_failed",
 			"account_id", account.ID,
 			"model", probeModel,
 			"status", resp.StatusCode,
 			"reason", reason,
+			"body", bodyText,
 		)
 		return nil, infraerrors.Newf(
 			mapUpstreamStatus(resp.StatusCode),
 			reason,
-			"upstream returned %d for probe model %q",
+			"upstream returned %d for probe model %q: %s",
 			resp.StatusCode,
 			probeModel,
+			bodyText,
 		)
 	}
 	return result, nil
@@ -393,7 +436,9 @@ func (s *GrokQuotaService) prepareProbe(ctx context.Context, accountID int64) (*
 	}
 	proxyURL := s.resolveProxyURL(ctx, account)
 
-	token, err := s.tokenProvider.GetAccessToken(ctx, account)
+	// Admin/recovery probes intentionally target sticky error accounts.
+	// Use operator probe token path so inactive Grok OAuth can still refresh.
+	token, err := s.tokenProvider.GetAccessTokenForOperatorProbe(ctx, account)
 	if err != nil {
 		return nil, "", "", infraerrors.Newf(http.StatusBadGateway, "GROK_QUOTA_TOKEN_UNAVAILABLE", "failed to acquire access token: %v", err)
 	}

@@ -506,7 +506,17 @@ func (h *GrokOAuthHandler) QueryQuota(c *gin.Context) {
 		response.BadRequest(c, "grok quota service is not enabled")
 		return
 	}
-	result, err := h.quotaService.QueryQuota(c.Request.Context(), accountID)
+	// mode=active|probe|live forces chat readiness probe. Recovery tooling must
+	// not classify accounts from billing-only quota snapshots.
+	mode := strings.ToLower(strings.TrimSpace(c.Query("mode")))
+	forceActive := mode == "active" || mode == "probe" || mode == "live" ||
+		c.Query("force_active_probe") == "1" || c.Query("force_active_probe") == "true"
+	var result *service.GrokQuotaProbeResult
+	if forceActive {
+		result, err = h.quotaService.QueryQuotaActiveProbe(c.Request.Context(), accountID)
+	} else {
+		result, err = h.quotaService.QueryQuota(c.Request.Context(), accountID)
+	}
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return

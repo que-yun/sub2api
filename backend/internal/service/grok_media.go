@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -288,10 +289,6 @@ func (s *OpenAIGatewayService) ForwardGrokMedia(
 	if err != nil {
 		return nil, err
 	}
-	targetURL, err := buildGrokMediaURL(account, s.cfg, endpoint, requestID)
-	if err != nil {
-		return nil, err
-	}
 
 	body, contentType, err = prepareGrokMediaForwardBody(endpoint, body, contentType)
 	if err != nil {
@@ -307,46 +304,67 @@ func (s *OpenAIGatewayService) ForwardGrokMedia(
 		return nil, err
 	}
 
-	var bodyReader io.Reader
-	if endpoint.RequiresRequestBody() {
-		bodyReader = bytes.NewReader(body)
-	}
 	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 	defer releaseUpstreamCtx()
-	upstreamReq, err := http.NewRequestWithContext(upstreamCtx, endpoint.httpMethod(), targetURL, bodyReader)
-	if err != nil {
-		return nil, err
-	}
-	upstreamReq.Header.Set("Authorization", "Bearer "+token)
-	upstreamReq.Header.Set("Accept", "application/json")
-	if account.IsGrokOAuth() {
-		applyGrokCLIHeaders(upstreamReq.Header)
-	}
-	if endpoint.RequiresRequestBody() {
-		contentType = strings.TrimSpace(contentType)
-		if contentType == "" {
-			contentType = "application/json"
-		}
-		upstreamReq.Header.Set("Content-Type", contentType)
-	}
-
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()
 	}
-	upstreamStart := time.Now()
-	resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
-	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
-	if err != nil {
-		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+
+	tryBaseURLs := []string{account.GetGrokMediaBaseURL()}
+	if account.IsGrokOAuth() && xai.IsCLIChatProxyBaseURL(tryBaseURLs[0]) {
+		tryBaseURLs = append(tryBaseURLs, xai.DefaultBaseURL)
+	}
+
+	var resp *http.Response
+	requestModel := requestInfo.Model
+	for i, baseURL := range tryBaseURLs {
+		targetURL, urlErr := buildGrokMediaURLWithBase(account, s.cfg, endpoint, requestID, baseURL)
+		if urlErr != nil {
+			return nil, urlErr
+		}
+		var bodyReader io.Reader
+		if endpoint.RequiresRequestBody() {
+			bodyReader = bytes.NewReader(body)
+		}
+		upstreamReq, reqErr := http.NewRequestWithContext(upstreamCtx, endpoint.httpMethod(), targetURL, bodyReader)
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		upstreamReq.Header.Set("Authorization", "Bearer "+token)
+		upstreamReq.Header.Set("Accept", "application/json")
+		applyGrokOAuthUpstreamHeadersForBaseURL(account, upstreamReq.Header, baseURL)
+		if endpoint.RequiresRequestBody() {
+			ct := strings.TrimSpace(contentType)
+			if ct == "" {
+				ct = "application/json"
+			}
+			upstreamReq.Header.Set("Content-Type", ct)
+		}
+		upstreamStart := time.Now()
+		currentResp, doErr := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
+		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
+		if doErr != nil {
+			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, doErr, false)
+		}
+		if currentResp.StatusCode < 400 {
+			resp = currentResp
+			break
+		}
+		requestIDHeader := firstNonEmpty(currentResp.Header.Get("x-request-id"), currentResp.Header.Get("xai-request-id"))
+		if i == 0 && canFallbackGrokCLIProxyToPublicAPI(account, baseURL, currentResp.StatusCode) && len(tryBaseURLs) > 1 {
+			_ = currentResp.Body.Close()
+			appendGrokCLIProxyFallbackOpsEvent(c, account, currentResp.StatusCode, requestIDHeader, "cli-chat-proxy 403, retrying same account on api.x.ai")
+			continue
+		}
+		return s.handleGrokMediaErrorResponse(ctx, currentResp, c, account, requestIDHeader, requestModel)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("grok media upstream returned no successful response")
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	requestIDHeader := firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id"))
-	requestModel := requestInfo.Model
-	if resp.StatusCode >= 400 {
-		return s.handleGrokMediaErrorResponse(ctx, resp, c, account, requestIDHeader, requestModel)
-	}
 
 	s.updateGrokUsageFromResponse(ctx, account, resp.Header, resp.StatusCode)
 	respBody, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)

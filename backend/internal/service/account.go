@@ -87,9 +87,12 @@ const openAILongContextBillingEnabledKey = "openai_long_context_billing_enabled"
 const (
 	OpenAIEndpointCapabilityChatCompletions OpenAIEndpointCapability = "chat_completions"
 	OpenAIEndpointCapabilityEmbeddings      OpenAIEndpointCapability = "embeddings"
+	OpenAIEndpointCapabilityVision          OpenAIEndpointCapability = "vision"
 )
 
 const openAIEndpointCapabilitiesCredentialKey = "openai_capabilities"
+const openAIVisionModelsCredentialKey = "vision_models"
+const openAIVisionModelMappingCredentialKey = "vision_model_mapping"
 
 const (
 	OpenAIAuthModePersonalAccessToken = "personalAccessToken"
@@ -805,6 +808,45 @@ func (a *Account) ResolveMappedModel(requestedModel string) (mappedModel string,
 	return requestedModel, false
 }
 
+// GetVisionModelMapping returns image-input-only OpenAI-compatible model
+// remapping. It lets an account keep a text default such as gpt-* -> glm-5.2
+// while routing multimodal requests to a model that actually accepts images.
+func (a *Account) GetVisionModelMapping() map[string]string {
+	if a == nil {
+		return nil
+	}
+	if a.Credentials != nil {
+		if mapping := stringMappingFromRaw(a.Credentials[openAIVisionModelMappingCredentialKey]); len(mapping) > 0 {
+			return mapping
+		}
+	}
+	if a.Extra != nil {
+		if mapping := stringMappingFromRaw(a.Extra[openAIVisionModelMappingCredentialKey]); len(mapping) > 0 {
+			return mapping
+		}
+	}
+	return nil
+}
+
+// ResolveVisionMappedModel resolves image-input-only model remapping and
+// reports whether a vision-specific mapping rule matched.
+func (a *Account) ResolveVisionMappedModel(requestedModel string) (mappedModel string, matched bool) {
+	mapping := a.GetVisionModelMapping()
+	if len(mapping) == 0 {
+		return requestedModel, false
+	}
+	if mappedModel, matched := resolveRequestedModelInMapping(mapping, requestedModel); matched {
+		return mappedModel, true
+	}
+	normalized := normalizeRequestedModelForLookup(a.Platform, requestedModel)
+	if normalized != requestedModel {
+		if mappedModel, matched := resolveRequestedModelInMapping(mapping, normalized); matched {
+			return mappedModel, true
+		}
+	}
+	return requestedModel, false
+}
+
 // GetOpenAICompactMode returns the compact routing mode for an OpenAI account.
 // Missing or invalid values fall back to "auto".
 func (a *Account) GetOpenAICompactMode() string {
@@ -1268,14 +1310,14 @@ func (a *Account) GetOpenAIRefreshToken() string {
 // GetGrokBaseURL selects the upstream used by Grok text and Responses traffic.
 // Grok media traffic has a different transport contract and must use
 // GetGrokMediaBaseURL instead.
+//
+// OAuth traffic always starts on cli-chat-proxy. Same-account fallback to
+// https://api.x.ai/v1 is handled by the gateway when the CLI proxy returns 403.
 func (a *Account) GetGrokBaseURL() string {
 	if !a.IsGrok() {
 		return ""
 	}
 	if a.IsGrokOAuth() {
-		// OAuth bearer credentials are subscription credentials and may only be
-		// sent to the supported CLI gateway. Stored base_url values and unsafe
-		// development overrides apply exclusively to API-key accounts.
 		return xai.DefaultCLIBaseURL
 	}
 	baseURL := a.GetCredential("base_url")
@@ -1287,9 +1329,8 @@ func (a *Account) GetGrokBaseURL() string {
 
 // GetGrokMediaBaseURL selects the upstream used by Grok Imagine APIs.
 //
-// OAuth media credentials have the same trust boundary as OAuth text traffic:
-// they are pinned to the supported CLI gateway even for large request bodies.
-// API-key accounts retain their configured public/custom upstream behavior.
+// OAuth media credentials share the same default as text traffic: start on the
+// CLI proxy. API-key accounts retain their configured public/custom upstream.
 func (a *Account) GetGrokMediaBaseURL() string {
 	if !a.IsGrok() {
 		return ""
@@ -1395,7 +1436,7 @@ func (a *Account) SupportsOpenAIEndpointCapability(capability OpenAIEndpointCapa
 		return false
 	}
 	if a.IsGrok() {
-		return capability == OpenAIEndpointCapabilityChatCompletions
+		return capability == OpenAIEndpointCapabilityChatCompletions || capability == OpenAIEndpointCapabilityVision
 	}
 	switch capability {
 	case OpenAIEndpointCapabilityChatCompletions:
@@ -1403,15 +1444,113 @@ func (a *Account) SupportsOpenAIEndpointCapability(capability OpenAIEndpointCapa
 		if a.Type != AccountTypeAPIKey {
 			return false
 		}
+	case OpenAIEndpointCapabilityVision:
 	default:
 		return false
 	}
 
 	configured, found := a.openAIEndpointCapabilitySet()
 	if !found {
-		return true
+		// Vision must be explicit. Text-only compatibility is the safer default
+		// for third-party OpenAI-compatible providers.
+		return capability != OpenAIEndpointCapabilityVision
 	}
 	return configured[string(capability)]
+}
+
+func (a *Account) SupportsOpenAIVisionModel(requestedModel string) bool {
+	if a == nil || !a.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityVision) {
+		return false
+	}
+	models, found := a.openAIVisionModelPatterns()
+	if !found {
+		return true
+	}
+	candidates := []string{strings.TrimSpace(requestedModel)}
+	if upstreamModel, matched := a.ResolveVisionMappedModel(requestedModel); matched {
+		candidates = append([]string{strings.TrimSpace(upstreamModel)}, candidates...)
+	}
+	if upstreamModel := strings.TrimSpace(a.GetMappedModel(requestedModel)); upstreamModel != "" {
+		candidates = append(candidates, upstreamModel)
+	}
+	seen := make(map[string]struct{}, len(candidates))
+	for _, model := range candidates {
+		if model == "" {
+			continue
+		}
+		if _, exists := seen[model]; exists {
+			continue
+		}
+		seen[model] = struct{}{}
+		for pattern := range models {
+			if matchWildcard(pattern, model) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (a *Account) openAIVisionModelPatterns() (map[string]struct{}, bool) {
+	if a == nil {
+		return nil, false
+	}
+	result := make(map[string]struct{})
+	found := false
+	addRaw := func(raw any) {
+		if raw == nil {
+			return
+		}
+		found = true
+		switch values := raw.(type) {
+		case []any:
+			for _, item := range values {
+				if s, ok := item.(string); ok {
+					if s = strings.TrimSpace(s); s != "" {
+						result[s] = struct{}{}
+					}
+				}
+			}
+		case []string:
+			for _, s := range values {
+				if s = strings.TrimSpace(s); s != "" {
+					result[s] = struct{}{}
+				}
+			}
+		case string:
+			for _, s := range strings.Split(values, ",") {
+				if s = strings.TrimSpace(s); s != "" {
+					result[s] = struct{}{}
+				}
+			}
+		case map[string]any:
+			for key, enabled := range values {
+				if boolValue, ok := enabled.(bool); ok && boolValue {
+					if key = strings.TrimSpace(key); key != "" {
+						result[key] = struct{}{}
+					}
+				}
+			}
+		case map[string]bool:
+			for key, enabled := range values {
+				if enabled {
+					if key = strings.TrimSpace(key); key != "" {
+						result[key] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+	if a.Credentials != nil {
+		addRaw(a.Credentials[openAIVisionModelsCredentialKey])
+	}
+	if a.Extra != nil {
+		addRaw(a.Extra[openAIVisionModelsCredentialKey])
+	}
+	if !found {
+		return nil, false
+	}
+	return result, true
 }
 
 func (a *Account) openAIEndpointCapabilitySet() (map[string]bool, bool) {

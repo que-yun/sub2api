@@ -15,6 +15,7 @@ import (
 	"time"
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/usagestats"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/stretchr/testify/require"
@@ -777,6 +778,105 @@ func TestGrokQuotaServiceQueryQuotaFree429PersistsLimitAndKeepsBilling(t *testin
 	require.Equal(t, account.ID, repo.lastRateLimitedID)
 	require.WithinDuration(t, time.Now().Add(45*time.Second), repo.lastRateLimitResetAt, time.Second)
 }
+
+func TestGrokQuotaServiceQueryQuotaFreeHard403NotMaskedByBilling(t *testing.T) {
+	t.Parallel()
+
+	account := healthyGrokQuotaOAuthAccount(60)
+	account.Status = StatusError
+	account.Schedulable = false
+	account.ErrorMessage = "grok entitlement or subscription tier denied"
+	repo := &grokQuotaAccountRepo{mockAccountRepoForPlatform: &mockAccountRepoForPlatform{
+		accountsByID: map[int64]*Account{account.ID: account},
+	}}
+	// No authoritative usage/plan in billing (free), so hybrid path reaches active probe.
+	upstream := &grokForbiddenActiveUpstream{inner: &grokHybridUpstream{}}
+	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream)
+
+	result, err := svc.QueryQuota(context.Background(), account.ID)
+	require.Error(t, err)
+	require.Nil(t, result)
+	require.Equal(t, http.StatusForbidden, infraerrors.Code(err))
+	require.Equal(t, "GROK_QUOTA_PROBE_UPSTREAM_ERROR", infraerrors.Reason(err))
+	require.Contains(t, err.Error(), "permission-denied")
+
+	// Account should remain/marked error after hard 403.
+	got, _ := repo.GetByID(context.Background(), account.ID)
+	require.Equal(t, StatusError, got.Status)
+	require.False(t, got.Schedulable)
+}
+
+func TestGrokQuotaServiceQueryQuotaActiveProbeForcesChatEvenWhenBillingAuthoritative(t *testing.T) {
+	t.Parallel()
+
+	account := healthyGrokQuotaOAuthAccount(59)
+	repo := &grokQuotaAccountRepo{mockAccountRepoForPlatform: &mockAccountRepoForPlatform{
+		accountsByID: map[int64]*Account{account.ID: account},
+	}}
+	usagePercent := 33.0
+	upstream := &grokHybridUpstream{weeklyUsagePercent: &usagePercent}
+	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream)
+
+	result, err := svc.QueryQuotaActiveProbe(context.Background(), account.ID)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "hybrid_probe", result.Source)
+	require.Equal(t, http.StatusOK, result.StatusCode)
+	require.NotNil(t, result.Snapshot)
+	require.NotNil(t, result.Billing)
+
+	requests, _ := upstream.snapshot()
+	paths := make([]string, 0, len(requests))
+	for _, req := range requests {
+		paths = append(paths, req.URL.Path)
+	}
+	require.Contains(t, paths, "/v1/responses")
+	require.Contains(t, paths, "/v1/billing")
+}
+
+func TestGrokQuotaServiceQueryQuotaActiveProbeHard403IgnoresAuthoritativeBilling(t *testing.T) {
+	t.Parallel()
+
+	account := healthyGrokQuotaOAuthAccount(61)
+	repo := &grokQuotaAccountRepo{mockAccountRepoForPlatform: &mockAccountRepoForPlatform{
+		accountsByID: map[int64]*Account{account.ID: account},
+	}}
+	usagePercent := 25.0
+	upstream := &grokForbiddenActiveUpstream{inner: &grokHybridUpstream{weeklyUsagePercent: &usagePercent}}
+	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream)
+
+	result, err := svc.QueryQuotaActiveProbe(context.Background(), account.ID)
+	require.Error(t, err)
+	require.Nil(t, result)
+	require.Equal(t, http.StatusForbidden, infraerrors.Code(err))
+	require.Equal(t, "GROK_QUOTA_PROBE_UPSTREAM_ERROR", infraerrors.Reason(err))
+}
+
+type grokForbiddenActiveUpstream struct {
+	httpUpstreamRecorder
+	inner *grokHybridUpstream
+}
+
+func (u *grokForbiddenActiveUpstream) Do(req *http.Request, proxyURL string, accountID int64, concurrency int) (*http.Response, error) {
+	if req != nil && req.URL.Path == "/v1/responses" {
+		return &http.Response{
+			StatusCode: http.StatusForbidden,
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				`{"code":"permission-denied","error":"Access to the chat endpoint is denied due to entitlement or subscription tier."}`,
+			)),
+		}, nil
+	}
+	if u.inner == nil {
+		u.inner = &grokHybridUpstream{}
+	}
+	return u.inner.Do(req, proxyURL, accountID, concurrency)
+}
+
+func (u *grokForbiddenActiveUpstream) DoWithTLS(req *http.Request, proxyURL string, accountID int64, concurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	return u.Do(req, proxyURL, accountID, concurrency)
+}
+
 
 func TestGrokQuotaServiceResetQuotaUnsupported(t *testing.T) {
 	t.Parallel()

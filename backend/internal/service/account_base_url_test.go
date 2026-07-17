@@ -294,6 +294,92 @@ func TestGetGrokBaseURLUsesSubscriptionProxyForOAuth(t *testing.T) {
 	}
 }
 
+
+func TestGetGrokBaseURLAlwaysStartsOnCLIProxyForOAuth(t *testing.T) {
+	tests := []struct {
+		name    string
+		account Account
+	}{
+		{
+			name: "hotmail email still starts on CLI proxy",
+			account: Account{
+				Type:     AccountTypeOAuth,
+				Platform: PlatformGrok,
+				Name:     "ThospqAbadi@hotmail.com",
+				Credentials: map[string]any{
+					"email": "thospqabadi@hotmail.com",
+				},
+			},
+		},
+		{
+			name: "SuperGrok plan still starts on CLI proxy",
+			account: Account{
+				Type:     AccountTypeOAuth,
+				Platform: PlatformGrok,
+				Credentials: map[string]any{
+					"email": "user@example.com",
+				},
+				Extra: map[string]any{
+					"grok_billing_snapshot": map[string]any{
+						"plan": "SuperGrok",
+					},
+				},
+			},
+		},
+		{
+			name: "high request limit still starts on CLI proxy",
+			account: Account{
+				Type:     AccountTypeOAuth,
+				Platform: PlatformGrok,
+				Credentials: map[string]any{
+					"email": "user@example.com",
+				},
+				Extra: map[string]any{
+					"grok_usage_snapshot": map[string]any{
+						"requests": map[string]any{
+							"limit":     int64(8300),
+							"remaining": int64(8300),
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "free build limit 21 stays on CLI proxy",
+			account: Account{
+				Type:     AccountTypeOAuth,
+				Platform: PlatformGrok,
+				Credentials: map[string]any{
+					"email": "xm02ws0tzu@yangliu.xin",
+				},
+				Extra: map[string]any{
+					"grok_usage_snapshot": map[string]any{
+						"requests": map[string]any{
+							"limit":     int64(21),
+							"remaining": int64(21),
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "unknown free oauth stays on CLI proxy",
+			account: Account{
+				Type:        AccountTypeOAuth,
+				Platform:    PlatformGrok,
+				Credentials: map[string]any{},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, xai.DefaultCLIBaseURL, tt.account.GetGrokBaseURL())
+			require.Equal(t, xai.DefaultCLIBaseURL, tt.account.GetGrokMediaBaseURL())
+		})
+	}
+}
+
 func TestGetGrokBaseURLPinsOAuthWhenUnsafeOverridesEnabled(t *testing.T) {
 	t.Setenv(xai.EnvAllowUnsafeURLOverrides, "true")
 	account := Account{

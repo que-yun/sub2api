@@ -189,7 +189,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 	var upstreamReq *http.Request
 	if account.Platform == PlatformGrok {
-		upstreamModel := resolveGrokWSUpstreamModel(account, body, originalModel)
+		upstreamModel := resolveGrokWSUpstreamModel(ctx, account, body, originalModel)
 		grokIntentSourceBody := body
 		body, err = patchGrokResponsesBody(body, upstreamModel)
 		if err != nil {
@@ -270,7 +270,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	needModelReplace := false
 	var mappedModelBytes []byte
 	if originalModel != "" {
-		mappedModel = normalizeOpenAIModelForUpstream(account, account.GetMappedModel(originalModel))
+		mappedModel = normalizeOpenAIModelForUpstream(account, resolveOpenAIForwardModelForContext(ctx, account, originalModel, ""))
 		needModelReplace = mappedModel != "" && mappedModel != originalModel
 		if needModelReplace {
 			mappedModelBytes = []byte(mappedModel)
@@ -430,19 +430,19 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	return resultWithUsage(), errors.New("upstream http bridge stream ended before terminal event")
 }
 
-func resolveGrokWSCacheIdentity(c *gin.Context, account *Account, payload []byte, originalModel string) (string, error) {
+func resolveGrokWSCacheIdentity(ctx context.Context, c *gin.Context, account *Account, payload []byte, originalModel string) (string, error) {
 	body, err := prepareOpenAIWSHTTPBridgeBody(payload)
 	if err != nil {
 		return "", err
 	}
-	upstreamModel := resolveGrokWSUpstreamModel(account, body, originalModel)
+	upstreamModel := resolveGrokWSUpstreamModel(ctx, account, body, originalModel)
 	return resolveGrokCacheIdentity(c, body, "", upstreamModel), nil
 }
 
-func resolveGrokWSUpstreamModel(account *Account, body []byte, originalModel string) string {
+func resolveGrokWSUpstreamModel(ctx context.Context, account *Account, body []byte, originalModel string) string {
 	upstreamModel := strings.TrimSpace(gjson.GetBytes(body, "model").String())
 	if account != nil && originalModel != "" {
-		if mappedModel := normalizeOpenAIModelForUpstream(account, account.GetMappedModel(originalModel)); mappedModel != "" {
+		if mappedModel := normalizeOpenAIModelForUpstream(account, resolveOpenAIForwardModelForContext(ctx, account, originalModel, "")); mappedModel != "" {
 			upstreamModel = mappedModel
 		}
 	}

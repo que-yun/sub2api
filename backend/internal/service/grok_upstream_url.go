@@ -49,28 +49,27 @@ func redactedGrokBaseURLValidator(validator xai.BaseURLValidator) xai.BaseURLVal
 	}
 }
 
-func buildGrokResponsesURL(account *Account, cfg *config.Config) (string, error) {
+func buildGrokURLWithBase(account *Account, cfg *config.Config, baseURL string, build func(string, xai.BaseURLValidator) (string, error)) (string, error) {
 	validator, err := grokBaseURLValidator(account, cfg)
 	if err != nil {
 		return "", err
 	}
-	return xai.BuildResponsesURLWithValidator(account.GetGrokBaseURL(), validator)
+	return build(baseURL, validator)
 }
 
-func buildGrokChatCompletionsURL(account *Account, cfg *config.Config) (string, error) {
-	validator, err := grokBaseURLValidator(account, cfg)
-	if err != nil {
-		return "", err
-	}
-	return xai.BuildChatCompletionsURLWithValidator(account.GetGrokBaseURL(), validator)
+func buildGrokResponsesURLWithBase(account *Account, cfg *config.Config, baseURL string) (string, error) {
+	return buildGrokURLWithBase(account, cfg, baseURL, xai.BuildResponsesURLWithValidator)
 }
 
-func buildGrokMediaURL(account *Account, cfg *config.Config, endpoint GrokMediaEndpoint, requestID string) (string, error) {
+func buildGrokChatCompletionsURLWithBase(account *Account, cfg *config.Config, baseURL string) (string, error) {
+	return buildGrokURLWithBase(account, cfg, baseURL, xai.BuildChatCompletionsURLWithValidator)
+}
+
+func buildGrokMediaURLWithBase(account *Account, cfg *config.Config, endpoint GrokMediaEndpoint, requestID, baseURL string) (string, error) {
 	validator, err := grokBaseURLValidator(account, cfg)
 	if err != nil {
 		return "", err
 	}
-	baseURL := account.GetGrokMediaBaseURL()
 	switch endpoint {
 	case GrokMediaEndpointImagesGenerations:
 		return xai.BuildImagesGenerationsURLWithValidator(baseURL, validator)
@@ -87,4 +86,25 @@ func buildGrokMediaURL(account *Account, cfg *config.Config, endpoint GrokMediaE
 	default:
 		return "", fmt.Errorf("unsupported grok media endpoint: %s", endpoint)
 	}
+}
+
+func buildGrokResponsesURL(account *Account, cfg *config.Config) (string, error) {
+	if account == nil {
+		return "", fmt.Errorf("grok account is required")
+	}
+	return buildGrokResponsesURLWithBase(account, cfg, account.GetGrokBaseURL())
+}
+
+func buildGrokChatCompletionsURL(account *Account, cfg *config.Config) (string, error) {
+	if account == nil {
+		return "", fmt.Errorf("grok account is required")
+	}
+	return buildGrokChatCompletionsURLWithBase(account, cfg, account.GetGrokBaseURL())
+}
+
+func buildGrokMediaURL(account *Account, cfg *config.Config, endpoint GrokMediaEndpoint, requestID string) (string, error) {
+	if account == nil {
+		return "", fmt.Errorf("grok account is required")
+	}
+	return buildGrokMediaURLWithBase(account, cfg, endpoint, requestID, account.GetGrokMediaBaseURL())
 }

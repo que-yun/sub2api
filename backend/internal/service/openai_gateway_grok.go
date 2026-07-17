@@ -45,7 +45,7 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		return nil, fmt.Errorf("grok account type %s is not supported by Responses forwarding", account.Type)
 	}
 
-	upstreamModel := account.GetMappedModel(originalModel)
+	upstreamModel := resolveOpenAIForwardModelForContext(ctx, account, originalModel, "")
 	if strings.TrimSpace(upstreamModel) == "" {
 		upstreamModel = grokDefaultResponsesModel
 	}
@@ -75,51 +75,76 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 
 	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 	defer releaseUpstreamCtx()
-	upstreamReq, err := buildGrokResponsesRequest(upstreamCtx, c, account, patchedBody, token, cacheIdentity, s.cfg)
-	if err != nil {
-		return nil, err
-	}
 
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()
 	}
 
-	upstreamStart := time.Now()
-	resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
-	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
-	if err != nil {
-		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+	tryBaseURLs := []string{account.GetGrokBaseURL()}
+	if account.IsGrokOAuth() && xai.IsCLIChatProxyBaseURL(tryBaseURLs[0]) {
+		tryBaseURLs = append(tryBaseURLs, xai.DefaultBaseURL)
 	}
-	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode >= 400 {
-		respBody := s.readUpstreamErrorBody(resp)
-		resp.Body = io.NopCloser(bytes.NewReader(respBody))
+	var resp *http.Response
+	var lastErrBody []byte
+	for i, baseURL := range tryBaseURLs {
+		upstreamReq, reqErr := buildGrokResponsesRequestWithBase(upstreamCtx, c, account, patchedBody, token, cacheIdentity, s.cfg, baseURL)
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		upstreamStart := time.Now()
+		currentResp, doErr := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
+		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
+		if doErr != nil {
+			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, doErr, false)
+		}
+		if currentResp.StatusCode < 400 {
+			resp = currentResp
+			break
+		}
+
+		respBody := s.readUpstreamErrorBody(currentResp)
+		_ = currentResp.Body.Close()
+		currentResp.Body = io.NopCloser(bytes.NewReader(respBody))
+		lastErrBody = respBody
 		upstreamMsg := sanitizeUpstreamErrorMessage(extractUpstreamErrorMessage(respBody))
 		if upstreamMsg == "" {
-			upstreamMsg = fmt.Sprintf("xAI upstream returned status %d", resp.StatusCode)
+			upstreamMsg = fmt.Sprintf("xAI upstream returned status %d", currentResp.StatusCode)
 		}
+		requestID := firstNonEmpty(currentResp.Header.Get("x-request-id"), currentResp.Header.Get("xai-request-id"))
+
+		// Same-account CLI -> public API fallback on 403 only.
+		if i == 0 && canFallbackGrokCLIProxyToPublicAPI(account, baseURL, currentResp.StatusCode) && len(tryBaseURLs) > 1 {
+			appendGrokCLIProxyFallbackOpsEvent(c, account, currentResp.StatusCode, requestID, "cli-chat-proxy 403, retrying same account on api.x.ai")
+			continue
+		}
+
 		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
 			Platform:           account.Platform,
 			AccountID:          account.ID,
 			AccountName:        account.Name,
-			UpstreamStatusCode: resp.StatusCode,
-			UpstreamRequestID:  firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id")),
+			UpstreamStatusCode: currentResp.StatusCode,
+			UpstreamRequestID:  requestID,
 			Kind:               "failover",
 			Message:            upstreamMsg,
 		})
-		s.handleGrokAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody)
-		if s.shouldFailoverUpstreamError(resp.StatusCode) {
+		s.handleGrokAccountUpstreamError(ctx, account, currentResp.StatusCode, currentResp.Header, respBody)
+		if s.shouldFailoverUpstreamError(currentResp.StatusCode) {
 			return nil, &UpstreamFailoverError{
-				StatusCode:             resp.StatusCode,
+				StatusCode:             currentResp.StatusCode,
 				ResponseBody:           respBody,
-				ResponseHeaders:        resp.Header.Clone(),
-				RetryableOnSameAccount: account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode),
+				ResponseHeaders:        currentResp.Header.Clone(),
+				RetryableOnSameAccount: account.IsPoolMode() && account.IsPoolModeRetryableStatus(currentResp.StatusCode),
 			}
 		}
-		return s.handleErrorResponse(ctx, resp, c, account, patchedBody, upstreamModel)
+		return s.handleErrorResponse(ctx, currentResp, c, account, patchedBody, upstreamModel)
 	}
+	if resp == nil {
+		return nil, fmt.Errorf("grok upstream returned no successful response")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_ = lastErrBody
 
 	s.updateGrokUsageFromResponse(ctx, account, resp.Header, resp.StatusCode)
 
@@ -174,6 +199,10 @@ func patchGrokResponsesBody(body []byte, upstreamModel string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	out, err = sanitizeGrokResponsesReasoningSummary(out)
+	if err != nil {
+		return nil, err
+	}
 	for _, unsupportedField := range []string{"prompt_cache_retention", "safety_identifier"} {
 		if gjson.GetBytes(out, unsupportedField).Exists() {
 			out, err = sjson.DeleteBytes(out, unsupportedField)
@@ -212,12 +241,31 @@ func patchGrokResponsesBody(body []byte, upstreamModel string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Agent 工具场景：把 auto 收敛为 required，避免 Grok 只输出计划而不调用客户端工具。
+	out, err = requireGrokResponsesFunctionToolChoice(out)
+	if err != nil {
+		return nil, err
+	}
 	// 最终清洗 input：把 Codex/OpenAI 专有 item 归一成 xAI 可反序列化的 ModelInput 变体。
 	out, err = sanitizeGrokResponsesModelInput(out)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// sanitizeGrokResponsesReasoningSummary 收敛 Grok 请求侧 summary。
+// Codex 常带 summary=auto，xAI 可能抬成 detailed 并回传长明文；请求侧尽量保持 auto。
+func sanitizeGrokResponsesReasoningSummary(body []byte) ([]byte, error) {
+	if !gjson.GetBytes(body, "reasoning").Exists() {
+		return body, nil
+	}
+	summary := strings.TrimSpace(gjson.GetBytes(body, "reasoning.summary").String())
+	if summary == "" || strings.EqualFold(summary, "auto") {
+		return body, nil
+	}
+	// detailed/concise 等统一压到 auto，避免上游按 detailed 生成超长可见摘要。
+	return sjson.SetBytes(body, "reasoning.summary", "auto")
 }
 
 func sanitizeGrokResponsesModelCapabilities(body []byte, upstreamModel string) ([]byte, error) {
@@ -300,10 +348,10 @@ func deleteJSONFields(value any, fields map[string]struct{}) bool {
 	}
 }
 
-
 // sanitizeGrokResponsesModelInput 只处理 xAI Responses ModelInput 明确不能反序列化的
-// OpenAI/Codex 专有 item。普通 message、function_call、function_call_output 原样保留；
-// previous_response_id 也保留，让 Grok 继续使用自己的上一轮响应做上下文锚点。
+// OpenAI/Codex 专有 item。普通 message、function_call_output 尽量保留；function_call 的
+// arguments 保持为“JSON object 的字符串”（OpenAI 形态）。xAI 既不接受字段级 object，
+// 也不接受解析后不是 object 的 arguments 字符串。previous_response_id 也保留。
 func sanitizeGrokResponsesModelInput(body []byte) ([]byte, error) {
 	input := gjson.GetBytes(body, "input")
 	if !input.IsArray() {
@@ -374,6 +422,9 @@ func normalizeGrokResponsesModelInputItem(item gjson.Result) (json.RawMessage, b
 			return marshalGrokModelInputMessage("assistant", text)
 		}
 		return nil, false, true, nil
+	case "function_call":
+		// OpenAI/Codex 历史里 arguments 常是 JSON 字符串；xAI 要求 object。
+		return normalizeGrokFunctionCallItem(item)
 	case "local_shell_call", "tool_search_call", "custom_tool_call", "mcp_tool_call", "tool_call":
 		return marshalGrokFunctionCallLikeItem(item)
 	case "tool_search_output", "custom_tool_call_output", "mcp_tool_call_output":
@@ -403,14 +454,7 @@ func marshalGrokFunctionCallLikeItem(item gjson.Result) (json.RawMessage, bool, 
 		name = "tool"
 	}
 	callID := strings.TrimSpace(firstNonEmptyString(item.Get("call_id").String(), item.Get("id").String()))
-	arguments := "{}"
-	if item.Get("arguments").Exists() {
-		if item.Get("arguments").Type == gjson.String {
-			arguments = item.Get("arguments").String()
-		} else {
-			arguments = item.Get("arguments").Raw
-		}
-	}
+	arguments, _ := normalizeGrokToolArgumentsJSONString(item)
 	out := map[string]any{
 		"type":      "function_call",
 		"name":      name,
@@ -421,6 +465,79 @@ func marshalGrokFunctionCallLikeItem(item gjson.Result) (json.RawMessage, bool, 
 	}
 	raw, err := json.Marshal(out)
 	return raw, true, true, err
+}
+
+// normalizeGrokFunctionCallItem 保留既有 function_call，只把 arguments 收敛成
+// “可解析为 JSON object 的字符串”。字段本身必须是 string：写成 object 会 422 ModelInput；
+// 字符串内容若不是 object，会 400 expected JSON object for tool arguments。
+func normalizeGrokFunctionCallItem(item gjson.Result) (json.RawMessage, bool, bool, error) {
+	if !item.IsObject() {
+		return json.RawMessage(item.Raw), true, false, nil
+	}
+	arguments, changed := normalizeGrokToolArgumentsJSONString(item)
+	if !changed {
+		return json.RawMessage(item.Raw), true, false, nil
+	}
+	out, err := sjson.Set(item.Raw, "arguments", arguments)
+	if err != nil {
+		return nil, false, false, err
+	}
+	return json.RawMessage(out), true, true, nil
+}
+
+// normalizeGrokToolArgumentsJSONString 把 function_call/custom_tool_call 的 arguments/input
+// 归一成 JSON object 的字符串表示（例如 `{"cmd":"pwd"}`）。
+// - 已是合法 object 字符串：尽量原样保留
+// - 字段级 object：序列化成字符串
+// - 空/非 object/纯文本：包进 {"input":...} 或 "{}"
+func normalizeGrokToolArgumentsJSONString(item gjson.Result) (string, bool) {
+	source := item.Get("arguments")
+	if !source.Exists() {
+		source = item.Get("input")
+	}
+	if !source.Exists() {
+		return "{}", true
+	}
+	if source.IsObject() {
+		// 字段级 object 必须改成 string，否则 xAI ModelInput 422。
+		// 用 Marshal 得到稳定紧凑 JSON，避免 gjson Raw 的空格差异。
+		compact, err := json.Marshal(json.RawMessage(source.Raw))
+		if err != nil {
+			return source.Raw, true
+		}
+		return string(compact), true
+	}
+	if source.Type == gjson.String {
+		raw := strings.TrimSpace(source.String())
+		if raw == "" {
+			return "{}", true
+		}
+		parsed := gjson.Parse(raw)
+		if parsed.IsObject() {
+			// 内容已是 object。若外层有多余空白，写回紧凑/原 raw 均可。
+			if raw == source.String() && raw == parsed.Raw {
+				return raw, false
+			}
+			// 保留解析后的稳定 object 文本。
+			if raw != parsed.Raw {
+				return parsed.Raw, true
+			}
+			return raw, false
+		}
+		wrapped, err := json.Marshal(map[string]any{"input": raw})
+		if err != nil {
+			return "{}", true
+		}
+		return string(wrapped), true
+	}
+	if source.IsArray() || source.Type == gjson.Number || source.Type == gjson.True || source.Type == gjson.False || source.Type == gjson.Null {
+		wrapped, err := json.Marshal(map[string]any{"value": json.RawMessage(source.Raw)})
+		if err != nil {
+			return "{}", true
+		}
+		return string(wrapped), true
+	}
+	return "{}", true
 }
 
 func marshalGrokFunctionCallOutputLikeItem(item gjson.Result) (json.RawMessage, bool, bool, error) {
@@ -507,8 +624,8 @@ func extractGrokInputItemText(item gjson.Result) string {
 // additional_tools is a Codex/Responses Lite private input carrier. xAI's
 // Responses schema accepts ordinary message/function-call input items but
 // rejects this carrier before inference with a ModelInput deserialization
-// error. Top-level supported tools remain available through the separate
-// sanitizeGrokResponsesTools path.
+// error. Before dropping the carrier, promote any usable nested tools into
+// the top-level tools array so Codex Desktop still keeps executable tools.
 func sanitizeGrokResponsesInput(body []byte) ([]byte, error) {
 	if !bytes.Contains(body, []byte(`"additional_tools"`)) {
 		return body, nil
@@ -520,22 +637,37 @@ func sanitizeGrokResponsesInput(body []byte) ([]byte, error) {
 
 	rawItems := input.Array()
 	filtered := make([]json.RawMessage, 0, len(rawItems))
+	promotedTools := make([]json.RawMessage, 0)
 	for _, item := range rawItems {
 		if strings.TrimSpace(item.Get("type").String()) == "additional_tools" {
+			for _, nested := range item.Get("tools").Array() {
+				if converted, ok := convertGrokCodexTool(nested); ok {
+					promotedTools = append(promotedTools, converted)
+				}
+			}
 			continue
 		}
 		filtered = append(filtered, json.RawMessage(item.Raw))
 	}
-	if len(filtered) == len(rawItems) {
+	changed := len(filtered) != len(rawItems)
+	if !changed && len(promotedTools) == 0 {
 		return body, nil
 	}
-	encoded, err := json.Marshal(filtered)
-	if err != nil {
-		return nil, err
+	if changed {
+		encoded, err := json.Marshal(filtered)
+		if err != nil {
+			return nil, err
+		}
+		body, err = sjson.SetRawBytes(body, "input", encoded)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return sjson.SetRawBytes(body, "input", encoded)
+	if len(promotedTools) == 0 {
+		return body, nil
+	}
+	return mergeGrokResponsesTools(body, promotedTools)
 }
-
 
 // stripGrokUnsupportedReasoningItems 移除 input 中携带 encrypted_content 的 reasoning 项。
 //
@@ -621,15 +753,47 @@ func sanitizeGrokResponsesTools(body []byte) ([]byte, error) {
 
 	rawTools := tools.Array()
 	filteredTools := make([]json.RawMessage, 0, len(rawTools))
+	seenTools := map[string]struct{}{}
+	appendTool := func(converted json.RawMessage) {
+		key := grokToolDedupeKey(converted)
+		if _, exists := seenTools[key]; exists {
+			return
+		}
+		seenTools[key] = struct{}{}
+		filteredTools = append(filteredTools, converted)
+	}
 	for _, tool := range rawTools {
-		toolType := strings.TrimSpace(tool.Get("type").String())
-		if _, ok := grokResponsesSupportedToolTypes[toolType]; ok && isValidGrokResponsesTool(tool) {
-			filteredTools = append(filteredTools, json.RawMessage(tool.Raw))
+		if converted, ok := convertGrokCodexTool(tool); ok {
+			appendTool(converted)
+			continue
+		}
+		// Flatten namespace / nested tools arrays that Codex may send.
+		if tool.Get("tools").IsArray() {
+			for _, nested := range tool.Get("tools").Array() {
+				if converted, ok := convertGrokCodexTool(nested); ok {
+					appendTool(converted)
+				}
+			}
 		}
 	}
 
 	var err error
-	if len(filteredTools) != len(rawTools) {
+	// 即使 tool 数量不变，也可能发生 schema 归一（exec_command 参数补齐）。
+	// 用序列化结果对比，避免弱 schema 原样透传。
+	toolsChanged := len(filteredTools) != len(rawTools)
+	if !toolsChanged {
+		originalEncoded, marshalErr := json.Marshal(rawToolsAsRaw(rawTools))
+		if marshalErr == nil {
+			filteredEncoded, marshalErr := json.Marshal(filteredTools)
+			if marshalErr == nil && !bytes.Equal(originalEncoded, filteredEncoded) {
+				toolsChanged = true
+			}
+		} else {
+			// 序列化失败时保守认为有变化，走写回路径。
+			toolsChanged = true
+		}
+	}
+	if toolsChanged {
 		if len(filteredTools) == 0 {
 			body, err = sjson.DeleteBytes(body, "tools")
 		} else {
@@ -658,6 +822,335 @@ func sanitizeGrokResponsesTools(body []byte) ([]byte, error) {
 	return body, nil
 }
 
+// convertGrokCodexTool normalizes Codex-only tool shapes into xAI-supported
+// Responses tools. Codex local shell / namespace wrappers are rewritten into
+// ordinary function tools so Grok can still emit executable function_call.
+func convertGrokCodexTool(tool gjson.Result) (json.RawMessage, bool) {
+	if !tool.IsObject() {
+		return nil, false
+	}
+	toolType := strings.TrimSpace(tool.Get("type").String())
+	switch toolType {
+	case "function":
+		if !isValidGrokResponsesTool(tool) {
+			return nil, false
+		}
+		if normalized, ok := normalizeGrokCodexFunctionTool(tool); ok {
+			return normalized, true
+		}
+		return json.RawMessage(tool.Raw), true
+	case "shell":
+		// xAI hosted shell needs environment. Codex local shell does not, so
+		// rewrite it to a function tool the client can still execute.
+		if tool.Get("environment").Exists() {
+			return json.RawMessage(tool.Raw), true
+		}
+		return marshalGrokCodexShellFunctionTool(tool)
+	case "local_shell":
+		return marshalGrokCodexShellFunctionTool(tool)
+	case "namespace":
+		// Flatten nested function tools; drop the namespace wrapper itself.
+		// Caller loops over nested tools separately when promoting.
+		return nil, false
+	default:
+		if _, ok := grokResponsesSupportedToolTypes[toolType]; ok && isValidGrokResponsesTool(tool) {
+			return json.RawMessage(tool.Raw), true
+		}
+		// Some Codex payloads put function tools under namespace.tools.
+		if tool.Get("tools").IsArray() {
+			return nil, false
+		}
+		return nil, false
+	}
+}
+
+func marshalGrokCodexShellFunctionTool(tool gjson.Result) (json.RawMessage, bool) {
+	name := strings.TrimSpace(firstNonEmptyString(
+		tool.Get("name").String(),
+		tool.Get("function.name").String(),
+	))
+	// Keep names Codex already understands. local_shell is rewritten to
+	// exec_command because current Codex Desktop/TUI primarily execute that
+	// function tool for command running.
+	switch strings.ToLower(name) {
+	case "", "local_shell", "shell", "container.exec":
+		name = "exec_command"
+	}
+	return marshalGrokCodexCanonicalFunctionTool(name, tool)
+}
+
+// normalizeGrokCodexFunctionTool 把 Codex 常见 shell 工具 schema 收敛到客户端可执行形态。
+// 已是完整 function 声明时尽量保留；exec_command/write_stdin 补齐关键参数字段。
+func normalizeGrokCodexFunctionTool(tool gjson.Result) (json.RawMessage, bool) {
+	name := strings.TrimSpace(firstNonEmptyString(
+		tool.Get("name").String(),
+		tool.Get("function.name").String(),
+	))
+	switch strings.ToLower(name) {
+	case "exec_command", "local_shell", "shell", "container.exec":
+		return marshalGrokCodexCanonicalFunctionTool("exec_command", tool)
+	case "write_stdin":
+		return marshalGrokCodexCanonicalFunctionTool("write_stdin", tool)
+	default:
+		return nil, false
+	}
+}
+
+func marshalGrokCodexCanonicalFunctionTool(name string, tool gjson.Result) (json.RawMessage, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, false
+	}
+	description := strings.TrimSpace(firstNonEmptyString(
+		tool.Get("description").String(),
+		tool.Get("function.description").String(),
+	))
+	var parameters map[string]any
+	switch strings.ToLower(name) {
+	case "exec_command":
+		if description == "" {
+			description = "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
+		}
+		// 对齐 Codex Desktop 实际 exec_command：cmd 字符串 + 可选 workdir。
+		// 额外允许常见可选字段，避免 Grok 生成后客户端拒收。
+		parameters = map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"cmd": map[string]any{
+					"type":        "string",
+					"description": "Shell command to execute.",
+				},
+				"workdir": map[string]any{
+					"type":        "string",
+					"description": "Optional working directory.",
+				},
+				"yield_time_ms": map[string]any{
+					"type":        "number",
+					"description": "Optional wait before yielding output.",
+				},
+				"max_output_tokens": map[string]any{
+					"type":        "number",
+					"description": "Optional output token budget.",
+				},
+				"login": map[string]any{
+					"type":        "boolean",
+					"description": "Optional login shell semantics.",
+				},
+				"shell": map[string]any{
+					"type":        "string",
+					"description": "Optional shell binary.",
+				},
+				"tty": map[string]any{
+					"type":        "boolean",
+					"description": "Optional PTY allocation.",
+				},
+				"justification": map[string]any{
+					"type":        "string",
+					"description": "Optional user-facing approval question.",
+				},
+			},
+			"required":             []string{"cmd"},
+			"additionalProperties": false,
+		}
+	case "write_stdin":
+		if description == "" {
+			description = "Writes characters to an existing unified exec session and returns recent output."
+		}
+		parameters = map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"session_id": map[string]any{
+					"type":        "number",
+					"description": "Identifier of the running unified exec session.",
+				},
+				"chars": map[string]any{
+					"type":        "string",
+					"description": "Bytes to write to stdin.",
+				},
+				"yield_time_ms": map[string]any{
+					"type":        "number",
+					"description": "Optional wait before yielding output.",
+				},
+				"max_output_tokens": map[string]any{
+					"type":        "number",
+					"description": "Optional output token budget.",
+				},
+			},
+			"required":             []string{"session_id"},
+			"additionalProperties": false,
+		}
+	default:
+		return nil, false
+	}
+	out := map[string]any{
+		"type":        "function",
+		"name":        name,
+		"description": description,
+		"parameters":  parameters,
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return nil, false
+	}
+	return raw, true
+}
+
+// requireGrokResponsesFunctionToolChoice 在请求已具备客户端 function 工具时，把 auto/空
+// tool_choice 收敛为 required。这样 Grok 必须先发起工具调用，但仍由模型选择具体工具，
+// 不把所有任务都硬导向 exec_command。
+// 不覆盖 none 或已经点名其他 function 的显式选择；工具结果回传轮次保持原策略，避免循环。
+func requireGrokResponsesFunctionToolChoice(body []byte) ([]byte, error) {
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.IsArray() || len(tools.Array()) == 0 {
+		return body, nil
+	}
+	hasInitialFunctionTool := false
+	for _, tool := range tools.Array() {
+		if strings.TrimSpace(tool.Get("type").String()) != "function" {
+			continue
+		}
+		name := strings.TrimSpace(firstNonEmptyString(
+			tool.Get("name").String(),
+			tool.Get("function.name").String(),
+		))
+		if name != "" && !grokFunctionToolNeedsPriorOutput(tool) {
+			hasInitialFunctionTool = true
+			break
+		}
+	}
+	if !hasInitialFunctionTool {
+		return body, nil
+	}
+	if grokResponsesInputHasToolOutput(body) {
+		return body, nil
+	}
+
+	toolChoice := gjson.GetBytes(body, "tool_choice")
+	if toolChoice.Exists() {
+		if toolChoice.Type == gjson.String {
+			switch strings.ToLower(strings.TrimSpace(toolChoice.String())) {
+			case "", "auto", "required":
+				// 可抬升
+			default:
+				// none 或其他显式字符串策略保持不动
+				return body, nil
+			}
+		} else if toolChoice.IsObject() {
+			choiceType := strings.ToLower(strings.TrimSpace(toolChoice.Get("type").String()))
+			switch choiceType {
+			case "", "auto", "required", "any":
+				// 可抬升
+			case "function":
+				// 已点名具体函数，不覆盖
+				return body, nil
+			case "none":
+				return body, nil
+			default:
+				// 未知对象形态：若不是 Codex shell 相关，保持原样避免误伤
+				return body, nil
+			}
+		} else {
+			return body, nil
+		}
+	}
+
+	return sjson.SetBytes(body, "tool_choice", "required")
+}
+
+func grokFunctionToolNeedsPriorOutput(tool gjson.Result) bool {
+	required := tool.Get("parameters.required")
+	if !required.IsArray() {
+		required = tool.Get("function.parameters.required")
+	}
+	if !required.IsArray() {
+		return false
+	}
+	for _, item := range required.Array() {
+		switch strings.ToLower(strings.TrimSpace(item.String())) {
+		case "session_id", "call_id":
+			return true
+		}
+	}
+	return false
+}
+
+func grokResponsesInputHasToolOutput(body []byte) bool {
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return false
+	}
+	for _, item := range input.Array() {
+		switch strings.TrimSpace(item.Get("type").String()) {
+		case "function_call_output", "custom_tool_call_output", "mcp_tool_call_output", "tool_search_output", "local_shell_call_output":
+			return true
+		}
+	}
+	return false
+}
+
+func mergeGrokResponsesTools(body []byte, extra []json.RawMessage) ([]byte, error) {
+	if len(extra) == 0 {
+		return body, nil
+	}
+	existing := make([]json.RawMessage, 0)
+	seen := map[string]struct{}{}
+	if tools := gjson.GetBytes(body, "tools"); tools.IsArray() {
+		for _, tool := range tools.Array() {
+			if converted, ok := convertGrokCodexTool(tool); ok {
+				key := grokToolDedupeKey(converted)
+				if _, exists := seen[key]; exists {
+					continue
+				}
+				seen[key] = struct{}{}
+				existing = append(existing, converted)
+			} else if tool.Get("tools").IsArray() {
+				// Flatten namespace.tools if present on top-level tools.
+				for _, nested := range tool.Get("tools").Array() {
+					if converted, ok := convertGrokCodexTool(nested); ok {
+						key := grokToolDedupeKey(converted)
+						if _, exists := seen[key]; exists {
+							continue
+						}
+						seen[key] = struct{}{}
+						existing = append(existing, converted)
+					}
+				}
+			}
+		}
+	}
+	for _, tool := range extra {
+		key := grokToolDedupeKey(tool)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		existing = append(existing, tool)
+	}
+	if len(existing) == 0 {
+		return body, nil
+	}
+	encoded, err := json.Marshal(existing)
+	if err != nil {
+		return nil, err
+	}
+	return sjson.SetRawBytes(body, "tools", encoded)
+}
+
+func rawToolsAsRaw(items []gjson.Result) []json.RawMessage {
+	out := make([]json.RawMessage, 0, len(items))
+	for _, item := range items {
+		out = append(out, json.RawMessage(item.Raw))
+	}
+	return out
+}
+
+func grokToolDedupeKey(tool json.RawMessage) string {
+	t := gjson.ParseBytes(tool)
+	return strings.TrimSpace(t.Get("type").String()) + "|" + strings.TrimSpace(firstNonEmptyString(
+		t.Get("name").String(),
+		t.Get("function.name").String(),
+	))
+}
 
 func isValidGrokResponsesTool(tool gjson.Result) bool {
 	if !tool.IsObject() {
@@ -1019,7 +1512,15 @@ func addOpenAIUsage(dst *OpenAIUsage, usage OpenAIUsage) {
 }
 
 func buildGrokResponsesRequest(ctx context.Context, c *gin.Context, account *Account, body []byte, token, cacheIdentity string, cfg *config.Config) (*http.Request, error) {
-	targetURL, err := buildGrokResponsesURL(account, cfg)
+	baseURL := ""
+	if account != nil {
+		baseURL = account.GetGrokBaseURL()
+	}
+	return buildGrokResponsesRequestWithBase(ctx, c, account, body, token, cacheIdentity, cfg, baseURL)
+}
+
+func buildGrokResponsesRequestWithBase(ctx context.Context, c *gin.Context, account *Account, body []byte, token, cacheIdentity string, cfg *config.Config, baseURL string) (*http.Request, error) {
+	targetURL, err := buildGrokResponsesURLWithBase(account, cfg, baseURL)
 	if err != nil {
 		return nil, err
 	}
@@ -1030,9 +1531,7 @@ func buildGrokResponsesRequest(ctx context.Context, c *gin.Context, account *Acc
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	if account.IsGrokOAuth() {
-		applyGrokCLIHeaders(req.Header)
-	}
+	applyGrokOAuthUpstreamHeadersForBaseURL(account, req.Header, baseURL)
 	applyGrokCacheHeaders(req.Header, cacheIdentity)
 	if c != nil {
 		if v := c.GetHeader("OpenAI-Beta"); strings.TrimSpace(v) != "" {
@@ -1042,14 +1541,38 @@ func buildGrokResponsesRequest(ctx context.Context, c *gin.Context, account *Acc
 	return req, nil
 }
 
-// applyGrokCLIHeaders identifies subscription traffic as a supported Grok CLI
-// version. The CLI gateway rejects otherwise valid OAuth requests without it.
+// applyGrokCLIHeaders identifies free-build CLI proxy traffic as a supported
+// Grok CLI version. Public api.x.ai OAuth traffic must not send these headers.
 func applyGrokCLIHeaders(headers http.Header) {
+	applyGrokCLIHeadersForBaseURL(headers, xai.DefaultCLIBaseURL)
+}
+
+// applyGrokOAuthUpstreamHeaders attaches CLI identity headers only when the
+// selected upstream is cli-chat-proxy.
+func applyGrokOAuthUpstreamHeaders(account *Account, headers http.Header) {
+	if account == nil {
+		return
+	}
+	applyGrokOAuthUpstreamHeadersForBaseURL(account, headers, account.GetGrokBaseURL())
+}
+
+func applyGrokOAuthUpstreamHeadersForBaseURL(account *Account, headers http.Header, baseURL string) {
+	if account == nil || !account.IsGrokOAuth() {
+		return
+	}
+	applyGrokCLIHeadersForBaseURL(headers, baseURL)
+}
+
+func applyGrokCLIHeadersForBaseURL(headers http.Header, baseURL string) {
 	if headers == nil {
+		return
+	}
+	if !xai.IsCLIChatProxyBaseURL(baseURL) {
 		return
 	}
 	headers.Set("User-Agent", grokUpstreamUserAgent)
 	headers.Set("X-Grok-Client-Version", grokCLIVersion)
+	xai.MaybeApplyCLIChatProxyHeaders(headers, baseURL)
 }
 
 func (s *OpenAIGatewayService) updateGrokUsageSnapshot(ctx context.Context, account *Account, snapshot *xai.QuotaSnapshot) {
@@ -1300,6 +1823,36 @@ func (s *OpenAIGatewayService) rateLimitGrok(ctx context.Context, account *Accou
 	persistGrokRateLimit(ctx, s.accountRepo, account, resetAt)
 }
 
+// canFallbackGrokCLIProxyToPublicAPI reports whether this OAuth request should
+// retry the same account on https://api.x.ai after cli-chat-proxy returns 403.
+func canFallbackGrokCLIProxyToPublicAPI(account *Account, baseURL string, statusCode int) bool {
+	if account == nil || !account.IsGrokOAuth() {
+		return false
+	}
+	if statusCode != http.StatusForbidden {
+		return false
+	}
+	if !xai.IsCLIChatProxyBaseURL(baseURL) {
+		return false
+	}
+	return true
+}
+
+func appendGrokCLIProxyFallbackOpsEvent(c *gin.Context, account *Account, statusCode int, requestID, message string) {
+	if c == nil || account == nil {
+		return
+	}
+	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+		Platform:           account.Platform,
+		AccountID:          account.ID,
+		AccountName:        account.Name,
+		UpstreamStatusCode: statusCode,
+		UpstreamRequestID:  requestID,
+		Kind:               "fallback",
+		Message:            message,
+	})
+}
+
 func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Context, account *Account, statusCode int, headers http.Header, responseBody []byte) {
 	if s == nil || account == nil {
 		return
@@ -1310,7 +1863,17 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 	case http.StatusUnauthorized:
 		s.tempUnscheduleGrok(ctx, account, 10*time.Minute, "grok credentials unauthorized")
 	case http.StatusForbidden:
-		s.tempUnscheduleGrok(ctx, account, 30*time.Minute, "grok access or entitlement denied")
+		// CLI-proxy 403 is often entitlement-bound for a single request path and may
+		// still succeed on the public API same-account fallback. Keep a short cooldown
+		// so one 403 does not long-block the account. Public API 403s stay short too.
+		cooldown := 2 * time.Minute
+		reason := "grok upstream 403"
+		if account.IsGrokOAuth() && xai.IsCLIChatProxyBaseURL(account.GetGrokBaseURL()) {
+			reason = "grok cli-chat-proxy 403"
+		} else if account.IsGrokOAuth() {
+			reason = "grok public api 403"
+		}
+		s.tempUnscheduleGrok(ctx, account, cooldown, reason)
 	case http.StatusTooManyRequests:
 		// updateGrokUsageSnapshot installs both runtime and durable rate-limit state.
 	default:

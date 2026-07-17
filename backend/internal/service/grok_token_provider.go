@@ -167,6 +167,71 @@ func (p *GrokTokenProvider) GetAccessToken(ctx context.Context, account *Account
 	return accessToken, nil
 }
 
+// GetAccessTokenForOperatorProbe acquires a usable access token for admin/recovery probes.
+// Unlike GetAccessToken, it can refresh sticky error accounts that are not schedulable.
+func (p *GrokTokenProvider) GetAccessTokenForOperatorProbe(ctx context.Context, account *Account) (string, error) {
+	if account == nil {
+		return "", errors.New("account is nil")
+	}
+	if account.Platform != PlatformGrok || account.Type != AccountTypeOAuth {
+		return "", errors.New("not a grok oauth account")
+	}
+	if strings.TrimSpace(account.GetGrokRefreshToken()) == "" && strings.TrimSpace(account.GetGrokAccessToken()) == "" {
+		return "", withGrokCredentialFailureSnapshot(errGrokOAuthRefreshTokenMissing, account)
+	}
+
+	// Prefer still-valid access token without forcing active/schedulable eligibility.
+	expiresAt := account.GetCredentialAsTime("expires_at")
+	accessToken := strings.TrimSpace(account.GetGrokAccessToken())
+	if accessToken != "" && expiresAt != nil && time.Until(*expiresAt) > grokTokenRefreshSkew {
+		return accessToken, nil
+	}
+	if accessToken != "" && expiresAt != nil && time.Now().Before(*expiresAt) && strings.TrimSpace(account.GetGrokRefreshToken()) == "" {
+		return accessToken, nil
+	}
+	if p == nil || p.refreshAPI == nil || p.executor == nil {
+		if accessToken != "" && expiresAt != nil && time.Now().Before(*expiresAt) {
+			return accessToken, nil
+		}
+		return "", errGrokOAuthRefreshNotConfigured
+	}
+	if strings.TrimSpace(account.GetGrokRefreshToken()) == "" {
+		if accessToken != "" && expiresAt != nil && time.Now().Before(*expiresAt) {
+			return accessToken, nil
+		}
+		return "", withGrokCredentialFailureSnapshot(errGrokOAuthRefreshTokenMissing, account)
+	}
+
+	refreshCtx, cancel := context.WithTimeout(ctx, grokRequestRefreshTimeout)
+	defer cancel()
+	refreshCtx = withOAuthRefreshAllowInactive(refreshCtx)
+	// Keep request-path locking/race recovery, but allow inactive Grok recovery accounts.
+	refreshCtx = withOAuthRefreshRequestPath(refreshCtx)
+	result, err := p.refreshAPI.RefreshIfNeeded(refreshCtx, account, p.executor, grokTokenRefreshSkew)
+	if err != nil {
+		return "", err
+	}
+	if result != nil && result.LockHeld {
+		token, waitErr := p.waitForRefreshedToken(refreshCtx, account, GrokTokenCacheKey(account))
+		if waitErr == nil && strings.TrimSpace(token) != "" {
+			return token, nil
+		}
+		// Fall through to whatever credential we still have.
+	}
+	if result != nil && result.Account != nil {
+		account = result.Account
+	}
+	accessToken = strings.TrimSpace(account.GetGrokAccessToken())
+	if accessToken == "" {
+		return "", withGrokCredentialFailureSnapshot(errGrokOAuthAccessTokenMissing, account)
+	}
+	expiresAt = account.GetCredentialAsTime("expires_at")
+	if expiresAt != nil && !time.Now().Before(*expiresAt) {
+		return "", withGrokCredentialFailureSnapshot(errGrokOAuthAccessTokenExpired, account)
+	}
+	return accessToken, nil
+}
+
 func (p *GrokTokenProvider) waitForRefreshedToken(ctx context.Context, account *Account, cacheKey string) (string, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, grokRefreshLockWaitTimeout)
 	defer cancel()
@@ -195,8 +260,11 @@ func (p *GrokTokenProvider) waitForRefreshedToken(ctx context.Context, account *
 				return "", errOAuthRefreshAccountStateChanged
 			} else {
 				sawAuthoritativeState = true
-				if eligibilityErr := grokOAuthRequestAccountEligibilityError(latest); eligibilityErr != nil {
-					return "", withGrokCredentialFailureSnapshot(eligibilityErr, latest)
+				allowInactive := isOAuthRefreshAllowInactive(waitCtx) && latest.IsGrokOAuth()
+				if !allowInactive {
+					if eligibilityErr := grokOAuthRequestAccountEligibilityError(latest); eligibilityErr != nil {
+						return "", withGrokCredentialFailureSnapshot(eligibilityErr, latest)
+					}
 				}
 				if !grokCredentialProxyIDsEqual(latest.ProxyID, selectedProxyID) {
 					return "", withGrokCredentialFailureSnapshot(errOAuthRefreshAccountStateChanged, latest)

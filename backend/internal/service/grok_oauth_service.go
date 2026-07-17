@@ -99,6 +99,7 @@ type GrokTokenInfo struct {
 	ExpiresAt         int64  `json:"expires_at"`
 	ClientID          string `json:"client_id,omitempty"`
 	Scope             string `json:"scope,omitempty"`
+	Referrer          string `json:"referrer,omitempty"`
 	Email             string `json:"email,omitempty"`
 	Subject           string `json:"sub,omitempty"`
 	TeamID            string `json:"team_id,omitempty"`
@@ -239,6 +240,9 @@ func (s *GrokOAuthService) BuildAccountCredentials(tokenInfo *GrokTokenInfo) map
 	if tokenInfo.Scope != "" {
 		creds["scope"] = tokenInfo.Scope
 	}
+	if tokenInfo.Referrer != "" {
+		creds["referrer"] = tokenInfo.Referrer
+	}
 	if tokenInfo.Email != "" {
 		creds["email"] = tokenInfo.Email
 	}
@@ -277,6 +281,7 @@ func (s *GrokOAuthService) tokenInfoFromResponse(tokenResp *xai.TokenResponse, c
 		ExpiresAt:    now.Add(time.Duration(expiresIn) * time.Second).Unix(),
 		ClientID:     strings.TrimSpace(clientID),
 		Scope:        tokenResp.Scope,
+		Referrer:     tokenResp.Referrer,
 	}
 	if info.ClientID == "" {
 		info.ClientID = xai.EffectiveClientID()

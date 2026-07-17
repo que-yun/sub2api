@@ -179,10 +179,16 @@ func TestPatchGrokResponsesBodyDropsUnsupportedNamespaceTools(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, json.Valid(patched))
 	require.Equal(t, "grok-4.3", gjson.GetBytes(patched, "model").String())
-	require.Len(t, gjson.GetBytes(patched, "tools").Array(), 2)
+	// namespace flattened; shell without environment rewritten to function exec_command
+	require.Len(t, gjson.GetBytes(patched, "tools").Array(), 3)
 	require.False(t, gjson.GetBytes(patched, `tools.#(type=="namespace")`).Exists())
+	require.False(t, gjson.GetBytes(patched, `tools.#(type=="shell")`).Exists())
 	require.True(t, gjson.GetBytes(patched, `tools.#(type=="function")`).Exists())
-	require.True(t, gjson.GetBytes(patched, `tools.#(type=="shell")`).Exists())
+	names := []string{}
+	for _, tool := range gjson.GetBytes(patched, "tools").Array() {
+		names = append(names, tool.Get("name").String())
+	}
+	require.ElementsMatch(t, []string{"inner", "kept_fn", "exec_command"}, names)
 	require.Equal(t, "kept_fn", gjson.GetBytes(patched, "tool_choice.name").String())
 }
 
@@ -261,21 +267,74 @@ func TestPatchGrokResponsesBodyDropsToolChoiceWhenToolsMissing(t *testing.T) {
 	require.False(t, gjson.GetBytes(patched, "tool_choice").Exists())
 }
 
-func TestPatchGrokResponsesBodyDropsToolChoiceWhenOnlyInvalidShellToolsRemain(t *testing.T) {
+func TestPatchGrokResponsesBodyConvertsCodexLocalShellToolsToFunctions(t *testing.T) {
 	t.Parallel()
 
 	body := []byte(`{
 		"model": "gpt-5.5",
 		"input": "hello",
-		"tools": [{"type": "shell", "name": "local_shell"}],
+		"tools": [
+			{"type": "shell", "name": "local_shell"},
+			{"type": "local_shell"},
+			{"type": "namespace", "namespace": "functions", "tools": [
+				{"type": "function", "name": "wait", "parameters": {"type": "object"}}
+			]}
+		],
 		"tool_choice": "auto"
 	}`)
 
 	patched, err := patchGrokResponsesBody(body, "grok-4.5")
 	require.NoError(t, err)
 	require.True(t, json.Valid(patched))
-	require.False(t, gjson.GetBytes(patched, "tools").Exists())
-	require.False(t, gjson.GetBytes(patched, "tool_choice").Exists())
+	require.Equal(t, 2, len(gjson.GetBytes(patched, "tools").Array()))
+	require.Equal(t, "function", gjson.GetBytes(patched, "tools.0.type").String())
+	require.Equal(t, "exec_command", gjson.GetBytes(patched, "tools.0.name").String())
+	require.Equal(t, "function", gjson.GetBytes(patched, "tools.1.type").String())
+	require.Equal(t, "wait", gjson.GetBytes(patched, "tools.1.name").String())
+	require.Equal(t, "required", gjson.GetBytes(patched, "tool_choice").String())
+	require.Equal(t, "cmd", gjson.GetBytes(patched, "tools.0.parameters.required.0").String())
+	require.True(t, gjson.GetBytes(patched, "tools.0.parameters.properties.cmd").Exists())
+	require.True(t, gjson.GetBytes(patched, "tools.0.parameters.properties.workdir").Exists())
+}
+
+func TestPatchGrokResponsesBodyPromotesAdditionalToolsIntoTopLevel(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model": "gpt-5.5",
+		"input": [
+			{
+				"type": "additional_tools",
+				"role": "developer",
+				"tools": [
+					{"type": "local_shell"},
+					{"type": "function", "name": "write_stdin", "parameters": {"type": "object", "properties": {"chars": {"type": "string"}}}}
+				]
+			},
+			{"type": "message", "role": "user", "content": "run ls"}
+		],
+		"tool_choice": "auto"
+	}`)
+
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.True(t, json.Valid(patched))
+	require.False(t, gjson.GetBytes(patched, `input.#(type=="additional_tools")`).Exists())
+	require.Equal(t, 2, len(gjson.GetBytes(patched, "tools").Array()))
+	names := []string{
+		gjson.GetBytes(patched, "tools.0.name").String(),
+		gjson.GetBytes(patched, "tools.1.name").String(),
+	}
+	require.ElementsMatch(t, []string{"exec_command", "write_stdin"}, names)
+	require.Equal(t, "required", gjson.GetBytes(patched, "tool_choice").String())
+	// write_stdin schema should require session_id and keep chars optional.
+	for _, tool := range gjson.GetBytes(patched, "tools").Array() {
+		if tool.Get("name").String() != "write_stdin" {
+			continue
+		}
+		require.Equal(t, "session_id", tool.Get("parameters.required.0").String())
+		require.True(t, tool.Get("parameters.properties.chars").Exists())
+	}
 }
 
 func TestPatchGrokResponsesBodySanitizesUnsupportedModelInputItems(t *testing.T) {
@@ -1665,11 +1724,11 @@ func TestHandleGrokAccountUpstreamErrorTempUnschedulesNonRateLimitStates(t *test
 			wantMaxCooldown: 10*time.Minute + time.Second,
 		},
 		{
-			name:            "forbidden entitlement",
+			name:            "forbidden short cooldown",
 			status:          http.StatusForbidden,
-			wantReason:      "grok access or entitlement denied",
-			wantMinCooldown: 30*time.Minute - time.Second,
-			wantMaxCooldown: 30*time.Minute + time.Second,
+			wantReason:      "grok cli-chat-proxy 403",
+			wantMinCooldown: 2*time.Minute - time.Second,
+			wantMaxCooldown: 2*time.Minute + time.Second,
 		},
 		{
 			name:            "upstream temporary error",
@@ -2202,3 +2261,202 @@ func TestIsGrokImageGenerationModel(t *testing.T) {
 	}
 }
 
+func TestPatchGrokResponsesBodyRequiresToolChoiceForFunctionTools(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model": "gpt-5.5",
+		"input": "run pwd",
+		"tools": [
+			{"type": "function", "name": "exec_command", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}},
+			{"type": "function", "name": "write_stdin", "parameters": {"type": "object", "properties": {"session_id": {"type": "number"}}, "required": ["session_id"]}}
+		],
+		"tool_choice": "auto"
+	}`)
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.Equal(t, "required", gjson.GetBytes(patched, "tool_choice").String())
+	// schema tightening keeps cmd required and optional workdir/yield fields.
+	require.Equal(t, "cmd", gjson.GetBytes(patched, "tools.0.parameters.required.0").String())
+	require.True(t, gjson.GetBytes(patched, "tools.0.parameters.properties.workdir").Exists())
+	require.True(t, gjson.GetBytes(patched, "tools.0.parameters.properties.yield_time_ms").Exists())
+}
+
+func TestPatchGrokResponsesBodyRequiresToolChoiceForNonShellFunctionTools(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model": "gpt-5.5",
+		"input": "edit the file",
+		"tools": [
+			{"type": "function", "name": "apply_patch", "description": "Apply a patch", "parameters": {"type": "object", "properties": {"patch": {"type": "string"}}, "required": ["patch"]}},
+			{"type": "function", "name": "view_image", "description": "Open an image", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}
+		],
+		"tool_choice": {"type": "auto"}
+	}`)
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.Equal(t, "required", gjson.GetBytes(patched, "tool_choice").String())
+	require.Equal(t, "apply_patch", gjson.GetBytes(patched, "tools.0.name").String())
+	require.Equal(t, "view_image", gjson.GetBytes(patched, "tools.1.name").String())
+}
+
+func TestPatchGrokResponsesBodyDoesNotRequireChoiceForContinuationOnlyTools(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model": "gpt-5.5",
+		"input": "continue process",
+		"tools": [
+			{"type": "function", "name": "write_stdin", "parameters": {"type": "object", "properties": {"session_id": {"type": "number"}}, "required": ["session_id"]}}
+		],
+		"tool_choice": "auto"
+	}`)
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.Equal(t, "auto", gjson.GetBytes(patched, "tool_choice").String())
+	require.Equal(t, "session_id", gjson.GetBytes(patched, "tools.0.parameters.required.0").String())
+}
+
+func TestPatchGrokResponsesBodyDoesNotOverrideExplicitNoneToolChoice(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model": "gpt-5.5",
+		"input": "no tools please",
+		"tools": [
+			{"type": "function", "name": "exec_command", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}}
+		],
+		"tool_choice": "none"
+	}`)
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.Equal(t, "none", gjson.GetBytes(patched, "tool_choice").String())
+}
+
+func TestPatchGrokResponsesBodyDoesNotOverrideExplicitOtherFunctionToolChoice(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model": "gpt-5.5",
+		"input": "write stdin",
+		"tools": [
+			{"type": "function", "name": "exec_command", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}},
+			{"type": "function", "name": "write_stdin", "parameters": {"type": "object", "properties": {"session_id": {"type": "number"}}, "required": ["session_id"]}}
+		],
+		"tool_choice": {"type": "function", "name": "write_stdin"}
+	}`)
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.Equal(t, "function", gjson.GetBytes(patched, "tool_choice.type").String())
+	require.Equal(t, "write_stdin", gjson.GetBytes(patched, "tool_choice.name").String())
+}
+
+func TestPatchGrokResponsesBodyNormalizesFunctionCallArgumentsToObjectJSONString(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model": "gpt-5.5",
+		"input": [
+			{"type": "function_call", "call_id": "call_1", "name": "exec_command", "arguments": "{\"cmd\":\"pwd\"}"},
+			{"type": "function_call_output", "call_id": "call_1", "output": "/Users/yunque/work\n"},
+			{"type": "custom_tool_call", "call_id": "call_2", "name": "lookup", "arguments": "{\"q\":\"x\"}"},
+			{"type": "function_call", "call_id": "call_3", "name": "plain", "arguments": "not-json"},
+			{"type": "function_call", "call_id": "call_4", "name": "already", "arguments": {"ok": true}}
+		],
+		"tools": [
+			{"type": "function", "name": "exec_command", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}}
+		]
+	}`)
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.True(t, json.Valid(patched))
+
+	// 字段必须是 string；字符串内容必须是 JSON object。
+	// 写成 object 会 422 ModelInput；内容不是 object 会 400 expected JSON object for tool arguments。
+	require.Equal(t, gjson.String, gjson.GetBytes(patched, "input.0.arguments").Type)
+	require.Equal(t, `{"cmd":"pwd"}`, gjson.GetBytes(patched, "input.0.arguments").String())
+	require.Equal(t, gjson.String, gjson.GetBytes(patched, "input.2.arguments").Type)
+	require.Equal(t, `{"q":"x"}`, gjson.GetBytes(patched, "input.2.arguments").String())
+	require.Equal(t, gjson.String, gjson.GetBytes(patched, "input.3.arguments").Type)
+	require.Equal(t, `{"input":"not-json"}`, gjson.GetBytes(patched, "input.3.arguments").String())
+	require.Equal(t, gjson.String, gjson.GetBytes(patched, "input.4.arguments").Type)
+	require.Equal(t, `{"ok":true}`, gjson.GetBytes(patched, "input.4.arguments").String())
+}
+
+func TestPatchGrokResponsesBodyDoesNotRequireToolChoiceAfterToolOutput(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model": "gpt-5.5",
+		"input": [
+			{"type": "function_call", "call_id": "call_1", "name": "exec_command", "arguments": "{\"cmd\":\"pwd\"}"},
+			{"type": "function_call_output", "call_id": "call_1", "output": "/Users/yunque/work\n"},
+			{"type": "message", "role": "user", "content": "继续总结结果"}
+		],
+		"tools": [
+			{"type": "function", "name": "exec_command", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}}
+		],
+		"tool_choice": "auto"
+	}`)
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.Equal(t, "auto", gjson.GetBytes(patched, "tool_choice").String())
+	require.Equal(t, "cmd", gjson.GetBytes(patched, "tools.0.parameters.required.0").String())
+}
+
+
+func TestForwardGrokResponsesFallsBackToPublicAPIOnCLIProxy403(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	body := []byte(`{"model":"grok","input":"ping","stream":true}`)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	account := &Account{
+		ID:       20767,
+		Platform: PlatformGrok,
+		Type:     AccountTypeOAuth,
+		Name:     "ThospqAbadi@hotmail.com",
+		Credentials: map[string]any{
+			"access_token": "token",
+			"email":        "thospqabadi@hotmail.com",
+		},
+		Extra: map[string]any{
+			"grok_billing_snapshot": map[string]any{"plan": "SuperGrok"},
+		},
+	}
+	okBody := strings.Join([]string{
+		`data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp_public","model":"grok-4.3","usage":{"input_tokens":1,"output_tokens":1}}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "
+")
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		{
+			StatusCode: http.StatusForbidden,
+			Header:     http.Header{"Content-Type": []string{"application/json"}, "xai-request-id": []string{"cli-403"}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"Access denied"}}`)),
+		},
+		{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"public-ok"}},
+			Body:       io.NopCloser(strings.NewReader(okBody)),
+		},
+	}}
+	svc := &OpenAIGatewayService{
+		httpUpstream: upstream,
+		accountRepo:  &grokQuotaAccountRepo{},
+	}
+
+	result, err := svc.forwardGrokResponses(context.Background(), c, account, body, "grok", true, time.Now())
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, upstream.requests, 2)
+	require.Equal(t, xai.DefaultCLIBaseURL+"/responses", upstream.requests[0].URL.String())
+	require.Equal(t, xai.DefaultBaseURL+"/responses", upstream.requests[1].URL.String())
+	require.Equal(t, "resp_public", result.ResponseID)
+}

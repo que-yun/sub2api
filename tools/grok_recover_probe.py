@@ -9,6 +9,7 @@ Design goals:
   3) sticky entitlement 403 holds                     (slow queue)
 - Healthy / currently schedulable accounts are skipped.
 - Successful probe/test path in backend clears sticky hold.
+- Always call quota with mode=active so chat readiness, not billing, decides rescue.
 
 Environment:
   SUB2API_BASE_URL   default http://127.0.0.1:6780
@@ -131,30 +132,66 @@ def parse_ts(value: str | None) -> datetime | None:
 
 
 def classify(http_code: int, body: str) -> tuple[str, int | None, str]:
+    """Classify recovery probe results.
+
+    Only chat/readiness outcomes count as rescue:
+    - HTTP 200 with active/hybrid probe status_code 200 => ok_200
+    - HTTP 200/429 with status_code 429 => rate_429
+    - billing-only 200 without an active probe is NOT a rescue
+    """
     try:
         obj = json.loads(body) if body else {}
     except Exception:
         obj = {}
+    data = obj.get("data") if isinstance(obj, dict) else None
+    if not isinstance(data, dict):
+        data = {}
+    source = str(data.get("source") or "").strip().lower()
+    snap = data.get("snapshot") if isinstance(data.get("snapshot"), dict) else {}
+    sc_raw = data.get("status_code")
+    if sc_raw is None:
+        sc_raw = snap.get("status_code")
+    try:
+        sc_i = int(sc_raw) if sc_raw is not None else None
+    except Exception:
+        sc_i = None
+    probe_error = str(data.get("probe_error") or "")
+    msg = (obj.get("message") or probe_error or body or "")[:240]
+    reason = str(obj.get("reason") or "")
+
     if http_code == 200:
-        data = obj.get("data") or {}
-        sc = data.get("status_code") or ((data.get("snapshot") or {}).get("status_code"))
-        try:
-            sc_i = int(sc) if sc is not None else 200
-        except Exception:
-            sc_i = 200
+        # Recovery must come from chat readiness, never billing-only quota.
+        if source in ("", "billing_probe") and not snap:
+            return "billing_only", sc_i or 200, "billing-only quota response is not a chat readiness rescue"
+        if probe_error:
+            # Should not happen for hard failures after backend fix, but keep safe.
+            low = probe_error.lower()
+            if "403" in low or "permission-denied" in low or "entitlement" in low:
+                return "forbidden_403", 403, probe_error[:240]
+            if "401" in low or "token" in low or "oauth" in low or "refresh" in low:
+                return "token_error", 401, probe_error[:240]
+            if "429" in low or "rate" in low:
+                return "rate_429", 429, probe_error[:240]
+            return "other_probe_error", sc_i, probe_error[:240]
         if sc_i == 200:
-            return "ok_200", sc_i, ""
+            return "ok_200", 200, ""
         if sc_i == 429:
-            return "rate_429", sc_i, ""
-        return f"http200_sc_{sc_i}", sc_i, ""
-    msg = (obj.get("message") or body or "")[:240]
-    reason = obj.get("reason") or ""
-    if http_code == 403 or "permission-denied" in msg or "Access to the chat endpoint is denied" in msg:
+            return "rate_429", 429, ""
+        if sc_i == 403:
+            return "forbidden_403", 403, msg
+        if sc_i == 401:
+            return "token_error", 401, msg
+        if sc_i is None:
+            # Active probe success always sets status_code; missing means unusable for recovery.
+            return "unknown_status", None, "missing active probe status_code"
+        return f"http200_sc_{sc_i}", sc_i, msg
+
+    if http_code == 403 or "permission-denied" in msg or "Access to the chat endpoint is denied" in msg or "entitlement" in msg.lower():
         return "forbidden_403", 403, msg
     if http_code == 429 or "free-usage-exhausted" in msg:
         return "rate_429", 429, msg
-    if "token" in msg.lower() or "OAUTH" in reason or "refresh" in msg.lower():
-        return "token_error", http_code or None, msg
+    if http_code == 401 or "token" in msg.lower() or "OAUTH" in reason or "refresh" in msg.lower() or "GROK_QUOTA_TOKEN" in msg:
+        return "token_error", http_code or 401, msg
     if http_code in (502, 503, 504) or "EOF" in msg or "timeout" in msg.lower() or "transport" in msg.lower():
         return "transport_error", http_code or None, msg
     if http_code == 404 and "ACCOUNT_NOT_FOUND" in msg:
@@ -163,7 +200,8 @@ def classify(http_code: int, body: str) -> tuple[str, int | None, str]:
 
 
 def probe_one(base: str, jwt: str, account_id: int, timeout: int) -> dict[str, Any]:
-    url = f"{base.rstrip('/')}/api/v1/admin/grok/accounts/{account_id}/quota"
+    # mode=active forces chat readiness probe; billing-only quota is not recovery evidence.
+    url = f"{base.rstrip('/')}/api/v1/admin/grok/accounts/{account_id}/quota?mode=active"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {jwt}"})
     started = time.time()
     http_code = 0
