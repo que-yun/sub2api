@@ -21,20 +21,20 @@ import (
 )
 
 // Account management implementations
-func (s *adminServiceImpl) ListAccounts(ctx context.Context, page, pageSize int, platform, accountType, status, search string, groupID int64, privacyMode string, sortBy, sortOrder string) ([]Account, int64, error) {
+func (s *adminServiceImpl) ListAccounts(ctx context.Context, page, pageSize int, platform, accountType, status, search string, groupID int64, privacyMode, planType string, sortBy, sortOrder string) ([]Account, int64, error) {
 	params := pagination.PaginationParams{Page: page, PageSize: pageSize, SortBy: sortBy, SortOrder: sortOrder}
-	accounts, result, err := s.accountRepo.ListWithFilters(ctx, params, platform, accountType, status, search, groupID, privacyMode)
+	accounts, result, err := s.accountRepo.ListWithFilters(ctx, params, platform, accountType, status, search, groupID, privacyMode, planType)
 	if err != nil {
 		return nil, 0, err
 	}
 	return accounts, result.Total, nil
 }
 
-func (s *adminServiceImpl) ListAccountsForSchedulerScoreFilter(ctx context.Context, platform, accountType, status, search string, groupID int64, privacyMode string) ([]Account, error) {
+func (s *adminServiceImpl) ListAccountsForSchedulerScoreFilter(ctx context.Context, platform, accountType, status, search string, groupID int64, privacyMode, planType string) ([]Account, error) {
 	if s == nil || s.accountRepo == nil {
 		return nil, nil
 	}
-	return s.accountRepo.ListAllWithFilters(ctx, platform, accountType, status, search, groupID, privacyMode)
+	return s.accountRepo.ListAllWithFilters(ctx, platform, accountType, status, search, groupID, privacyMode, planType)
 }
 
 func (s *adminServiceImpl) ListOpenAISchedulableAccountsForSchedulerScore(ctx context.Context, groupID *int64) ([]Account, error) {
@@ -626,6 +626,31 @@ type accountProbeEnabledAtomicUpdater interface {
 	UpdateWithUpstreamBillingProbeEnabled(context.Context, *Account, bool) error
 }
 
+
+// credentialsLookLikeAuthRefresh reports whether the credentials payload
+// contains usable auth material from a re-login / re-OAuth flow.
+func credentialsLookLikeAuthRefresh(credentials map[string]any) bool {
+	if len(credentials) == 0 {
+		return false
+	}
+	for _, key := range []string{"access_token", "refresh_token", "api_key", "id_token"} {
+		raw, ok := credentials[key]
+		if !ok || raw == nil {
+			continue
+		}
+		if s, ok := raw.(string); ok {
+			if strings.TrimSpace(s) != "" {
+				return true
+			}
+			continue
+		}
+		if strings.TrimSpace(fmt.Sprint(raw)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *UpdateAccountInput) (*Account, error) {
 	account, err := s.accountRepo.GetByID(ctx, id)
 	if err != nil {
@@ -786,6 +811,19 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	if input.Status != "" {
 		account.Status = input.Status
 	}
+	// Reauth tools often only push status=active + fresh tokens. Without restoring
+	// schedulable, the account stays out of the scheduler pool forever even though
+	// credentials are valid again.
+	credentialsRefreshed := len(input.Credentials) > 0 && credentialsLookLikeAuthRefresh(input.Credentials)
+	if credentialsRefreshed {
+		if input.Status == StatusActive || account.Status == StatusActive || account.Status == StatusError {
+			account.Status = StatusActive
+			account.ErrorMessage = ""
+			account.Schedulable = true
+			account.TempUnschedulableUntil = nil
+			account.TempUnschedulableReason = ""
+		}
+	}
 	if input.ExpiresAt != nil {
 		if *input.ExpiresAt <= 0 {
 			account.ExpiresAt = nil
@@ -831,6 +869,14 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 			}); err != nil {
 				return nil, err
 			}
+		}
+	}
+
+	if credentialsRefreshed && account.Status == StatusActive {
+		// Drop sticky temp holds / runtime scheduler blocks left by earlier auth failures.
+		_ = s.accountRepo.ClearTempUnschedulable(ctx, account.ID)
+		if s.runtimeBlocker != nil {
+			s.runtimeBlocker.ClearAccountSchedulingBlock(account.ID)
 		}
 	}
 
@@ -1130,6 +1176,7 @@ func (s *adminServiceImpl) resolveBulkUpdateTargetIDs(ctx context.Context, filte
 			filters.Search,
 			groupID,
 			filters.PrivacyMode,
+			filters.PlanType,
 			"",
 			"",
 		)

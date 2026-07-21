@@ -720,6 +720,63 @@ func TestAccountSupportsOpenAIVisionModel(t *testing.T) {
 	})
 }
 
+func TestAccountSupportsOpenAIVisionModel_InferredFromCatalog(t *testing.T) {
+	t.Run("vision mapping without capability still schedules", func(t *testing.T) {
+		account := &Account{
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeAPIKey,
+			Credentials: map[string]any{
+				"model_mapping":        map[string]any{"gpt-*": "z-ai/glm-5.2"},
+				"vision_model_mapping": map[string]any{"gpt-*": "meta/llama-3.2-11b-vision-instruct"},
+				"openai_capabilities": map[string]any{
+					"chat_completions": true,
+				},
+			},
+		}
+		require.True(t, account.SupportsOpenAIVisionModel("gpt-5.5"))
+		mapped, ok := account.ResolveInferredVisionModel("gpt-5.5")
+		require.True(t, ok)
+		require.Equal(t, "meta/llama-3.2-11b-vision-instruct", mapped)
+	})
+
+	t.Run("catalog vision models allow same-account image schedule", func(t *testing.T) {
+		account := &Account{
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeAPIKey,
+			Credentials: map[string]any{
+				"model_mapping": map[string]any{
+					"gpt-*":                              "z-ai/glm-5.2",
+					"meta/llama-3.2-11b-vision-instruct": "meta/llama-3.2-11b-vision-instruct",
+					"nvidia/nemotron-nano-12b-v2-vl":     "nvidia/nemotron-nano-12b-v2-vl",
+				},
+				"openai_capabilities": map[string]any{
+					"chat_completions": true,
+				},
+			},
+		}
+		require.True(t, account.SupportsOpenAIVisionModel("gpt-5.5"))
+		mapped, ok := account.ResolveInferredVisionModel("gpt-5.5")
+		require.True(t, ok)
+		require.Equal(t, "meta/llama-3.2-11b-vision-instruct", mapped)
+	})
+
+	t.Run("text-only mapping without vision catalog rejects image", func(t *testing.T) {
+		account := &Account{
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeAPIKey,
+			Credentials: map[string]any{
+				"model_mapping": map[string]any{"gpt-*": "glm-5.2"},
+				"openai_capabilities": map[string]any{
+					"chat_completions": true,
+				},
+			},
+		}
+		require.False(t, account.SupportsOpenAIVisionModel("gpt-5.5"))
+		_, ok := account.ResolveInferredVisionModel("gpt-5.5")
+		require.False(t, ok)
+	})
+}
+
 func TestBuildOpenAIImagesURL_HandlesVersionedBaseURL(t *testing.T) {
 	require.Equal(t,
 		"https://image-upstream.example/v1/images/generations",

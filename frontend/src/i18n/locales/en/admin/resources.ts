@@ -544,6 +544,8 @@ export default {
       billingModeVideo: 'Video',
       allBillingModes: 'All Billing Modes',
       ipAddress: 'IP',
+      allIngressNodes: 'All ingress nodes',
+      ingressNode: 'Ingress Node',
       clickToViewBalance: 'Click to view balance history',
       failedToLoadUser: 'Failed to load user info',
       userDeletedBadge: 'Deleted',

@@ -531,6 +531,11 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					}
 					h.gatewayService.RecordOpenAIAccountSwitch()
 					failedAccountIDs[account.ID] = struct{}{}
+					if failoverErr.IsOpenAIContextWindowGLMFailover() {
+						// Prefer non-GLM accounts for the rest of this request's retries.
+						visionRequestCtx = service.WithSkipGLMMappedAccountsForContextWindow(visionRequestCtx)
+						c.Request = c.Request.WithContext(service.WithSkipGLMMappedAccountsForContextWindow(c.Request.Context()))
+					}
 					lastFailoverErr = failoverErr
 					if switchCount >= maxAccountSwitches {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
@@ -1065,6 +1070,11 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 					}
 					h.gatewayService.RecordOpenAIAccountSwitch()
 					failedAccountIDs[account.ID] = struct{}{}
+					if failoverErr.IsOpenAIContextWindowGLMFailover() {
+						// Prefer non-GLM accounts for the rest of this request's retries.
+						visionRequestCtx = service.WithSkipGLMMappedAccountsForContextWindow(visionRequestCtx)
+						c.Request = c.Request.WithContext(service.WithSkipGLMMappedAccountsForContextWindow(c.Request.Context()))
+					}
 					lastFailoverErr = failoverErr
 					if switchCount >= maxAccountSwitches {
 						h.handleAnthropicFailoverExhausted(c, failoverErr, streamStarted)
@@ -1608,6 +1618,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 		h.gatewayService.RecordOpenAIAccountSwitch()
 		failedAccountIDs[account.ID] = struct{}{}
+		if failoverErr.IsOpenAIContextWindowGLMFailover() {
+			// Prefer non-GLM accounts for the rest of this websocket turn's retries.
+			ctx = service.WithSkipGLMMappedAccountsForContextWindow(ctx)
+			c.Request = c.Request.WithContext(service.WithSkipGLMMappedAccountsForContextWindow(c.Request.Context()))
+		}
 		lastFailoverErr = failoverErr
 		if switchCount >= maxAccountSwitches {
 			closeOpenAIWSFailoverExhausted(wsConn, failoverErr)

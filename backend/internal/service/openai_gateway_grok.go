@@ -68,6 +68,13 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		return nil, fmt.Errorf("apply grok Free function-tool cache route: %w", err)
 	}
 
+	// grok Build(cli-chat-proxy)自带后端 web_search，收到图片会把看图题变成多轮联网检索；
+	// 含 input_image 时注入 developer 指令让它直接看图作答（用户显式要搜时仍放行）。
+	// 仅针对 Build：api.x.ai 的 API Key 账号不受影响。
+	if account.IsGrokOAuth() && xai.IsCLIChatProxyBaseURL(account.GetGrokBaseURL()) {
+		patchedBody = appendGrokImageSearchGuard(patchedBody)
+	}
+
 	token, _, err := s.getRequestCredential(ctx, c, account)
 	if err != nil {
 		return nil, err
@@ -88,57 +95,85 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 
 	var resp *http.Response
 	var lastErrBody []byte
+	// GPT/OpenAI 会话切到 Grok 后，Codex 可能仍携带外来 previous_response_id。
+	// 同账号允许一次 drop-and-retry，并对孤儿 function_call_output 做可重建修复。
+	prevResponseRecovered := false
 	for i, baseURL := range tryBaseURLs {
-		upstreamReq, reqErr := buildGrokResponsesRequestWithBase(upstreamCtx, c, account, patchedBody, token, cacheIdentity, s.cfg, baseURL)
-		if reqErr != nil {
-			return nil, reqErr
+		for {
+			upstreamReq, reqErr := buildGrokResponsesRequestWithBase(upstreamCtx, c, account, patchedBody, token, cacheIdentity, s.cfg, baseURL)
+			if reqErr != nil {
+				return nil, reqErr
+			}
+			upstreamStart := time.Now()
+			currentResp, doErr := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
+			SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
+			if doErr != nil {
+				return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, doErr, false)
+			}
+			if currentResp.StatusCode < 400 {
+				resp = currentResp
+				break
+			}
+
+			respBody := s.readUpstreamErrorBody(currentResp)
+			_ = currentResp.Body.Close()
+			currentResp.Body = io.NopCloser(bytes.NewReader(respBody))
+			lastErrBody = respBody
+			upstreamMsg := sanitizeUpstreamErrorMessage(extractUpstreamErrorMessage(respBody))
+			if upstreamMsg == "" {
+				upstreamMsg = fmt.Sprintf("xAI upstream returned status %d", currentResp.StatusCode)
+			}
+			requestID := firstNonEmpty(currentResp.Header.Get("x-request-id"), currentResp.Header.Get("xai-request-id"))
+
+			// Cross-model / stale previous_response_id: drop anchor and repair orphan tool outputs once.
+			if !prevResponseRecovered &&
+				gjson.GetBytes(patchedBody, "previous_response_id").Exists() &&
+				(isOpenAICompatPreviousResponseNotFound(currentResp.StatusCode, upstreamMsg, respBody) ||
+					isOpenAICompatPreviousResponseUnsupported(currentResp.StatusCode, upstreamMsg, respBody) ||
+					isGrokOrphanFunctionCallOutputError(currentResp.StatusCode, upstreamMsg, respBody)) {
+				repairedBody, repaired, repairErr := dropGrokPreviousResponseIDAndRepairToolOutputs(patchedBody)
+				if repairErr == nil && repaired {
+					prevResponseRecovered = true
+					patchedBody = repairedBody
+					slog.Info("grok responses: previous_response_id unavailable, retrying without continuation",
+						"account_id", account.ID,
+						"upstream_model", upstreamModel,
+						"upstream_status", currentResp.StatusCode,
+						"upstream_request_id", requestID,
+					)
+					continue
+				}
+			}
+
+			// Same-account CLI -> public API fallback on 403 only.
+			if i == 0 && canFallbackGrokCLIProxyToPublicAPI(account, baseURL, currentResp.StatusCode) && len(tryBaseURLs) > 1 {
+				appendGrokCLIProxyFallbackOpsEvent(c, account, currentResp.StatusCode, requestID, "cli-chat-proxy 403, retrying same account on api.x.ai")
+				break
+			}
+
+			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+				Platform:           account.Platform,
+				AccountID:          account.ID,
+				AccountName:        account.Name,
+				UpstreamStatusCode: currentResp.StatusCode,
+				UpstreamRequestID:  requestID,
+				Kind:               "failover",
+				Message:            upstreamMsg,
+			})
+			s.handleGrokAccountUpstreamError(ctx, account, currentResp.StatusCode, currentResp.Header, respBody)
+			if s.shouldFailoverUpstreamError(currentResp.StatusCode) {
+				return nil, &UpstreamFailoverError{
+					StatusCode:             currentResp.StatusCode,
+					ResponseBody:           respBody,
+					ResponseHeaders:        currentResp.Header.Clone(),
+					RetryableOnSameAccount: account.IsPoolMode() && account.IsPoolModeRetryableStatus(currentResp.StatusCode),
+				}
+			}
+			return s.handleErrorResponse(ctx, currentResp, c, account, patchedBody, upstreamModel)
 		}
-		upstreamStart := time.Now()
-		currentResp, doErr := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
-		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
-		if doErr != nil {
-			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, doErr, false)
-		}
-		if currentResp.StatusCode < 400 {
-			resp = currentResp
+		if resp != nil {
 			break
 		}
-
-		respBody := s.readUpstreamErrorBody(currentResp)
-		_ = currentResp.Body.Close()
-		currentResp.Body = io.NopCloser(bytes.NewReader(respBody))
-		lastErrBody = respBody
-		upstreamMsg := sanitizeUpstreamErrorMessage(extractUpstreamErrorMessage(respBody))
-		if upstreamMsg == "" {
-			upstreamMsg = fmt.Sprintf("xAI upstream returned status %d", currentResp.StatusCode)
-		}
-		requestID := firstNonEmpty(currentResp.Header.Get("x-request-id"), currentResp.Header.Get("xai-request-id"))
-
-		// Same-account CLI -> public API fallback on 403 only.
-		if i == 0 && canFallbackGrokCLIProxyToPublicAPI(account, baseURL, currentResp.StatusCode) && len(tryBaseURLs) > 1 {
-			appendGrokCLIProxyFallbackOpsEvent(c, account, currentResp.StatusCode, requestID, "cli-chat-proxy 403, retrying same account on api.x.ai")
-			continue
-		}
-
-		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
-			Platform:           account.Platform,
-			AccountID:          account.ID,
-			AccountName:        account.Name,
-			UpstreamStatusCode: currentResp.StatusCode,
-			UpstreamRequestID:  requestID,
-			Kind:               "failover",
-			Message:            upstreamMsg,
-		})
-		s.handleGrokAccountUpstreamError(ctx, account, currentResp.StatusCode, currentResp.Header, respBody)
-		if s.shouldFailoverUpstreamError(currentResp.StatusCode) {
-			return nil, &UpstreamFailoverError{
-				StatusCode:             currentResp.StatusCode,
-				ResponseBody:           respBody,
-				ResponseHeaders:        currentResp.Header.Clone(),
-				RetryableOnSameAccount: account.IsPoolMode() && account.IsPoolModeRetryableStatus(currentResp.StatusCode),
-			}
-		}
-		return s.handleErrorResponse(ctx, currentResp, c, account, patchedBody, upstreamModel)
 	}
 	if resp == nil {
 		return nil, fmt.Errorf("grok upstream returned no successful response")
@@ -251,6 +286,12 @@ func patchGrokResponsesBody(body []byte, upstreamModel string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 跨模型/自包含续链：input 已能独立重建时剥离外来 previous_response_id，
+	// 避免 GPT 会话的 resp_* 锚点被带到 xAI。
+	out, err = sanitizeGrokResponsesPreviousResponseID(out)
+	if err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -351,7 +392,9 @@ func deleteJSONFields(value any, fields map[string]struct{}) bool {
 // sanitizeGrokResponsesModelInput 只处理 xAI Responses ModelInput 明确不能反序列化的
 // OpenAI/Codex 专有 item。普通 message、function_call_output 尽量保留；function_call 的
 // arguments 保持为“JSON object 的字符串”（OpenAI 形态）。xAI 既不接受字段级 object，
-// 也不接受解析后不是 object 的 arguments 字符串。previous_response_id 也保留。
+// 也不接受解析后不是 object 的 arguments 字符串。
+// previous_response_id 由 sanitizeGrokResponsesPreviousResponseID 决定是否保留：
+// input 自包含时可剥离（兼容 GPT→Grok），仅依赖 previous 的工具续链则保留。
 func sanitizeGrokResponsesModelInput(body []byte) ([]byte, error) {
 	input := gjson.GetBytes(body, "input")
 	if !input.IsArray() {
@@ -383,6 +426,168 @@ func sanitizeGrokResponsesModelInput(body []byte) ([]byte, error) {
 		return nil, err
 	}
 	return sjson.SetRawBytes(body, "input", encoded)
+}
+
+// sanitizeGrokResponsesPreviousResponseID 在 Grok HTTP 路径上处理跨模型续链锚点。
+// Codex 从 GPT 切到 Grok 后常仍携带 OpenAI 的 previous_response_id；xAI 无法解析外来
+// resp_*。当 input 已自包含（无工具输出，或每个 function_call_output 都能在 input 内
+// 找到同 call_id 的 function_call 上下文）时主动剥离 previous_response_id。
+// 若工具输出仍依赖 previous（孤儿 output / 仅靠 item_reference），则保留，留给上游
+// 失败后的 drop-and-retry 路径再修复。
+func sanitizeGrokResponsesPreviousResponseID(body []byte) ([]byte, error) {
+	prev := strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String())
+	if prev == "" {
+		// 空字符串 / null 也清掉，避免 xAI 因空锚点 400。
+		if gjson.GetBytes(body, "previous_response_id").Exists() {
+			return sjson.DeleteBytes(body, "previous_response_id")
+		}
+		return body, nil
+	}
+
+	coverage := AnalyzeToolCallOutputContextCoverageBytes(body)
+	if coverage.HasFunctionCallOutput && !coverage.ContextCoversAllCallIDs {
+		// 仍依赖 previous 解析工具 call；同平台 Grok 续链需要保留。
+		return body, nil
+	}
+	return sjson.DeleteBytes(body, "previous_response_id")
+}
+
+// dropGrokPreviousResponseIDAndRepairToolOutputs 用于 previous_response 不可用时的同账号重试：
+//  1. 去掉 previous_response_id
+//  2. 把缺少对应 function_call 上下文的 function_call_output 转成 message，避免
+//     “No tool call found for function call output”。
+func dropGrokPreviousResponseIDAndRepairToolOutputs(body []byte) ([]byte, bool, error) {
+	if len(body) == 0 {
+		return body, false, nil
+	}
+	out := body
+	changed := false
+	if gjson.GetBytes(out, "previous_response_id").Exists() {
+		next, err := sjson.DeleteBytes(out, "previous_response_id")
+		if err != nil {
+			return body, false, err
+		}
+		out = next
+		changed = true
+	}
+	repaired, repairChanged, err := repairGrokOrphanFunctionCallOutputs(out)
+	if err != nil {
+		return body, false, err
+	}
+	if repairChanged {
+		out = repaired
+		changed = true
+	}
+	return out, changed, nil
+}
+
+func isGrokOrphanFunctionCallOutputError(statusCode int, upstreamMsg string, upstreamBody []byte) bool {
+	if statusCode != http.StatusBadRequest && statusCode != http.StatusUnprocessableEntity {
+		return false
+	}
+	check := func(s string) bool {
+		lower := strings.ToLower(strings.TrimSpace(s))
+		if lower == "" {
+			return false
+		}
+		return (strings.Contains(lower, "no tool call found") && strings.Contains(lower, "function call output")) ||
+			(strings.Contains(lower, "tool call") && strings.Contains(lower, "function_call_output") && strings.Contains(lower, "not found")) ||
+			strings.Contains(lower, "no tool call found for function call output")
+	}
+	if check(upstreamMsg) || check(string(upstreamBody)) {
+		return true
+	}
+	return check(gjson.GetBytes(upstreamBody, "error.code").String()) ||
+		check(gjson.GetBytes(upstreamBody, "error.message").String())
+}
+
+// repairGrokOrphanFunctionCallOutputs 将缺少同 call_id 的 function_call 上下文的
+// function_call_output 折叠为 user message，保证剥离 previous / item_reference 后
+// input 仍可被 xAI 接受。已有匹配 function_call 的输出保持不变。
+func repairGrokOrphanFunctionCallOutputs(body []byte) ([]byte, bool, error) {
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return body, false, nil
+	}
+
+	contextIDs := map[string]struct{}{}
+	input.ForEach(func(_, item gjson.Result) bool {
+		if !item.IsObject() {
+			return true
+		}
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if !isCodexToolCallContextItemType(itemType) && itemType != "function_call" {
+			return true
+		}
+		callID := strings.TrimSpace(firstNonEmptyString(item.Get("call_id").String(), item.Get("id").String()))
+		if callID != "" {
+			contextIDs[callID] = struct{}{}
+		}
+		return true
+	})
+
+	items := input.Array()
+	kept := make([]json.RawMessage, 0, len(items))
+	changed := false
+	for _, item := range items {
+		if !item.IsObject() {
+			kept = append(kept, json.RawMessage(item.Raw))
+			continue
+		}
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if !isCodexToolCallOutputItemType(itemType) && itemType != "function_call_output" {
+			kept = append(kept, json.RawMessage(item.Raw))
+			continue
+		}
+		callID := strings.TrimSpace(firstNonEmptyString(item.Get("call_id").String(), item.Get("id").String()))
+		if callID != "" {
+			if _, ok := contextIDs[callID]; ok {
+				kept = append(kept, json.RawMessage(item.Raw))
+				continue
+			}
+		}
+		// 孤儿工具输出：折叠成可读 message，避免断链后 400。
+		output := ""
+		if item.Get("output").Exists() {
+			if item.Get("output").Type == gjson.String {
+				output = item.Get("output").String()
+			} else {
+				output = item.Get("output").Raw
+			}
+		}
+		text := strings.TrimSpace(output)
+		if text == "" {
+			changed = true
+			continue
+		}
+		if callID != "" {
+			text = "Tool result (" + callID + "):\n" + text
+		} else {
+			text = "Tool result:\n" + text
+		}
+		raw, keep, _, err := marshalGrokModelInputMessage("user", text)
+		if err != nil {
+			return body, false, err
+		}
+		if !keep {
+			changed = true
+			continue
+		}
+		kept = append(kept, raw)
+		changed = true
+	}
+	if !changed {
+		return body, false, nil
+	}
+	encoded, err := json.Marshal(kept)
+	if err != nil {
+		return body, false, err
+	}
+	out, err := sjson.SetRawBytes(body, "input", encoded)
+	if err != nil {
+		return body, false, err
+	}
+	return out, true, nil
 }
 
 func normalizeGrokResponsesModelInputItem(item gjson.Result) (json.RawMessage, bool, bool, error) {
@@ -925,11 +1130,11 @@ func marshalGrokCodexCanonicalFunctionTool(name string, tool gjson.Result) (json
 					"description": "Optional working directory.",
 				},
 				"yield_time_ms": map[string]any{
-					"type":        "number",
+					"type":        "integer",
 					"description": "Optional wait before yielding output.",
 				},
 				"max_output_tokens": map[string]any{
-					"type":        "number",
+					"type":        "integer",
 					"description": "Optional output token budget.",
 				},
 				"login": map[string]any{
@@ -960,7 +1165,7 @@ func marshalGrokCodexCanonicalFunctionTool(name string, tool gjson.Result) (json
 			"type": "object",
 			"properties": map[string]any{
 				"session_id": map[string]any{
-					"type":        "number",
+					"type":        "integer",
 					"description": "Identifier of the running unified exec session.",
 				},
 				"chars": map[string]any{
@@ -968,11 +1173,11 @@ func marshalGrokCodexCanonicalFunctionTool(name string, tool gjson.Result) (json
 					"description": "Bytes to write to stdin.",
 				},
 				"yield_time_ms": map[string]any{
-					"type":        "number",
+					"type":        "integer",
 					"description": "Optional wait before yielding output.",
 				},
 				"max_output_tokens": map[string]any{
-					"type":        "number",
+					"type":        "integer",
 					"description": "Optional output token budget.",
 				},
 			},
@@ -1866,9 +2071,54 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 	case http.StatusUnauthorized:
 		s.tempUnscheduleGrok(ctx, account, 10*time.Minute, "grok credentials unauthorized")
 	case http.StatusForbidden:
-		// CLI-proxy 403 is often entitlement-bound for a single request path and may
-		// still succeed on the public API same-account fallback. Keep a short cooldown
-		// so one 403 does not long-block the account. Public API 403s stay short too.
+		// Free-usage exhaustion can arrive as 403/429; keep recoverable rate-limit semantics.
+		if freeInfo := xai.ParseFreeUsageExhaustedBody(responseBody); freeInfo != nil && freeInfo.Exhausted {
+			cooldown := freeInfo.Cooldown
+			if cooldown <= 0 {
+				cooldown = xai.DefaultFreeUsageCooldown
+			}
+			until := now.Add(cooldown)
+			if account.RateLimitResetAt != nil && account.RateLimitResetAt.After(until) {
+				until = *account.RateLimitResetAt
+			}
+			if s.accountRepo != nil {
+				persistGrokRateLimit(ctx, s.accountRepo, account, until)
+				_ = s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{
+					"grok_free_usage_exhausted":      true,
+					"grok_free_usage_error_code":     freeInfo.ErrorCode,
+					"grok_free_usage_window":         freeInfo.Window,
+					"grok_free_usage_model":          freeInfo.Model,
+					"grok_free_usage_cooldown_until": until.UTC().Format(time.RFC3339),
+				})
+			}
+			return
+		}
+
+		// True permission/entitlement denials should leave the active pool.
+		// Prefer sticky error immediately for explicit permission-denied bodies;
+		// otherwise escalate after consecutive 403s to avoid endless short cooldowns.
+		if IsGrokPermissionDeniedBody(responseBody) {
+			if s.accountRepo != nil {
+				stateCtx, cancel := openAIAccountStateContext(ctx)
+				defer cancel()
+				_ = s.accountRepo.SetError(stateCtx, account.ID, grokHoldUntilSuccessReason)
+				MarkGrokHoldUntilSuccess(stateCtx, s.accountRepo, account)
+			}
+			account.Status = StatusError
+			account.Schedulable = false
+			account.ErrorMessage = grokHoldUntilSuccessReason
+			account.TempUnschedulableUntil = nil
+			account.TempUnschedulableReason = ""
+			s.BlockAccountScheduling(account, time.Time{}, grokHoldUntilSuccessReason)
+			return
+		}
+		if s.rateLimitService != nil {
+			upstreamMsg := strings.TrimSpace(string(responseBody))
+			if s.rateLimitService.EscalateGrokForbiddenOn403(ctx, account, upstreamMsg, responseBody) {
+				return
+			}
+		}
+		// Ambiguous 403: short cooldown only.
 		cooldown := 2 * time.Minute
 		reason := "grok upstream 403"
 		if account.IsGrokOAuth() && xai.IsCLIChatProxyBaseURL(account.GetGrokBaseURL()) {
@@ -1878,13 +2128,37 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 		}
 		s.tempUnscheduleGrok(ctx, account, cooldown, reason)
 	case http.StatusTooManyRequests:
-		// updateGrokUsageSnapshot installs both runtime and durable rate-limit state.
+		// updateGrokUsageSnapshot 只在快照能解析出有效配额窗口/retry-after 时才落库限流。
+		// 但 cli-chat-proxy 的 429 常不带配额头(headers_observed=false)：此时上面既不写 DB
+		// 限流、也不设有效冷却窗口，账号会以"DB 可用"状态被反复重新调度、持续 429，形成
+		// "仪表盘一直显示可用、请求一直失败"的死循环，且耗尽状态无法经 runtime 同步回本机探测。
+		// 这里补一层显式兜底：按上游语义解析冷却时长(free-usage 耗尽=滚动窗口默认 24h，普通
+		// 429=2min 或 retry-after)，durable 落 rate_limit_reset_at + 设内存封禁，与探测路径
+		// ApplyGrokProbeOrTestStatus 的 429 处理保持一致，让耗尽账号即时退出调度并可被同步/探测。
+		cooldown, _, freeInfo, _ := xai.ResolveGrokCooldown(statusCode, headers, responseBody)
+		if cooldown <= 0 {
+			cooldown = 2 * time.Minute
+		}
+		until := now.Add(cooldown)
+		// 已有更晚的限流窗口时不缩短(与 403 free-usage 分支一致)。
+		if account.RateLimitResetAt != nil && account.RateLimitResetAt.After(until) {
+			until = *account.RateLimitResetAt
+		}
+		s.rateLimitGrok(ctx, account, until)
+		if freeInfo != nil && freeInfo.Exhausted && s.accountRepo != nil {
+			_ = s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{
+				"grok_free_usage_exhausted":      true,
+				"grok_free_usage_error_code":     freeInfo.ErrorCode,
+				"grok_free_usage_window":         freeInfo.Window,
+				"grok_free_usage_model":          freeInfo.Model,
+				"grok_free_usage_cooldown_until": until.UTC().Format(time.RFC3339),
+			})
+		}
 	default:
 		if statusCode >= 500 {
 			s.tempUnscheduleGrok(ctx, account, 2*time.Minute, "grok upstream temporary error")
 		}
 	}
-	_ = responseBody
 }
 
 func (s *OpenAIGatewayService) tempUnscheduleGrok(ctx context.Context, account *Account, cooldown time.Duration, reason string) {

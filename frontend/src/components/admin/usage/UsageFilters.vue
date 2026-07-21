@@ -84,6 +84,12 @@
           <Select v-model="filters.model" :options="modelOptions" searchable @change="emitChange" />
         </div>
 
+        <!-- Ingress Node Filter -->
+        <div class="w-full sm:w-auto sm:min-w-[220px]">
+          <label class="input-label">{{ t('admin.usage.ingressNode') }}</label>
+          <Select v-model="filters.ingress_node" :options="ingressNodeOptions" @change="emitChange" />
+        </div>
+
         <!-- Account Filter -->
         <div ref="accountSearchRef" class="usage-filter-dropdown relative w-full sm:w-auto sm:min-w-[220px]">
           <label class="input-label">{{ t('admin.usage.account') }}</label>
@@ -256,6 +262,13 @@ let accountSearchTimeout: ReturnType<typeof setTimeout> | null = null
 const modelOptions = computed<SelectOption[]>(() => [
   { value: null, label: t('admin.usage.allModels') },
   ...(props.modelOptions ?? []).map((m) => ({ value: m, label: m })),
+])
+
+// 入口节点：与 LOG_SERVICE_NAME 对齐（本机 sub2api-home-local / VPS standby sub2api-standby）
+const ingressNodeOptions = computed<SelectOption[]>(() => [
+  { value: null, label: t('admin.usage.allIngressNodes') },
+  { value: 'sub2api-home-local', label: 'sub2api-home-local' },
+  { value: 'sub2api-standby', label: 'sub2api-standby' },
 ])
 const groupOptions = ref<SelectOption[]>([{ value: null, label: t('admin.usage.allGroups') }])
 

@@ -376,6 +376,162 @@ func TestPatchGrokResponsesBodySanitizesUnsupportedModelInputItems(t *testing.T)
 	require.Equal(t, "keep raw message", gjson.GetBytes(patched, "input.4.content").String())
 }
 
+func TestPatchGrokResponsesBody_DropsPreviousResponseIDWhenInputSelfContained(t *testing.T) {
+	t.Parallel()
+
+	// GPT→Grok 跨模型：input 已是完整历史时，外来 previous_response_id 应剥离。
+	body := []byte(`{
+		"model": "gpt-5.4",
+		"previous_response_id": "resp_openai_from_gpt_session",
+		"input": [
+			{"type":"message","role":"user","content":"continue"},
+			{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"/tmp"}
+		],
+		"tools":[{"type":"function","name":"exec_command","parameters":{"type":"object"}}]
+	}`)
+
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.True(t, json.Valid(patched))
+	require.False(t, gjson.GetBytes(patched, "previous_response_id").Exists(),
+		"self-contained tool history must not keep foreign previous_response_id on Grok")
+	require.Equal(t, "function_call", gjson.GetBytes(patched, "input.1.type").String())
+	require.Equal(t, "function_call_output", gjson.GetBytes(patched, "input.2.type").String())
+	require.Equal(t, "call_1", gjson.GetBytes(patched, "input.2.call_id").String())
+}
+
+func TestPatchGrokResponsesBody_KeepsPreviousResponseIDForOrphanToolOutput(t *testing.T) {
+	t.Parallel()
+
+	// 仅有 function_call_output、无 inline function_call：仍依赖 previous 解析 call。
+	body := []byte(`{
+		"model": "gpt-5.4",
+		"previous_response_id": "resp_grok_same_platform",
+		"input": [
+			{"type":"item_reference","id":"call_only_in_prev"},
+			{"type":"function_call_output","call_id":"call_only_in_prev","output":"tool done"}
+		]
+	}`)
+
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.Equal(t, "resp_grok_same_platform", gjson.GetBytes(patched, "previous_response_id").String(),
+		"orphan tool outputs still need previous_response_id until recovery repair")
+	require.False(t, gjson.GetBytes(patched, `input.#(type=="item_reference")`).Exists())
+	require.Equal(t, "function_call_output", gjson.GetBytes(patched, "input.0.type").String())
+}
+
+func TestPatchGrokResponsesBody_DropsEmptyPreviousResponseID(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model": "gpt-5.4",
+		"previous_response_id": "",
+		"input": [{"type":"message","role":"user","content":"hi"}]
+	}`)
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.False(t, gjson.GetBytes(patched, "previous_response_id").Exists())
+}
+
+func TestDropGrokPreviousResponseIDAndRepairToolOutputs(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model": "grok-4.5",
+		"previous_response_id": "resp_openai_stale",
+		"input": [
+			{"type":"message","role":"user","content":"go on"},
+			{"type":"function_call_output","call_id":"call_orphan","output":"shell result"},
+			{"type":"function_call","call_id":"call_ok","name":"exec_command","arguments":"{\"cmd\":\"ls\"}"},
+			{"type":"function_call_output","call_id":"call_ok","output":"a.txt"}
+		]
+	}`)
+
+	repaired, changed, err := dropGrokPreviousResponseIDAndRepairToolOutputs(body)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.False(t, gjson.GetBytes(repaired, "previous_response_id").Exists())
+	// orphan output folded to message; matched output kept
+	require.Equal(t, "message", gjson.GetBytes(repaired, "input.1.type").String())
+	require.Equal(t, "user", gjson.GetBytes(repaired, "input.1.role").String())
+	require.Contains(t, gjson.GetBytes(repaired, "input.1.content").String(), "call_orphan")
+	require.Contains(t, gjson.GetBytes(repaired, "input.1.content").String(), "shell result")
+	require.Equal(t, "function_call", gjson.GetBytes(repaired, "input.2.type").String())
+	require.Equal(t, "function_call_output", gjson.GetBytes(repaired, "input.3.type").String())
+	require.Equal(t, "call_ok", gjson.GetBytes(repaired, "input.3.call_id").String())
+}
+
+func TestIsGrokOrphanFunctionCallOutputError(t *testing.T) {
+	t.Parallel()
+	require.True(t, isGrokOrphanFunctionCallOutputError(
+		400,
+		`No tool call found for function call output`,
+		[]byte(`{"error":{"message":"No tool call found for function call output with call_id=call_x"}}`),
+	))
+	require.False(t, isGrokOrphanFunctionCallOutputError(429, "rate limited", nil))
+}
+
+func TestForwardGrokResponses_RetriesAfterDroppingStalePreviousResponseID(t *testing.T) {
+	t.Setenv(xai.EnvAllowUnsafeURLOverrides, "true")
+	gin.SetMode(gin.TestMode)
+
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		{
+			StatusCode: http.StatusBadRequest,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"error":{"code":"previous_response_not_found","message":"Previous response not found"}}`,
+			)),
+		},
+		{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"id":"resp_grok_recovered","object":"response","model":"grok-4.5","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}`,
+			)),
+		},
+	}}
+	svc := &OpenAIGatewayService{httpUpstream: upstream}
+	account := &Account{
+		ID:          42,
+		Name:        "grok",
+		Platform:    PlatformGrok,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"base_url": "https://api.x.ai/v1",
+			"api_key":  "xai-test",
+		},
+	}
+
+	// 孤儿 tool output + 外来 previous：首次 patch 会保留 previous，上游 400 后 drop+repair 重试。
+	body := []byte(`{
+		"model":"gpt-5.4",
+		"stream":false,
+		"previous_response_id":"resp_openai_stale_from_gpt",
+		"input":[
+			{"type":"message","role":"user","content":"continue"},
+			{"type":"function_call_output","call_id":"call_orphan","output":"done"}
+		]
+	}`)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	result, err := svc.forwardGrokResponses(context.Background(), c, account, body, "gpt-5.4", false, time.Now())
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "resp_grok_recovered", result.ResponseID)
+	require.Len(t, upstream.bodies, 2)
+	require.Equal(t, "resp_openai_stale_from_gpt", gjson.GetBytes(upstream.bodies[0], "previous_response_id").String())
+	require.False(t, gjson.GetBytes(upstream.bodies[1], "previous_response_id").Exists())
+	require.Equal(t, "message", gjson.GetBytes(upstream.bodies[1], "input.1.type").String())
+	require.Contains(t, gjson.GetBytes(upstream.bodies[1], "input.1.content").String(), "call_orphan")
+}
+
 func TestBuildGrokResponsesRequestUsesAccountBaseURLAndBearerToken(t *testing.T) {
 	t.Setenv(xai.EnvAllowUnsafeURLOverrides, "true")
 
@@ -1759,6 +1915,24 @@ func TestHandleGrokAccountUpstreamErrorTempUnschedulesNonRateLimitStates(t *test
 	}
 }
 
+func TestHandleGrokAccountUpstreamErrorPermissionDeniedMarksError(t *testing.T) {
+	account := &Account{ID: 71, Platform: PlatformGrok, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true}
+	repo := &grokQuotaAccountRepo{}
+	svc := &OpenAIGatewayService{accountRepo: repo}
+
+	body := []byte(`{"code":"permission-denied","error":"Access to the chat endpoint is denied."}`)
+	svc.handleGrokAccountUpstreamError(context.Background(), account, http.StatusForbidden, nil, body)
+
+	require.Equal(t, 1, repo.setErrorCalls)
+	require.Equal(t, account.ID, repo.lastErrorID)
+	require.Equal(t, grokHoldUntilSuccessReason, repo.lastErrorMsg)
+	require.Zero(t, repo.tempUnschedCalls)
+	require.Equal(t, StatusError, account.Status)
+	require.False(t, account.Schedulable)
+	require.True(t, GrokAccountRequiresSuccessBeforeSchedule(account))
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
 func TestHandleGrokAccountUpstreamError429SetsRateLimitedFromRetryAfter(t *testing.T) {
 	account := &Account{ID: 61, Platform: PlatformGrok, Type: AccountTypeOAuth}
 	repo := &grokQuotaAccountRepo{}
@@ -2405,7 +2579,6 @@ func TestPatchGrokResponsesBodyDoesNotRequireToolChoiceAfterToolOutput(t *testin
 	require.Equal(t, "cmd", gjson.GetBytes(patched, "tools.0.parameters.required.0").String())
 }
 
-
 func TestForwardGrokResponsesFallsBackToPublicAPIOnCLIProxy403(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -2433,8 +2606,7 @@ func TestForwardGrokResponsesFallsBackToPublicAPIOnCLIProxy403(t *testing.T) {
 		"",
 		"data: [DONE]",
 		"",
-	}, "
-")
+	}, "\n")
 	upstream := &httpUpstreamRecorder{responses: []*http.Response{
 		{
 			StatusCode: http.StatusForbidden,

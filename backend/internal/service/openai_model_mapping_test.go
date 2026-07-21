@@ -387,3 +387,27 @@ func TestUsageBillingModelCandidatesPreserveGPT55ProModel(t *testing.T) {
 		}
 	}
 }
+
+
+func TestResolveOpenAIForwardModelForContext_InferredVisionCatalog(t *testing.T) {
+	account := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"model_mapping": map[string]any{
+				"gpt-*":                              "z-ai/glm-5.2",
+				"meta/llama-3.2-11b-vision-instruct": "meta/llama-3.2-11b-vision-instruct",
+			},
+		},
+	}
+	// Text path still uses glm default.
+	if got := resolveOpenAIForwardModelForContext(context.Background(), account, "gpt-5.5", ""); got != "z-ai/glm-5.2" {
+		t.Fatalf("text path model = %q, want z-ai/glm-5.2", got)
+	}
+
+	// Image path remaps to a catalog VL model on the same account.
+	visionCtx := WithOpenAIImageInputIntent(context.Background())
+	if got := resolveOpenAIForwardModelForContext(visionCtx, account, "gpt-5.5", ""); got != "meta/llama-3.2-11b-vision-instruct" {
+		t.Fatalf("vision path model = %q, want meta/llama-3.2-11b-vision-instruct", got)
+	}
+}

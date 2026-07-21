@@ -141,6 +141,9 @@ type OAuthRefreshAPI struct {
 	tokenCache  GeminiTokenCache // 可选，nil = 无分布式锁
 	lockTTL     time.Duration
 	localLocks  sync.Map // key: cacheKey string -> value: *contextMutex
+
+	// 可选：本机 Anthropic setup-token 刷新成功后立刻推 VPS
+	anthropicSetupTokenVPSSync *anthropicSetupTokenVPSSyncTrigger
 }
 
 // NewOAuthRefreshAPI 创建统一刷新 API
@@ -155,6 +158,23 @@ func NewOAuthRefreshAPI(accountRepo AccountRepository, tokenCache GeminiTokenCac
 		tokenCache:  tokenCache,
 		lockTTL:     ttl,
 	}
+}
+
+// SetAnthropicSetupTokenVPSSync 注入 setup-token 刷新成功后的 VPS 同步触发器（本机权威节点用）。
+func (api *OAuthRefreshAPI) SetAnthropicSetupTokenVPSSync(trigger *anthropicSetupTokenVPSSyncTrigger) {
+	if api == nil {
+		return
+	}
+	api.anthropicSetupTokenVPSSync = trigger
+}
+
+// NotifyAnthropicSetupTokenRefreshed 供管理端 /refresh 等非 RefreshIfNeeded 路径调用。
+// 仅 Anthropic setup-token 且本机开启即时推 VPS 时生效；内部防抖。
+func (api *OAuthRefreshAPI) NotifyAnthropicSetupTokenRefreshed(account *Account) {
+	if api == nil || api.anthropicSetupTokenVPSSync == nil {
+		return
+	}
+	api.anthropicSetupTokenVPSSync.NotifyRefreshed(account)
 }
 
 // getLocalLock 返回指定 cacheKey 的进程内互斥锁
@@ -380,6 +400,11 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 		if eligibilityErr := grokOAuthRequestAccountEligibilityError(freshAccount); eligibilityErr != nil {
 			return nil, withGrokCredentialFailureSnapshot(eligibilityErr, freshAccount)
 		}
+	}
+
+	// 本机 setup-token 刷新成功：异步触发 VPS 同步（请求路径与后台路径共用）。
+	if api.anthropicSetupTokenVPSSync != nil {
+		api.anthropicSetupTokenVPSSync.NotifyRefreshed(freshAccount)
 	}
 
 	return &OAuthRefreshResult{

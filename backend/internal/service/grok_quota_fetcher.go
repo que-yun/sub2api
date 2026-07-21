@@ -12,6 +12,11 @@ import (
 
 const grokQuotaSnapshotExtraKey = "grok_usage_snapshot"
 
+// grokNegativeSnapshotFreshWindow is how long a negative probe snapshot (401/403)
+// remains assertive in UI/quota summary. Older negatives are treated as stale so
+// a recovered account is not permanently red-flagged by an old failure.
+const grokNegativeSnapshotFreshWindow = 6 * time.Hour
+
 type GrokQuotaFetcher struct{}
 
 func NewGrokQuotaFetcher() *GrokQuotaFetcher {
@@ -102,10 +107,22 @@ func (f *GrokQuotaFetcher) BuildUsageInfo(account *Account) *UsageInfo {
 
 	if usage.ErrorCode == "" {
 		switch snapshot.StatusCode {
-		case 401:
-			usage.NeedsReauth = true
-			usage.ErrorCode = "unauthenticated"
-		case 403:
+		case 401, 403:
+			stale := false
+			if parsedAt, parseErr := time.Parse(time.RFC3339, snapshot.UpdatedAt); parseErr == nil {
+				if time.Since(parsedAt) > grokNegativeSnapshotFreshWindow {
+					stale = true
+				}
+			}
+			if stale {
+				usage.GrokQuotaSnapshotState = "stale"
+				break
+			}
+			if snapshot.StatusCode == 401 {
+				usage.NeedsReauth = true
+				usage.ErrorCode = "unauthenticated"
+				break
+			}
 			usage.IsForbidden = true
 			usage.ForbiddenType = "forbidden"
 			usage.ErrorCode = "forbidden"

@@ -5,6 +5,8 @@ REMOTE_EXEC_TARGET="${REMOTE_EXEC_TARGET:-root@100.99.28.61}"
 SSH_PORT="${SSH_PORT:-}"
 SSH_IDENTITY_FILE="${SSH_IDENTITY_FILE:-}"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-15}"
+SSH_RETRIES="${SSH_RETRIES:-4}"
+SSH_RETRY_SLEEP_SECONDS="${SSH_RETRY_SLEEP_SECONDS:-8}"
 REMOTE_QUERY_TIMEOUT_SECONDS="${REMOTE_QUERY_TIMEOUT_SECONDS:-45}"
 LOCAL_PG_CONTAINER="${LOCAL_PG_CONTAINER:-sub2api-postgres}"
 LOCAL_PG_SOURCE="${LOCAL_PG_SOURCE:-host}"
@@ -45,8 +47,8 @@ local_psql() {
 ssh_args=(
   -o BatchMode=yes
   -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}"
-  -o ServerAliveInterval=10
-  -o ServerAliveCountMax=3
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=4
   -o StrictHostKeyChecking=accept-new
 )
 if [[ -n "${SSH_PORT}" ]]; then
@@ -56,9 +58,26 @@ if [[ -n "${SSH_IDENTITY_FILE}" ]]; then
   ssh_args+=(-i "${SSH_IDENTITY_FILE}" -o IdentitiesOnly=yes)
 fi
 
+
+remote_exec() {
+  local attempt=1
+  local rc=0
+  while true; do
+    ssh "${ssh_args[@]}" "${REMOTE_EXEC_TARGET}" "$@" && return 0
+    rc=$?
+    if (( attempt >= SSH_RETRIES )); then
+      return "${rc}"
+    fi
+    echo "remote_exec failed (exit=${rc}), retry ${attempt}/${SSH_RETRIES} in ${SSH_RETRY_SLEEP_SECONDS}s ..." >&2
+    sleep "${SSH_RETRY_SLEEP_SECONDS}"
+    attempt=$((attempt + 1))
+  done
+}
+
+
 echo "Pulling VPS OpenAI OAuth runtime fields ..."
 echo "VPS runtime permanent error import: ${VPS_RUNTIME_PULL_IMPORT_PERMANENT_ERRORS}"
-ssh "${ssh_args[@]}" "${REMOTE_EXEC_TARGET}" "timeout $(printf "%q" "${REMOTE_QUERY_TIMEOUT_SECONDS}") docker exec sub2api-standby-postgres psql -U $(printf "%q" "${PGUSER}") -d $(printf "%q" "${PGDATABASE}") -v ON_ERROR_STOP=1 -c \"
+remote_exec "timeout $(printf "%q" "${REMOTE_QUERY_TIMEOUT_SECONDS}") docker exec sub2api-standby-postgres psql -U $(printf "%q" "${PGUSER}") -d $(printf "%q" "${PGDATABASE}") -v ON_ERROR_STOP=1 -c \"
 COPY (
   SELECT
     id,

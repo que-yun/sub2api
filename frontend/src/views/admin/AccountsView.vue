@@ -327,6 +327,7 @@
           <template #cell-today_stats="{ row }">
             <AccountTodayStatsCell
               :stats="todayStatsByAccountId[String(row.id)] ?? null"
+              :lifetime-stats="lifetimeStatsByAccountId[String(row.id)] ?? null"
               :loading="todayStatsLoading"
               :error="todayStatsError"
             />
@@ -345,6 +346,7 @@
               :account="row"
               :today-stats="todayStatsByAccountId[String(row.id)] ?? null"
               :today-stats-loading="todayStatsLoading"
+              :lifetime-stats="lifetimeStatsByAccountId[String(row.id)] ?? null"
               :manual-refresh-token="usageManualRefreshToken"
             />
           </template>
@@ -689,6 +691,7 @@ const AUTO_REFRESH_SILENT_WINDOW_MS = 15000
 const autoRefreshSilentUntil = ref(0)
 const hasPendingListSync = ref(false)
 const todayStatsByAccountId = ref<Record<string, WindowStats>>({})
+const lifetimeStatsByAccountId = ref<Record<string, WindowStats>>({})
 const todayStatsLoading = ref(false)
 const todayStatsError = ref<string | null>(null)
 const todayStatsReqSeq = ref(0)
@@ -705,7 +708,7 @@ const buildDefaultTodayStats = (): WindowStats => ({
 
 const refreshTodayStatsBatch = async () => {
   // Why this checks both columns:
-  // - today_stats column shows dedicated today's metrics.
+  // - today_stats column shows dedicated today's metrics + lifetime totals.
   // - usage column also embeds today's stats for Key/Bedrock rows.
   // So we only skip fetching when BOTH columns are hidden.
   if (hiddenColumns.has('today_stats') && hiddenColumns.has('usage')) {
@@ -718,6 +721,7 @@ const refreshTodayStatsBatch = async () => {
   const reqSeq = ++todayStatsReqSeq.value
   if (accountIDs.length === 0) {
     todayStatsByAccountId.value = {}
+    lifetimeStatsByAccountId.value = {}
     todayStatsError.value = null
     todayStatsLoading.value = false
     return
@@ -727,19 +731,26 @@ const refreshTodayStatsBatch = async () => {
   todayStatsError.value = null
 
   try {
-    const result = await adminAPI.accounts.getBatchTodayStats(accountIDs)
+    const [todayResult, lifetimeResult] = await Promise.all([
+      adminAPI.accounts.getBatchTodayStats(accountIDs),
+      adminAPI.accounts.getBatchLifetimeStats(accountIDs)
+    ])
     if (reqSeq !== todayStatsReqSeq.value) return
-    const serverStats = result.stats ?? {}
-    const nextStats: Record<string, WindowStats> = {}
+    const serverToday = todayResult.stats ?? {}
+    const serverLifetime = lifetimeResult.stats ?? {}
+    const nextToday: Record<string, WindowStats> = {}
+    const nextLifetime: Record<string, WindowStats> = {}
     for (const accountID of accountIDs) {
       const key = String(accountID)
-      nextStats[key] = serverStats[key] ?? buildDefaultTodayStats()
+      nextToday[key] = serverToday[key] ?? buildDefaultTodayStats()
+      nextLifetime[key] = serverLifetime[key] ?? buildDefaultTodayStats()
     }
-    todayStatsByAccountId.value = nextStats
+    todayStatsByAccountId.value = nextToday
+    lifetimeStatsByAccountId.value = nextLifetime
   } catch (error) {
     if (reqSeq !== todayStatsReqSeq.value) return
     todayStatsError.value = 'Failed'
-    console.error('Failed to load account today stats:', error)
+    console.error('Failed to load account today/lifetime stats:', error)
   } finally {
     if (reqSeq === todayStatsReqSeq.value) {
       todayStatsLoading.value = false
@@ -923,6 +934,7 @@ const {
     type: '',
     status: '',
     privacy_mode: '',
+    plan_type: '',
     group: '',
     search: '',
     include_scheduler_score: shouldIncludeSchedulerScore() ? '1' : '0',
@@ -1649,6 +1661,7 @@ const buildBulkEditFilterSnapshot = () => {
     group: typeof rawParams.group === 'string' ? rawParams.group : '',
     search: typeof rawParams.search === 'string' ? rawParams.search : '',
     privacy_mode: typeof rawParams.privacy_mode === 'string' ? rawParams.privacy_mode : '',
+    plan_type: typeof rawParams.plan_type === 'string' ? rawParams.plan_type : '',
     sort_by: typeof rawParams.sort_by === 'string' ? rawParams.sort_by : '',
     sort_order: sortOrder
   }
@@ -1699,6 +1712,7 @@ const buildAccountQueryFilters = () => ({
   status: params.status || '',
   group: params.group || '',
   privacy_mode: params.privacy_mode || '',
+  plan_type: params.plan_type || '',
   search: params.search || '',
   sort_by: sortState.sort_by,
   sort_order: sortState.sort_order
@@ -1707,6 +1721,20 @@ const accountMatchesCurrentFilters = (account: Account) => {
   const filters = buildAccountQueryFilters()
   if (filters.platform && account.platform !== filters.platform) return false
   if (filters.type && account.type !== filters.type) return false
+  if (filters.plan_type) {
+    const plan = (getAccountPlanType(account) || '').trim().toLowerCase().replace(/[\s_-]+/g, '')
+    const wanted = String(filters.plan_type).trim().toLowerCase().replace(/[\s_-]+/g, '')
+    if (!plan || plan !== wanted) {
+      // free filter also matches basic/grok free aliases used by badges
+      if (wanted === 'free') {
+        if (plan !== 'basic' && plan !== 'grokfree' && plan !== 'grokbasic' && plan !== 'freetier') return false
+      } else if (wanted === 'pro') {
+        if (plan !== 'chatgptpro') return false
+      } else {
+        return false
+      }
+    }
+  }
   if (filters.status) {
     const now = Date.now()
     const rateLimitResetAt = account.rate_limit_reset_at ? new Date(account.rate_limit_reset_at).getTime() : Number.NaN

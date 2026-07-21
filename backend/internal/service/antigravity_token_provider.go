@@ -33,6 +33,7 @@ type AntigravityTokenProvider struct {
 	executor                OAuthRefreshExecutor
 	refreshPolicy           ProviderRefreshPolicy
 	tempUnschedCache        TempUnschedCache // 用于同步更新 Redis 临时不可调度缓存
+	requestRefreshOff  bool // true: 请求路径不刷新，等待本机同步
 }
 
 func NewAntigravityTokenProvider(
@@ -64,6 +65,15 @@ func (p *AntigravityTokenProvider) SetTempUnschedCache(cache TempUnschedCache) {
 	p.tempUnschedCache = cache
 }
 
+// SetRequestRefreshEnabled controls refresh-token use from the request path.
+// Disable on VPS standby so only the local authority mints/rotates Antigravity OAuth tokens.
+func (p *AntigravityTokenProvider) SetRequestRefreshEnabled(enabled bool) {
+	if p == nil {
+		return
+	}
+	p.requestRefreshOff = !enabled
+}
+
 // GetAccessToken returns a valid access_token.
 func (p *AntigravityTokenProvider) GetAccessToken(ctx context.Context, account *Account) (string, error) {
 	if account == nil {
@@ -86,18 +96,31 @@ func (p *AntigravityTokenProvider) GetAccessToken(ctx context.Context, account *
 	}
 
 	cacheKey := AntigravityTokenCacheKey(account)
+	expiresAt := account.GetCredentialAsTime("expires_at")
+	accountAccessToken := strings.TrimSpace(account.GetCredential("access_token"))
 
-	// 1) Try cache first.
+	// 1) Try cache first. Only accept when cached AT matches DB credentials.
 	if p.tokenCache != nil {
-		if token, err := p.tokenCache.GetAccessToken(ctx, cacheKey); err == nil && strings.TrimSpace(token) != "" {
-			return token, nil
+		if token, err := p.tokenCache.GetAccessToken(ctx, cacheKey); err == nil {
+			cachedToken := strings.TrimSpace(token)
+			if cachedToken != "" && accountAccessToken != "" && cachedToken == accountAccessToken &&
+				(expiresAt == nil || time.Now().Before(*expiresAt)) {
+				return cachedToken, nil
+			}
 		}
 	}
 
 	// 2) Refresh if needed (pre-expiry skew).
-	expiresAt := account.GetCredentialAsTime("expires_at")
 	needsRefresh := expiresAt == nil || time.Until(*expiresAt) <= antigravityTokenRefreshSkew
-	if needsRefresh && p.refreshAPI != nil && p.executor != nil {
+	if needsRefresh && p.requestRefreshOff {
+		// VPS / 只读节点：不调用 token endpoint，沿用库内 access_token。
+		if expiresAt == nil || !time.Now().Before(*expiresAt) {
+			// 过期则临时冷却，等本机同步（不在 VPS 上 mint RT）。
+			p.markTempUnschedulable(account, errors.New("antigravity access_token expired; await local credential sync"))
+			return "", errors.New("antigravity access_token expired; await local credential sync")
+		}
+		// 仍在 skew 窗口内：继续用现有 access_token，不刷新。
+	} else if needsRefresh && p.refreshAPI != nil && p.executor != nil {
 		// 请求路径使用短超时，避免代理不通时阻塞过久（后台刷新服务会继续重试）
 		refreshCtx, cancel := context.WithTimeout(ctx, antigravityRequestRefreshTimeout)
 		defer cancel()

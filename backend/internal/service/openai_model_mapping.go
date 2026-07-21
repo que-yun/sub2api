@@ -34,6 +34,17 @@ func resolveOpenAIForwardModelForContext(ctx context.Context, account *Account, 
 				return mappedModel
 			}
 		}
+		// Same-account multimodal fallback: multi-model pools often map gpt-* to a
+		// text model (e.g. glm-5.2) while still shipping VL models in the catalog.
+		// Prefer rewriting the upstream model over failing or hopping accounts.
+		if mappedModel, matched := account.ResolveInferredVisionModel(requestedModel); matched {
+			return mappedModel
+		}
+		if messagesDispatchMappedModel != "" {
+			if mappedModel, matched := account.ResolveInferredVisionModel(messagesDispatchMappedModel); matched {
+				return mappedModel
+			}
+		}
 	}
 
 	mappedModel, matched := account.ResolveMappedModel(requestedModel)

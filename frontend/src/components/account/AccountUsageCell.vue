@@ -40,7 +40,12 @@
         <div v-if="usageInfo.error" class="text-xs text-amber-600 dark:text-amber-400 truncate max-w-[200px]" :title="usageInfo.error">
           {{ usageInfo.error }}
         </div>
-        <!-- 5h Window -->
+
+        <!--
+          Anthropic 用量列只展示配额窗口 + 对应本地 window_stats。
+          今日/历史已有「今日统计」列（AccountTodayStatsCell），这里再画会和 5h/7d 本地数叠在一起。
+        -->
+        <!-- 5h：上游配额% + 本地 session 窗统计 -->
         <UsageProgressBar
           v-if="usageInfo.five_hour"
           label="5h"
@@ -50,12 +55,13 @@
           color="indigo"
         />
 
-        <!-- 7d Window (OAuth only) -->
+        <!-- 7d：上游配额% + 本地近 7 天 usage_logs 统计 -->
         <UsageProgressBar
           v-if="usageInfo.seven_day"
           label="7d"
           :utilization="usageInfo.seven_day.utilization"
           :resets-at="usageInfo.seven_day.resets_at"
+          :window-stats="usageInfo.seven_day.window_stats"
           color="emerald"
         />
 
@@ -601,9 +607,33 @@
           </span>
         </div>
       </div>
+      <!-- Lifetime totals for API Key / Bedrock accounts -->
+      <div
+        v-if="lifetimeStats"
+        class="mb-0.5 flex items-center"
+      >
+        <div class="flex items-center gap-1.5 text-[9px] text-gray-400 dark:text-gray-500">
+          <span class="rounded bg-gray-50 px-1.5 py-0.5 dark:bg-gray-900">
+            total {{ formatLifetimeRequests }} req
+          </span>
+          <span class="rounded bg-gray-50 px-1.5 py-0.5 dark:bg-gray-900">
+            {{ formatLifetimeTokens }}
+          </span>
+          <span class="rounded bg-gray-50 px-1.5 py-0.5 dark:bg-gray-900" :title="t('usage.accountBilled')">
+            A ${{ formatLifetimeCost }}
+          </span>
+          <span
+            v-if="lifetimeStats.user_cost != null"
+            class="rounded bg-gray-50 px-1.5 py-0.5 dark:bg-gray-900"
+            :title="t('usage.userBilled')"
+          >
+            U ${{ formatLifetimeUserCost }}
+          </span>
+        </div>
+      </div>
       <!-- Loading skeleton for today stats -->
       <div
-        v-else-if="todayStatsLoading"
+        v-else-if="todayStatsLoading && !todayStats"
         class="mb-0.5 flex items-center gap-1"
       >
         <div class="h-3 w-10 animate-pulse rounded bg-gray-200 dark:bg-gray-700"></div>
@@ -634,7 +664,7 @@
       />
 
       <!-- No data at all -->
-      <div v-if="!todayStats && !todayStatsLoading && !hasApiKeyQuota" class="text-xs text-gray-400">-</div>
+      <div v-if="!todayStats && !lifetimeStats && !todayStatsLoading && !hasApiKeyQuota" class="text-xs text-gray-400">-</div>
     </div>
   </div>
 </template>
@@ -664,11 +694,13 @@ const props = withDefaults(
     account: Account
     todayStats?: WindowStats | null
     todayStatsLoading?: boolean
+    lifetimeStats?: WindowStats | null
     manualRefreshToken?: number
   }>(),
   {
     todayStats: null,
     todayStatsLoading: false,
+    lifetimeStats: null,
     manualRefreshToken: 0
   }
 )
@@ -1490,6 +1522,26 @@ const formatKeyCost = computed(() => {
 const formatKeyUserCost = computed(() => {
   if (!props.todayStats || props.todayStats.user_cost == null) return '0.00'
   return props.todayStats.user_cost.toFixed(2)
+})
+
+const formatLifetimeRequests = computed(() => {
+  if (!props.lifetimeStats) return ''
+  return formatCompactNumber(props.lifetimeStats.requests, { allowBillions: false })
+})
+
+const formatLifetimeTokens = computed(() => {
+  if (!props.lifetimeStats) return ''
+  return formatCompactNumber(props.lifetimeStats.tokens)
+})
+
+const formatLifetimeCost = computed(() => {
+  if (!props.lifetimeStats) return '0.00'
+  return props.lifetimeStats.cost.toFixed(2)
+})
+
+const formatLifetimeUserCost = computed(() => {
+  if (!props.lifetimeStats || props.lifetimeStats.user_cost == null) return '0.00'
+  return props.lifetimeStats.user_cost.toFixed(2)
 })
 
 onMounted(() => {

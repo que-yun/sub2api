@@ -42,6 +42,7 @@ export async function list(
     group?: string
     search?: string
     privacy_mode?: string
+    plan_type?: string
     lite?: string
     include_scheduler_score?: string
     sort_by?: string
@@ -78,6 +79,7 @@ export async function listWithEtag(
     group?: string
     search?: string
     privacy_mode?: string
+    plan_type?: string
     lite?: string
     include_scheduler_score?: string
     sort_by?: string
@@ -500,6 +502,32 @@ export async function getBatchTodayStats(accountIds: number[]): Promise<BatchTod
 }
 
 /**
+ * Get account all-time (lifetime) statistics
+ * @param id - Account ID
+ * @returns Lifetime stats (requests, tokens, cost)
+ */
+export async function getLifetimeStats(id: number): Promise<WindowStats> {
+  const { data } = await apiClient.get<WindowStats>(`/admin/accounts/${id}/lifetime-stats`)
+  return data
+}
+
+export interface BatchLifetimeStatsResponse {
+  stats: Record<string, WindowStats>
+}
+
+/**
+ * 批量获取多个账号的全量统计
+ * @param accountIds - 账号 ID 列表
+ * @returns 以账号 ID（字符串）为键的统计映射
+ */
+export async function getBatchLifetimeStats(accountIds: number[]): Promise<BatchLifetimeStatsResponse> {
+  const { data } = await apiClient.post<BatchLifetimeStatsResponse>('/admin/accounts/lifetime-stats/batch', {
+    account_ids: accountIds
+  })
+  return data
+}
+
+/**
  * Set account schedulable status
  * @param id - Account ID
  * @param schedulable - Whether the account should participate in scheduling
@@ -620,6 +648,7 @@ export async function exportData(options?: {
     status?: string
     group?: string
     privacy_mode?: string
+    plan_type?: string
     search?: string
     sort_by?: string
     sort_order?: 'asc' | 'desc'
@@ -630,12 +659,13 @@ export async function exportData(options?: {
   if (options?.ids && options.ids.length > 0) {
     params.ids = options.ids.join(',')
   } else if (options?.filters) {
-    const { platform, type, status, group, privacy_mode, search, sort_by, sort_order } = options.filters
+    const { platform, type, status, group, privacy_mode, plan_type, search, sort_by, sort_order } = options.filters
     if (platform) params.platform = platform
     if (type) params.type = type
     if (status) params.status = status
     if (group) params.group = group
     if (privacy_mode) params.privacy_mode = privacy_mode
+    if (plan_type) params.plan_type = plan_type
     if (search) params.search = search
     if (sort_by) params.sort_by = sort_by
     if (sort_order) params.sort_order = sort_order
@@ -900,6 +930,8 @@ export const accountsAPI = {
   getUsage,
   getTodayStats,
   getBatchTodayStats,
+  getLifetimeStats,
+  getBatchLifetimeStats,
   clearRateLimit,
   recoverState,
   resetAccountQuota,

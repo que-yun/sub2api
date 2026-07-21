@@ -289,6 +289,11 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 					}
 					h.gatewayService.RecordOpenAIAccountSwitch()
 					failedAccountIDs[account.ID] = struct{}{}
+					if failoverErr.IsOpenAIContextWindowGLMFailover() {
+						// Prefer non-GLM accounts for the rest of this request's retries.
+						visionRequestCtx = service.WithSkipGLMMappedAccountsForContextWindow(visionRequestCtx)
+						c.Request = c.Request.WithContext(service.WithSkipGLMMappedAccountsForContextWindow(c.Request.Context()))
+					}
 					lastFailoverErr = failoverErr
 					if switchCount >= maxAccountSwitches {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)

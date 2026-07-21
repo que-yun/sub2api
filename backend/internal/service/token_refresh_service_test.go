@@ -317,6 +317,28 @@ type tokenCacheInvalidatorStub struct {
 	lastAccount *Account
 }
 
+func TestTokenRefreshService_SetupTokenRefreshInvalidatesTokenCache(t *testing.T) {
+	account := &Account{
+		ID:          1201,
+		Platform:    PlatformAnthropic,
+		Type:        AccountTypeSetupToken,
+		Status:      StatusActive,
+		Schedulable: true,
+		Credentials: map[string]any{
+			"access_token": "new-access-token",
+		},
+	}
+	invalidator := &tokenCacheInvalidatorStub{}
+	svc := &TokenRefreshService{
+		cacheInvalidator: invalidator,
+	}
+
+	svc.postRefreshStateSync(context.Background(), account)
+
+	require.Equal(t, 1, invalidator.calls)
+	require.Equal(t, account.ID, invalidator.lastAccount.ID)
+}
+
 type tokenRefreshRuntimeBlocker struct {
 	blockCalls int
 	clearCalls int

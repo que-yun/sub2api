@@ -960,6 +960,11 @@ func filterSchedulerExtra(extra map[string]any) map[string]any {
 		"auto_pause_5h_disabled",
 		"auto_pause_7d_disabled",
 		"model_rate_limits",
+		// grok_hold_until_success 参与 IsSchedulable(GrokAccountRequiresSuccessBeforeSchedule)：
+		// 403 权限封禁后被 hold 的 grok 号必须靠它在选号"初筛"阶段就判为不可调度。若不带进 meta，
+		// 初筛用的 meta 对象 Extra 里没有它 → 误判可调度 → held 号进打分/TopK → 直到 acc 复检才被拒，
+		// 而 TopK 被这些 held 号占满时会整批复检失败 → 无候选 503，健康号反而永远排不进 TopK。
+		"grok_hold_until_success",
 		service.UpstreamBillingProbeExtraKey,
 	}
 	filtered := make(map[string]any)

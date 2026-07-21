@@ -718,10 +718,10 @@ func (r *accountRepository) Delete(ctx context.Context, id int64) error {
 }
 
 func (r *accountRepository) List(ctx context.Context, params pagination.PaginationParams) ([]service.Account, *pagination.PaginationResult, error) {
-	return r.ListWithFilters(ctx, params, "", "", "", "", 0, "")
+	return r.ListWithFilters(ctx, params, "", "", "", "", 0, "", "")
 }
 
-func (r *accountRepository) accountListFilteredQuery(platform, accountType, status, search string, groupID int64, privacyMode string) *dbent.AccountQuery {
+func (r *accountRepository) accountListFilteredQuery(platform, accountType, status, search string, groupID int64, privacyMode, planType string) *dbent.AccountQuery {
 	q := r.client.Account.Query()
 
 	if platform != "" {
@@ -813,12 +813,85 @@ func (r *accountRepository) accountListFilteredQuery(platform, accountType, stat
 			}
 		}))
 	}
+	if planType != "" {
+		q = q.Where(accountPlanTypePredicate(planType))
+	}
 
 	return q
 }
 
-func (r *accountRepository) ListWithFilters(ctx context.Context, params pagination.PaginationParams, platform, accountType, status, search string, groupID int64, privacyMode string) ([]service.Account, *pagination.PaginationResult, error) {
-	q := r.accountListFilteredQuery(platform, accountType, status, search, groupID, privacyMode)
+// accountPlanTypePredicate matches the same plan/tier sources rendered by the
+// admin account table badge: fresh Grok billing/quota snapshots first, then
+// credential fallbacks for OpenAI/Grok plan_type and subscription_tier.
+func accountPlanTypePredicate(planType string) dbpredicate.Account {
+	variants := accountPlanTypeFilterVariants(planType)
+	return dbpredicate.Account(func(s *entsql.Selector) {
+		preds := make([]*entsql.Predicate, 0, len(variants)*4)
+		for _, variant := range variants {
+			preds = append(preds,
+				sqljson.ValueEQ(dbaccount.FieldCredentials, variant, sqljson.Path("plan_type")),
+				sqljson.ValueEQ(dbaccount.FieldCredentials, variant, sqljson.Path("subscription_tier")),
+				sqljson.ValueEQ(dbaccount.FieldExtra, variant, sqljson.Path("subscription_tier")),
+				sqljson.ValueEQ(dbaccount.FieldExtra, variant, sqljson.Path("grok_billing_snapshot", "plan")),
+				sqljson.ValueEQ(dbaccount.FieldExtra, variant, sqljson.Path("grok_quota_snapshot", "subscription_tier")),
+			)
+		}
+		s.Where(entsql.Or(preds...))
+	})
+}
+
+func accountPlanTypeFilterVariants(planType string) []string {
+	raw := strings.TrimSpace(planType)
+	if raw == "" {
+		return nil
+	}
+	normalized := strings.ToLower(raw)
+	normalized = strings.ReplaceAll(normalized, " ", "")
+	normalized = strings.ReplaceAll(normalized, "_", "")
+	normalized = strings.ReplaceAll(normalized, "-", "")
+
+	seen := map[string]struct{}{}
+	add := func(values ...string) {
+		for _, value := range values {
+			v := strings.TrimSpace(value)
+			if v == "" {
+				continue
+			}
+			if _, ok := seen[v]; ok {
+				continue
+			}
+			seen[v] = struct{}{}
+		}
+	}
+	add(raw, strings.ToLower(raw), strings.ToUpper(raw))
+
+	switch normalized {
+	case "supergrok":
+		add("SuperGrok", "supergrok", "SUPERGROK", "super_grok", "super-grok")
+	case "supergrokheavy":
+		add("SuperGrok Heavy", "supergrokheavy", "SuperGrokHeavy", "super_grok_heavy", "super-grok-heavy")
+	case "free", "basic", "grokfree", "grokbasic", "freetier":
+		add("free", "FREE", "Free", "basic", "BASIC", "Basic", "grok-free", "grok_free", "free-tier", "free_tier")
+	case "plus":
+		add("plus", "Plus", "PLUS")
+	case "pro", "chatgptpro":
+		add("pro", "Pro", "PRO", "chatgptpro", "ChatGPTPro", "chatgpt_pro")
+	case "team":
+		add("team", "Team", "TEAM")
+	default:
+		// Keep raw/case variants only for unknown plan labels.
+	}
+
+	out := make([]string, 0, len(seen))
+	for value := range seen {
+		out = append(out, value)
+	}
+	// Stable order is not required for SQL OR predicates.
+	return out
+}
+
+func (r *accountRepository) ListWithFilters(ctx context.Context, params pagination.PaginationParams, platform, accountType, status, search string, groupID int64, privacyMode, planType string) ([]service.Account, *pagination.PaginationResult, error) {
+	q := r.accountListFilteredQuery(platform, accountType, status, search, groupID, privacyMode, planType)
 	// Clone before Count so interceptor-appended predicates (SoftDeleteMixin's
 	// deleted_at IS NULL) don't accumulate on the shared builder and pollute the
 	// subsequent list query. Same pattern used in group_repo/promo_code_repo/user_repo
@@ -847,8 +920,8 @@ func (r *accountRepository) ListWithFilters(ctx context.Context, params paginati
 	return outAccounts, paginationResultFromTotal(int64(total), params), nil
 }
 
-func (r *accountRepository) ListAllWithFilters(ctx context.Context, platform, accountType, status, search string, groupID int64, privacyMode string) ([]service.Account, error) {
-	accounts, err := r.accountListFilteredQuery(platform, accountType, status, search, groupID, privacyMode).All(ctx)
+func (r *accountRepository) ListAllWithFilters(ctx context.Context, platform, accountType, status, search string, groupID int64, privacyMode, planType string) ([]service.Account, error) {
+	accounts, err := r.accountListFilteredQuery(platform, accountType, status, search, groupID, privacyMode, planType).All(ctx)
 	if err != nil {
 		return nil, err
 	}

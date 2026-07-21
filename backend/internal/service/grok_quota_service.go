@@ -172,7 +172,13 @@ func (s *GrokQuotaService) probeUsage(ctx context.Context, accountID int64) (*Gr
 		return nil, err
 	}
 
-	probeModel := grokQuotaProbeModel()
+	// 探测必须测"账号真正服务的模型"：与真实转发一致，按账号 model_mapping 解析上游模型
+	// (resolveOpenAIForwardModelForContext 同 forwardGrokResponses)。原来硬用固定 grok-4.5，
+	// 若某账号把 grok-4.5 映射成别的模型，探测会测错模型 → 假 403 → 误 hold，把 chat 其实可用的号冻死。
+	probeModel := resolveOpenAIForwardModelForContext(ctx, account, grokQuotaProbeModel(), "")
+	if strings.TrimSpace(probeModel) == "" {
+		probeModel = grokQuotaProbeModel()
+	}
 	body, err := buildGrokQuotaProbeBody(probeModel)
 	if err != nil {
 		return nil, infraerrors.Newf(http.StatusBadRequest, "GROK_QUOTA_PROBE_BODY_ERROR", "failed to build probe body: %v", err)

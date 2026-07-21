@@ -195,6 +195,10 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 		}
 		h.gatewayService.RecordOpenAIAccountSwitch()
 		failedAccountIDs[account.ID] = struct{}{}
+		if failoverErr.IsOpenAIContextWindowGLMFailover() {
+			// Prefer non-GLM accounts for the rest of this request's retries.
+			c.Request = c.Request.WithContext(service.WithSkipGLMMappedAccountsForContextWindow(c.Request.Context()))
+		}
 		lastFailoverErr = failoverErr
 		if switchCount >= h.maxAccountSwitches {
 			h.handleFailoverExhausted(c, failoverErr, false)

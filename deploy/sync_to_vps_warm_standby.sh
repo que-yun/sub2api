@@ -24,14 +24,34 @@ SYNC_MODE="${SYNC_MODE:-full}"
 KEEP_LOCAL_DUMP="${KEEP_LOCAL_DUMP:-false}"
 START_STANDBY_AFTER_SYNC="${START_STANDBY_AFTER_SYNC:-false}"
 STANDBY_IGNORE_PROXY_IDS="${STANDBY_IGNORE_PROXY_IDS:-}"
-STANDBY_CLEAR_OPENAI_OAUTH_PROXY_IDS="${STANDBY_CLEAR_OPENAI_OAUTH_PROXY_IDS:-true}"
-STANDBY_CLEAR_OPENAI_APIKEY_PROXY_IDS="${STANDBY_CLEAR_OPENAI_APIKEY_PROXY_IDS:-true}"
-STANDBY_CLEAR_GROK_PROXY_IDS="${STANDBY_CLEAR_GROK_PROXY_IDS:-true}"
+STANDBY_CLEAR_OPENAI_OAUTH_PROXY_IDS="${STANDBY_CLEAR_OPENAI_OAUTH_PROXY_IDS:-false}"
+STANDBY_CLEAR_OPENAI_APIKEY_PROXY_IDS="${STANDBY_CLEAR_OPENAI_APIKEY_PROXY_IDS:-false}"
+STANDBY_CLEAR_GROK_PROXY_IDS="${STANDBY_CLEAR_GROK_PROXY_IDS:-false}"
 STANDBY_CLEAR_LOCALHOST_PROXY_IDS="${STANDBY_CLEAR_LOCALHOST_PROXY_IDS:-13}"
+# VPS 代理策略：
+# - remap_local: 保留“需要代理”的账户，但统一映射到 VPS 本机 mihomo
+# - clear_all: 全部清空为直连（旧行为）
+# - keep: 不做额外处理（不推荐，会把本机 127.0.0.1 代理原样带过去）
+STANDBY_PROXY_POLICY="${STANDBY_PROXY_POLICY:-remap_local}"
+STANDBY_LOCAL_PROXY_ID="${STANDBY_LOCAL_PROXY_ID:-6}"
+STANDBY_LOCAL_PROXY_NAME="${STANDBY_LOCAL_PROXY_NAME:-vps-mihomo-socks5-7891}"
+STANDBY_LOCAL_PROXY_PROTOCOL="${STANDBY_LOCAL_PROXY_PROTOCOL:-socks5}"
+STANDBY_LOCAL_PROXY_HOST="${STANDBY_LOCAL_PROXY_HOST:-127.0.0.1}"
+STANDBY_LOCAL_PROXY_PORT="${STANDBY_LOCAL_PROXY_PORT:-7891}"
+STANDBY_CLEAR_ALL_ACCOUNT_PROXY_IDS="${STANDBY_CLEAR_ALL_ACCOUNT_PROXY_IDS:-false}"
+
+# remap_local 时不能先按平台清空 proxy，否则后面无东西可 remap。
+if [[ "${STANDBY_PROXY_POLICY}" == "remap_local" ]]; then
+  STANDBY_CLEAR_OPENAI_OAUTH_PROXY_IDS=false
+  STANDBY_CLEAR_OPENAI_APIKEY_PROXY_IDS=false
+  STANDBY_CLEAR_GROK_PROXY_IDS=false
+  STANDBY_CLEAR_ALL_ACCOUNT_PROXY_IDS=false
+fi
 PULL_STANDBY_OPENAI_OAUTH_TOKENS="${PULL_STANDBY_OPENAI_OAUTH_TOKENS:-false}"
 PULL_STANDBY_RUNTIME_RECORDS="${PULL_STANDBY_RUNTIME_RECORDS:-false}"
 STANDBY_RUNTIME_PULL_LOOKBACK_HOURS="${STANDBY_RUNTIME_PULL_LOOKBACK_HOURS:-48}"
 STANDBY_TOKEN_REFRESH_OPENAI_REQUEST_REFRESH_ENABLED="${STANDBY_TOKEN_REFRESH_OPENAI_REQUEST_REFRESH_ENABLED:-}"
+STANDBY_TOKEN_REFRESH_REQUEST_REFRESH_ENABLED="${STANDBY_TOKEN_REFRESH_REQUEST_REFRESH_ENABLED:-}"
 STANDBY_RESTORE_STRATEGY="${STANDBY_RESTORE_STRATEGY:-shadow_swap}"
 STANDBY_KEEP_PREVIOUS_DBS="${STANDBY_KEEP_PREVIOUS_DBS:-1}"
 
@@ -50,12 +70,38 @@ cleanup() {
 }
 trap cleanup EXIT
 
+SSH_RETRIES="${SSH_RETRIES:-4}"
+SSH_RETRY_SLEEP_SECONDS="${SSH_RETRY_SLEEP_SECONDS:-8}"
+
 remote_exec() {
-  ssh "${ssh_args[@]}" "${REMOTE_EXEC_TARGET}" "$@"
+  local attempt=1
+  local rc=0
+  while true; do
+    ssh "${ssh_args[@]}" "${REMOTE_EXEC_TARGET}" "$@" && return 0
+    rc=$?
+    if (( attempt >= SSH_RETRIES )); then
+      return "${rc}"
+    fi
+    echo "remote_exec failed (exit=${rc}), retry ${attempt}/${SSH_RETRIES} in ${SSH_RETRY_SLEEP_SECONDS}s ..." >&2
+    sleep "${SSH_RETRY_SLEEP_SECONDS}"
+    attempt=$((attempt + 1))
+  done
 }
 
 remote_copy() {
-  gzip -c "$1" | ssh "${ssh_args[@]}" "${REMOTE_COPY_HOST}" "gzip -dc > $(shell_quote "$2")"
+  local attempt=1
+  local rc=0
+  while true; do
+    gzip -c "$1" | ssh "${ssh_args[@]}" "${REMOTE_COPY_HOST}" "gzip -dc > $(shell_quote "$2")" \
+      && ssh "${ssh_args[@]}" "${REMOTE_COPY_HOST}" "test -s $(shell_quote "$2")" && return 0
+    rc=$?
+    if (( attempt >= SSH_RETRIES )); then
+      return "${rc}"
+    fi
+    echo "remote_copy failed (exit=${rc}), retry ${attempt}/${SSH_RETRIES} in ${SSH_RETRY_SLEEP_SECONDS}s ..." >&2
+    sleep "${SSH_RETRY_SLEEP_SECONDS}"
+    attempt=$((attempt + 1))
+  done
 }
 
 shell_quote() {
@@ -115,6 +161,8 @@ local_pg_dump() {
 ssh_args=(
   -o BatchMode=yes
   -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}"
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=4
   -o StrictHostKeyChecking=accept-new
 )
 if [[ -n "${SSH_PORT}" ]]; then
@@ -537,6 +585,7 @@ echo "Restoring snapshot on VPS standby database ..."
 pgdatabase_sql="$(sql_literal "${PGDATABASE}")"
 ignore_proxy_ids_sql="$(sql_literal "${STANDBY_IGNORE_PROXY_IDS}")"
 standby_openai_request_refresh_sql="$(sql_literal "${STANDBY_TOKEN_REFRESH_OPENAI_REQUEST_REFRESH_ENABLED}")"
+standby_request_refresh_sql="$(sql_literal "${STANDBY_TOKEN_REFRESH_REQUEST_REFRESH_ENABLED}")"
 restore_db="${PGDATABASE}_restore_${timestamp_id}"
 previous_db="${PGDATABASE}_previous_${timestamp_id}"
 
@@ -673,11 +722,75 @@ BEGIN
 END \\\$\\\$;
 
 SELECT 'verified_standby_openai_apikey_proxy_ids_cleared=0';\"
+
+# VPS proxy policy after snapshot restore
+if [[ $(shell_quote "${STANDBY_PROXY_POLICY}") == "remap_local" ]]; then
+  docker exec sub2api-standby-postgres psql -U $(shell_quote "${PGUSER}") -d $(shell_quote "${PGDATABASE}") -v ON_ERROR_STOP=1 -c \"
+INSERT INTO public.proxies (id, name, protocol, host, port, status, created_at, updated_at, fallback_mode, expiry_warn_days)
+VALUES (
+  ${STANDBY_LOCAL_PROXY_ID},
+  $(sql_literal "${STANDBY_LOCAL_PROXY_NAME}"),
+  $(sql_literal "${STANDBY_LOCAL_PROXY_PROTOCOL}"),
+  $(sql_literal "${STANDBY_LOCAL_PROXY_HOST}"),
+  ${STANDBY_LOCAL_PROXY_PORT},
+  'active', now(), now(), 'none', 7
+)
+ON CONFLICT (id) DO UPDATE SET
+  name = EXCLUDED.name,
+  protocol = EXCLUDED.protocol,
+  host = EXCLUDED.host,
+  port = EXCLUDED.port,
+  status = 'active',
+  deleted_at = NULL,
+  updated_at = now();
+
+UPDATE public.proxies
+SET protocol = $(sql_literal "${STANDBY_LOCAL_PROXY_PROTOCOL}"),
+    host = $(sql_literal "${STANDBY_LOCAL_PROXY_HOST}"),
+    port = ${STANDBY_LOCAL_PROXY_PORT},
+    status = 'active',
+    deleted_at = NULL,
+    updated_at = now()
+WHERE deleted_at IS NULL
+  AND (host IN ('127.0.0.1', 'localhost') OR id = ${STANDBY_LOCAL_PROXY_ID});
+
+WITH remapped AS (
+  UPDATE public.accounts
+  SET proxy_id = ${STANDBY_LOCAL_PROXY_ID}, updated_at = now()
+  WHERE deleted_at IS NULL
+    AND proxy_id IS NOT NULL
+    AND proxy_id IS DISTINCT FROM ${STANDBY_LOCAL_PROXY_ID}
+  RETURNING id
+)
+SELECT 'standby_proxy_policy=remap_local local_proxy_id=' || ${STANDBY_LOCAL_PROXY_ID}::text ||
+       ' remapped=' || (SELECT count(*)::text FROM remapped) ||
+       ' accounts_with_proxy=' || (
+         SELECT count(*)::text FROM public.accounts
+         WHERE deleted_at IS NULL AND proxy_id IS NOT NULL
+       );\"
+elif [[ $(shell_quote "${STANDBY_PROXY_POLICY}") == "clear_all" || $(shell_quote "${STANDBY_CLEAR_ALL_ACCOUNT_PROXY_IDS}") == true ]]; then
+  docker exec sub2api-standby-postgres psql -U $(shell_quote "${PGUSER}") -d $(shell_quote "${PGDATABASE}") -v ON_ERROR_STOP=1 -c \"
+WITH updated AS (
+  UPDATE public.accounts
+  SET proxy_id = NULL, updated_at = now()
+  WHERE deleted_at IS NULL
+    AND proxy_id IS NOT NULL
+  RETURNING id
+)
+SELECT 'standby_proxy_policy=clear_all cleared=' || count(*) FROM updated;\"
+fi
 if [[ -n $(shell_quote "${STANDBY_TOKEN_REFRESH_OPENAI_REQUEST_REFRESH_ENABLED}") ]]; then
   if grep -q '^TOKEN_REFRESH_OPENAI_REQUEST_REFRESH_ENABLED=' /etc/sub2api-standby.env; then
     sed -i \"s/^TOKEN_REFRESH_OPENAI_REQUEST_REFRESH_ENABLED=.*/TOKEN_REFRESH_OPENAI_REQUEST_REFRESH_ENABLED=${STANDBY_TOKEN_REFRESH_OPENAI_REQUEST_REFRESH_ENABLED}/\" /etc/sub2api-standby.env
   else
     printf '\\nTOKEN_REFRESH_OPENAI_REQUEST_REFRESH_ENABLED=%s\\n' ${standby_openai_request_refresh_sql} >> /etc/sub2api-standby.env
+  fi
+fi
+if [[ -n $(shell_quote "${STANDBY_TOKEN_REFRESH_REQUEST_REFRESH_ENABLED}") ]]; then
+  if grep -q '^TOKEN_REFRESH_REQUEST_REFRESH_ENABLED=' /etc/sub2api-standby.env; then
+    sed -i \"s/^TOKEN_REFRESH_REQUEST_REFRESH_ENABLED=.*/TOKEN_REFRESH_REQUEST_REFRESH_ENABLED=${STANDBY_TOKEN_REFRESH_REQUEST_REFRESH_ENABLED}/\" /etc/sub2api-standby.env
+  else
+    printf '\\nTOKEN_REFRESH_REQUEST_REFRESH_ENABLED=%s\\n' ${standby_request_refresh_sql} >> /etc/sub2api-standby.env
   fi
 fi
 if [[ $(shell_quote "${START_STANDBY_AFTER_SYNC}") == true ]]; then
@@ -834,11 +947,75 @@ BEGIN
 END \\\$\\\$;
 
 SELECT 'verified_standby_openai_apikey_proxy_ids_cleared=0';\"
+
+# VPS proxy policy after snapshot restore
+if [[ $(shell_quote "${STANDBY_PROXY_POLICY}") == "remap_local" ]]; then
+  docker exec sub2api-standby-postgres psql -U $(shell_quote "${PGUSER}") -d \"\${restore_db}\" -v ON_ERROR_STOP=1 -c \"
+INSERT INTO public.proxies (id, name, protocol, host, port, status, created_at, updated_at, fallback_mode, expiry_warn_days)
+VALUES (
+  ${STANDBY_LOCAL_PROXY_ID},
+  $(sql_literal "${STANDBY_LOCAL_PROXY_NAME}"),
+  $(sql_literal "${STANDBY_LOCAL_PROXY_PROTOCOL}"),
+  $(sql_literal "${STANDBY_LOCAL_PROXY_HOST}"),
+  ${STANDBY_LOCAL_PROXY_PORT},
+  'active', now(), now(), 'none', 7
+)
+ON CONFLICT (id) DO UPDATE SET
+  name = EXCLUDED.name,
+  protocol = EXCLUDED.protocol,
+  host = EXCLUDED.host,
+  port = EXCLUDED.port,
+  status = 'active',
+  deleted_at = NULL,
+  updated_at = now();
+
+UPDATE public.proxies
+SET protocol = $(sql_literal "${STANDBY_LOCAL_PROXY_PROTOCOL}"),
+    host = $(sql_literal "${STANDBY_LOCAL_PROXY_HOST}"),
+    port = ${STANDBY_LOCAL_PROXY_PORT},
+    status = 'active',
+    deleted_at = NULL,
+    updated_at = now()
+WHERE deleted_at IS NULL
+  AND (host IN ('127.0.0.1', 'localhost') OR id = ${STANDBY_LOCAL_PROXY_ID});
+
+WITH remapped AS (
+  UPDATE public.accounts
+  SET proxy_id = ${STANDBY_LOCAL_PROXY_ID}, updated_at = now()
+  WHERE deleted_at IS NULL
+    AND proxy_id IS NOT NULL
+    AND proxy_id IS DISTINCT FROM ${STANDBY_LOCAL_PROXY_ID}
+  RETURNING id
+)
+SELECT 'standby_proxy_policy=remap_local local_proxy_id=' || ${STANDBY_LOCAL_PROXY_ID}::text ||
+       ' remapped=' || (SELECT count(*)::text FROM remapped) ||
+       ' accounts_with_proxy=' || (
+         SELECT count(*)::text FROM public.accounts
+         WHERE deleted_at IS NULL AND proxy_id IS NOT NULL
+       );\"
+elif [[ $(shell_quote "${STANDBY_PROXY_POLICY}") == "clear_all" || $(shell_quote "${STANDBY_CLEAR_ALL_ACCOUNT_PROXY_IDS}") == true ]]; then
+  docker exec sub2api-standby-postgres psql -U $(shell_quote "${PGUSER}") -d \"\${restore_db}\" -v ON_ERROR_STOP=1 -c \"
+WITH updated AS (
+  UPDATE public.accounts
+  SET proxy_id = NULL, updated_at = now()
+  WHERE deleted_at IS NULL
+    AND proxy_id IS NOT NULL
+  RETURNING id
+)
+SELECT 'standby_proxy_policy=clear_all cleared=' || count(*) FROM updated;\"
+fi
 if [[ -n $(shell_quote "${STANDBY_TOKEN_REFRESH_OPENAI_REQUEST_REFRESH_ENABLED}") ]]; then
   if grep -q '^TOKEN_REFRESH_OPENAI_REQUEST_REFRESH_ENABLED=' /etc/sub2api-standby.env; then
     sed -i \"s/^TOKEN_REFRESH_OPENAI_REQUEST_REFRESH_ENABLED=.*/TOKEN_REFRESH_OPENAI_REQUEST_REFRESH_ENABLED=${STANDBY_TOKEN_REFRESH_OPENAI_REQUEST_REFRESH_ENABLED}/\" /etc/sub2api-standby.env
   else
     printf '\\nTOKEN_REFRESH_OPENAI_REQUEST_REFRESH_ENABLED=%s\\n' ${standby_openai_request_refresh_sql} >> /etc/sub2api-standby.env
+  fi
+fi
+if [[ -n $(shell_quote "${STANDBY_TOKEN_REFRESH_REQUEST_REFRESH_ENABLED}") ]]; then
+  if grep -q '^TOKEN_REFRESH_REQUEST_REFRESH_ENABLED=' /etc/sub2api-standby.env; then
+    sed -i \"s/^TOKEN_REFRESH_REQUEST_REFRESH_ENABLED=.*/TOKEN_REFRESH_REQUEST_REFRESH_ENABLED=${STANDBY_TOKEN_REFRESH_REQUEST_REFRESH_ENABLED}/\" /etc/sub2api-standby.env
+  else
+    printf '\\nTOKEN_REFRESH_REQUEST_REFRESH_ENABLED=%s\\n' ${standby_request_refresh_sql} >> /etc/sub2api-standby.env
   fi
 fi
 if [[ $(shell_quote "${START_STANDBY_AFTER_SYNC}") == true ]]; then

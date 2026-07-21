@@ -444,6 +444,53 @@ func isOpenAIContextWindowError(upstreamMsg string, upstreamBody []byte) bool {
 	return match(string(upstreamBody))
 }
 
+// isGLMFamilyModel reports whether an upstream/model id is GLM family.
+// Used only for context-window failover: mapped gpt-* -> glm-* accounts should
+// not permanently fail long Codex sessions when another non-GLM account exists.
+func isGLMFamilyModel(model string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	if normalized == "" {
+		return false
+	}
+	// Accept common vendor prefixes and aliases: glm-5.2, z-ai/glm-5.2, GLM-5.2
+	if strings.Contains(normalized, "glm-") || strings.Contains(normalized, "/glm") {
+		return true
+	}
+	if strings.HasPrefix(normalized, "glm") {
+		return true
+	}
+	return false
+}
+
+// accountMapsRequestToGLM reports whether this account would forward the
+// client-requested model to a GLM upstream model via account model_mapping.
+func accountMapsRequestToGLM(account *Account, requestedModel string) bool {
+	if account == nil {
+		return false
+	}
+	req := strings.TrimSpace(requestedModel)
+	if req == "" {
+		return false
+	}
+	mapped := strings.TrimSpace(account.GetMappedModel(req))
+	if mapped == "" {
+		mapped = req
+	}
+	return isGLMFamilyModel(mapped)
+}
+
+// shouldFailoverOpenAIContextWindow decides whether a context-window upstream
+// rejection should switch accounts instead of failing the client immediately.
+// Policy: only auto-failover when the current account maps the request to GLM.
+// Native large-context accounts (OpenAI/Grok/etc.) keep the old fail-fast path,
+// because the same oversized prompt will fail deterministically there too.
+func shouldFailoverOpenAIContextWindow(account *Account, requestedModel, upstreamMsg string, upstreamBody []byte) bool {
+	if !isOpenAIContextWindowError(upstreamMsg, upstreamBody) {
+		return false
+	}
+	return accountMapsRequestToGLM(account, requestedModel)
+}
+
 func (s *OpenAIGatewayService) shouldFailoverUpstreamError(statusCode int) bool {
 	switch statusCode {
 	case 401, 402, 403, 429, 529:
@@ -453,11 +500,21 @@ func (s *OpenAIGatewayService) shouldFailoverUpstreamError(statusCode int) bool 
 	}
 }
 
-func (s *OpenAIGatewayService) shouldFailoverOpenAIUpstreamResponse(statusCode int, upstreamMsg string, upstreamBody []byte) bool {
+func (s *OpenAIGatewayService) shouldFailoverOpenAIUpstreamResponse(statusCode int, upstreamMsg string, upstreamBody []byte, account *Account, requestedModel string) bool {
 	if isOpenAIContextWindowError(upstreamMsg, upstreamBody) {
-		return false
+		// GLM-mapped accounts may still be salvageable by switching to a non-GLM
+		// account in the same group. Other accounts stay fail-fast.
+		return shouldFailoverOpenAIContextWindow(account, requestedModel, upstreamMsg, upstreamBody)
 	}
 	if isOpenAIRequestBodyTooLargeError(statusCode, upstreamMsg, upstreamBody) {
+		return true
+	}
+	// Multi-model pools (ollama/nvidia/opencode) often reject Codex tool+image
+	// payloads with provider-specific 400s. After same-account VL/tool salvage,
+	// account failover is still required so image requests can reach another VL pool.
+	if statusCode == http.StatusBadRequest &&
+		isOpenAIMultiModelCompatPoolAccount(account) &&
+		isOpenAICompatibleModelPayloadIncompatError(upstreamMsg, upstreamBody) {
 		return true
 	}
 	if s.shouldFailoverUpstreamError(statusCode) {
@@ -466,14 +523,389 @@ func (s *OpenAIGatewayService) shouldFailoverOpenAIUpstreamResponse(statusCode i
 	return isOpenAITransientProcessingError(statusCode, upstreamMsg, upstreamBody)
 }
 
+// isOpenAIMultiModelCompatPoolAccount reports OpenAI-compatible multi-model API-key
+// pools where model/tool schema rejections are usually destination-specific rather
+// than true client hard failures.
+func isOpenAIMultiModelCompatPoolAccount(account *Account) bool {
+	if account == nil || !account.IsOpenAICompatible() || account.Type != AccountTypeAPIKey {
+		return false
+	}
+	base := strings.ToLower(strings.TrimSpace(account.GetCredential("base_url")))
+	if isOllamaOpenAICompatibleAccount(account) ||
+		strings.Contains(base, "nvidia.com") ||
+		strings.Contains(base, "opencode.ai") {
+		return true
+	}
+	return len(account.GetModelMapping()) > 1 || len(account.GetVisionModelMapping()) > 0
+}
+
+// isOpenAICompatibleModelPayloadIncompatError matches provider 400s that mean
+// "this destination cannot accept the current tools/image payload", not a fatal
+// client schema error on every account.
+func isOpenAICompatibleModelPayloadIncompatError(upstreamMsg string, upstreamBody []byte) bool {
+	match := func(text string) bool {
+		lower := strings.ToLower(strings.TrimSpace(text))
+		if lower == "" {
+			return false
+		}
+		if strings.Contains(lower, "invalid tool call arguments") {
+			return true
+		}
+		if strings.Contains(lower, "extra data: line") {
+			return true
+		}
+		if strings.Contains(lower, "does not support tools") ||
+			strings.Contains(lower, "tools are not supported") ||
+			strings.Contains(lower, "tool calling is not supported") ||
+			strings.Contains(lower, "function calling is not supported") ||
+			strings.Contains(lower, "tool use is not supported") ||
+			strings.Contains(lower, "does not support function") {
+			return true
+		}
+		if strings.Contains(lower, "does not support image") ||
+			strings.Contains(lower, "images are not supported") ||
+			strings.Contains(lower, "image input is not supported") ||
+			strings.Contains(lower, "image_url is not supported") ||
+			strings.Contains(lower, "multimodal") && strings.Contains(lower, "not support") {
+			return true
+		}
+		if strings.Contains(lower, "unknown model") ||
+			strings.Contains(lower, "model not found") ||
+			strings.Contains(lower, "does not exist") && strings.Contains(lower, "model") {
+			return true
+		}
+		return false
+	}
+	if match(upstreamMsg) {
+		return true
+	}
+	if len(upstreamBody) == 0 {
+		return false
+	}
+	for _, path := range []string{
+		"error.message",
+		"response.error.message",
+		"message",
+	} {
+		if match(gjson.GetBytes(upstreamBody, path).String()) {
+			return true
+		}
+	}
+	return match(string(upstreamBody))
+}
+
+const openAIContextWindowGLMFailoverReason = GatewayFailureReason("openai_context_window_glm_failover")
+
+// IsOpenAIContextWindowGLMFailover reports a context-window failure that only
+// happened because this account mapped the request onto a GLM model.
+func (e *UpstreamFailoverError) IsOpenAIContextWindowGLMFailover() bool {
+	return e != nil && e.Reason == openAIContextWindowGLMFailoverReason
+}
+
 // OpenAIRequestBodyTooLargeClientMessage is the fixed downstream message used
 // after all account-specific request body limit failovers are exhausted.
 const OpenAIRequestBodyTooLargeClientMessage = "Request payload is too large"
 
 const openAIRequestBodyTooLargeReason = GatewayFailureReason("openai_request_body_too_large")
 
+// isOpenAIUpstreamFailedToReadRequestBody matches upstream 400s where the provider
+// accepted the connection but could not consume the request payload (common on
+// Ollama Cloud for oversized Codex /v1/responses bodies).
+func isOpenAIUpstreamFailedToReadRequestBody(upstreamMsg string, upstreamBody []byte) bool {
+	match := func(text string) bool {
+		lower := strings.ToLower(strings.TrimSpace(text))
+		if lower == "" {
+			return false
+		}
+		return strings.Contains(lower, "failed to read request body") ||
+			strings.Contains(lower, "unable to read request body") ||
+			strings.Contains(lower, "error reading request body")
+	}
+	if match(upstreamMsg) {
+		return true
+	}
+	if len(upstreamBody) == 0 {
+		return false
+	}
+	for _, path := range []string{
+		"error.message",
+		"response.error.message",
+		"message",
+	} {
+		if match(gjson.GetBytes(upstreamBody, path).String()) {
+			return true
+		}
+	}
+	return match(string(upstreamBody))
+}
+
 func isOpenAIRequestBodyTooLargeError(statusCode int, upstreamMsg string, upstreamBody []byte) bool {
-	return statusCode == http.StatusRequestEntityTooLarge && !isOpenAIContextWindowError(upstreamMsg, upstreamBody)
+	if isOpenAIContextWindowError(upstreamMsg, upstreamBody) {
+		return false
+	}
+	if statusCode == http.StatusRequestEntityTooLarge {
+		return true
+	}
+	// Some OpenAI-compatible gateways (notably Ollama Cloud) surface oversized
+	// payloads as 400 "failed to read request body" instead of 413.
+	return statusCode == http.StatusBadRequest && isOpenAIUpstreamFailedToReadRequestBody(upstreamMsg, upstreamBody)
+}
+
+// isOllamaOpenAICompatibleAccount reports accounts whose base_url points at Ollama.
+func isOllamaOpenAICompatibleAccount(account *Account) bool {
+	if account == nil {
+		return false
+	}
+	base := strings.ToLower(strings.TrimSpace(account.GetCredential("base_url")))
+	if base == "" {
+		return false
+	}
+	return strings.Contains(base, "ollama.com") ||
+		strings.Contains(base, "://ollama.") ||
+		strings.Contains(base, ".ollama.")
+}
+
+// openAIOllamaLargeContextModelLadder is the same-account upgrade path used when
+// Ollama rejects the currently mapped model (usually glm-5.2) for a large body.
+// Only models that the account already exposes via model_mapping destinations
+// are eligible; order prefers coding/long-context models first.
+var openAIOllamaLargeContextModelLadder = []string{
+	"kimi-k2.7-code",
+	"kimi-k2.6",
+	"kimi-k2.5",
+	"qwen3.5:397b",
+	"qwen3.5-397b",
+	"minimax-m3",
+	"mistral-large-3:675b",
+	"mistral-large-3-675b",
+	"deepseek-v4-pro",
+	"nemotron-3-ultra",
+	"nemotron-3-super",
+}
+
+func accountExposesOpenAIUpstreamModel(account *Account, model string) bool {
+	if account == nil {
+		return false
+	}
+	want := strings.TrimSpace(model)
+	if want == "" {
+		return false
+	}
+	wantLower := strings.ToLower(want)
+	for _, mapped := range account.GetModelMapping() {
+		if strings.EqualFold(strings.TrimSpace(mapped), want) {
+			return true
+		}
+	}
+	// Also accept exact inbound aliases that map to themselves.
+	if mapped := strings.TrimSpace(account.GetMappedModel(want)); strings.EqualFold(mapped, want) || strings.EqualFold(mapped, wantLower) {
+		return true
+	}
+	return false
+}
+
+// shouldRetryOpenAISameAccountLargeContextModel decides whether the current
+// upstream rejection can be salvaged by switching to another model on the same
+// Ollama account before failing over to a different account.
+func shouldRetryOpenAISameAccountLargeContextModel(
+	account *Account,
+	statusCode int,
+	upstreamMsg string,
+	upstreamBody []byte,
+	currentUpstreamModel string,
+	tried map[string]struct{},
+) (nextModel string, ok bool) {
+	if !isOllamaOpenAICompatibleAccount(account) {
+		return "", false
+	}
+	// Same trigger set as body-limit / context-window salvage: the payload is
+	// too heavy for the current model/gateway path, but another long-context
+	// model on this account may still accept it.
+	if !isOpenAIRequestBodyTooLargeError(statusCode, upstreamMsg, upstreamBody) &&
+		!isOpenAIContextWindowError(upstreamMsg, upstreamBody) &&
+		!isOpenAIUpstreamFailedToReadRequestBody(upstreamMsg, upstreamBody) {
+		return "", false
+	}
+	if tried == nil {
+		tried = map[string]struct{}{}
+	}
+	current := strings.TrimSpace(currentUpstreamModel)
+	if current != "" {
+		tried[strings.ToLower(current)] = struct{}{}
+	}
+	for _, candidate := range openAIOllamaLargeContextModelLadder {
+		key := strings.ToLower(strings.TrimSpace(candidate))
+		if key == "" {
+			continue
+		}
+		if _, seen := tried[key]; seen {
+			continue
+		}
+		if !accountExposesOpenAIUpstreamModel(account, candidate) {
+			continue
+		}
+		// Prefer the canonical destination name from mapping when present.
+		mapped := strings.TrimSpace(account.GetMappedModel(candidate))
+		if mapped == "" {
+			mapped = candidate
+		}
+		mappedKey := strings.ToLower(mapped)
+		if _, seen := tried[mappedKey]; seen {
+			continue
+		}
+		return mapped, true
+	}
+	return "", false
+}
+
+// openAISameAccountVisionModelLadder is the same-account multimodal fallback
+// path. Image requests prefer remapping models on the selected account over
+// hopping accounts solely because the first VL destination is busy/broken.
+var openAISameAccountVisionModelLadder = []string{
+	"meta/llama-3.2-11b-vision-instruct",
+	"meta/llama-3.2-90b-vision-instruct",
+	"nvidia/nemotron-nano-12b-v2-vl",
+	"nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
+	"microsoft/phi-3-vision-128k-instruct",
+	"qwen3.7-plus",
+	"mimo-v2.5",
+	"gemma4:31b",
+	"gemma4-31b",
+	"google/gemma-3-12b-it",
+	"google/gemma-3-4b-it",
+}
+
+// shouldRetryOpenAISameAccountVisionModel decides whether an image-input
+// upstream rejection can be salvaged by another multimodal model already
+// present on the same multi-model account.
+func shouldRetryOpenAISameAccountVisionModel(
+	account *Account,
+	statusCode int,
+	upstreamMsg string,
+	upstreamBody []byte,
+	currentUpstreamModel string,
+	tried map[string]struct{},
+) (nextModel string, ok bool) {
+	if account == nil || !account.IsOpenAICompatible() {
+		return "", false
+	}
+	// Only salvage transient / model-level rejections. Auth and hard client
+	// errors should not invent alternative vision destinations.
+	if statusCode != http.StatusTooManyRequests &&
+		statusCode != http.StatusServiceUnavailable &&
+		statusCode != http.StatusBadGateway &&
+		statusCode != http.StatusGatewayTimeout &&
+		statusCode != http.StatusInternalServerError &&
+		statusCode != http.StatusNotFound &&
+		statusCode != http.StatusBadRequest {
+		return "", false
+	}
+	msg := strings.ToLower(strings.TrimSpace(upstreamMsg) + " " + string(upstreamBody))
+	// Do not spin VL models on pure context-window or auth failures.
+	if isOpenAIContextWindowError(upstreamMsg, upstreamBody) {
+		return "", false
+	}
+	if strings.Contains(msg, "invalid api key") || strings.Contains(msg, "unauthorized") ||
+		strings.Contains(msg, "authentication") || strings.Contains(msg, "permission") {
+		return "", false
+	}
+	if tried == nil {
+		tried = map[string]struct{}{}
+	}
+	current := strings.TrimSpace(currentUpstreamModel)
+	if current != "" {
+		tried[strings.ToLower(current)] = struct{}{}
+	}
+
+	// Prefer explicit vision mapping destinations, then catalog inference,
+	// then a fixed ladder of common VL ids if the account exposes them.
+	candidates := make([]string, 0, 16)
+	for _, mapped := range account.GetVisionModelMapping() {
+		if mapped = strings.TrimSpace(mapped); mapped != "" {
+			candidates = append(candidates, mapped)
+		}
+	}
+	if inferred, found := account.ResolveInferredVisionModel(current); found {
+		candidates = append(candidates, inferred)
+	}
+	candidates = append(candidates, openAISameAccountVisionModelLadder...)
+
+	for _, candidate := range candidates {
+		key := strings.ToLower(strings.TrimSpace(candidate))
+		if key == "" {
+			continue
+		}
+		if _, seen := tried[key]; seen {
+			continue
+		}
+		// Candidate must either be a known mapping destination or an explicit
+		// vision_model_mapping target (accountExposes checks model_mapping).
+		exposed := false
+		for _, dest := range account.GetModelMapping() {
+			if strings.EqualFold(strings.TrimSpace(dest), candidate) || strings.EqualFold(strings.TrimSpace(dest), strings.TrimSpace(candidate)) {
+				exposed = true
+				break
+			}
+		}
+		if !exposed {
+			for src, dest := range account.GetModelMapping() {
+				if strings.EqualFold(strings.TrimSpace(src), candidate) {
+					exposed = true
+					candidate = strings.TrimSpace(dest)
+					if candidate == "" {
+						candidate = strings.TrimSpace(src)
+					}
+					break
+				}
+			}
+		}
+		if !exposed {
+			for _, dest := range account.GetVisionModelMapping() {
+				if strings.EqualFold(strings.TrimSpace(dest), candidate) {
+					exposed = true
+					break
+				}
+			}
+		}
+		if !exposed {
+			continue
+		}
+		mapped := strings.TrimSpace(candidate)
+		mappedKey := strings.ToLower(mapped)
+		if _, seen := tried[mappedKey]; seen {
+			continue
+		}
+		// Skip pure text defaults such as glm-5.2.
+		if openAIVisionModelNameScore(mapped) <= 0 && openAIVisionModelNameScore(candidate) <= 0 {
+			continue
+		}
+		return mapped, true
+	}
+	return "", false
+}
+
+
+// preferOpenAIVisionChatFallback reports whether an image-input /v1/responses
+// request should be converted to chat completions on this multi-model account.
+// Used for ollama/nvidia/opencode pools where force_responses is flaky for VL.
+func preferOpenAIVisionChatFallback(account *Account, requestedModel string) bool {
+	if account == nil || !account.IsOpenAICompatible() || account.Type != AccountTypeAPIKey {
+		return false
+	}
+	if !account.SupportsOpenAIVisionModel(requestedModel) {
+		return false
+	}
+	base := strings.ToLower(strings.TrimSpace(account.GetCredential("base_url")))
+	if isOllamaOpenAICompatibleAccount(account) ||
+		strings.Contains(base, "nvidia.com") ||
+		strings.Contains(base, "opencode.ai") {
+		return true
+	}
+	// Explicit vision mapping on a multi-model catalog is also a strong signal.
+	if len(account.GetVisionModelMapping()) > 0 && len(account.GetModelMapping()) > 1 {
+		return true
+	}
+	return false
 }
 
 func newOpenAIUpstreamFailoverError(
@@ -482,12 +914,23 @@ func newOpenAIUpstreamFailoverError(
 	responseBody []byte,
 	upstreamMsg string,
 	retryableOnSameAccount bool,
+	account *Account,
+	requestedModel string,
 ) *UpstreamFailoverError {
 	failoverErr := &UpstreamFailoverError{
 		StatusCode:             statusCode,
 		ResponseBody:           responseBody,
 		ResponseHeaders:        responseHeaders.Clone(),
 		RetryableOnSameAccount: retryableOnSameAccount,
+	}
+	if shouldFailoverOpenAIContextWindow(account, requestedModel, upstreamMsg, responseBody) {
+		// Context-window rejections are deterministic for a given account/model.
+		// Never retry the same account; switch to another account and prefer non-GLM.
+		failoverErr.RetryableOnSameAccount = false
+		failoverErr.Scope = GatewayFailureScopeAccount
+		failoverErr.Reason = openAIContextWindowGLMFailoverReason
+		failoverErr.NextAccountAction = NextAccountRetry
+		return failoverErr
 	}
 	if isOpenAIRequestBodyTooLargeError(statusCode, upstreamMsg, responseBody) {
 		failoverErr.RetryableOnSameAccount = false
@@ -607,6 +1050,10 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 		)
 	}
 
+	reqModelForFailover := ""
+	if len(requestedModel) > 0 {
+		reqModelForFailover = strings.TrimSpace(requestedModel[0])
+	}
 	if isOpenAIRequestBodyTooLargeError(resp.StatusCode, upstreamMsg, body) {
 		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
 			Platform:           account.Platform,
@@ -625,6 +1072,8 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 			body,
 			upstreamMsg,
 			false,
+			account,
+			reqModelForFailover,
 		)
 	}
 
@@ -897,4 +1346,27 @@ func (s *OpenAIGatewayService) handleCompatErrorResponse(
 
 	writeError(c, resp.StatusCode, errType, upstreamMsg)
 	return nil, fmt.Errorf("upstream error: %d %s", resp.StatusCode, upstreamMsg)
+}
+
+
+type openaiSkipGLMMappedAccountsContextKey struct{}
+
+// WithSkipGLMMappedAccountsForContextWindow marks subsequent account selection to
+// skip accounts whose model_mapping still routes the request to GLM.
+func WithSkipGLMMappedAccountsForContextWindow(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, openaiSkipGLMMappedAccountsContextKey{}, true)
+}
+
+func shouldSkipGLMMappedAccountForContextWindow(ctx context.Context, account *Account, requestedModel string) bool {
+	if ctx == nil {
+		return false
+	}
+	skip, _ := ctx.Value(openaiSkipGLMMappedAccountsContextKey{}).(bool)
+	if !skip {
+		return false
+	}
+	return accountMapsRequestToGLM(account, requestedModel)
 }

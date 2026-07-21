@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -105,29 +106,119 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 		zap.Bool("stream", clientStream),
 	)
 
-	// Build and send upstream request via the shared CC pipeline
+	// Build and send upstream request via the shared CC pipeline.
+	// Image-input requests may need same-account VL model retries before
+	// account failover: multi-model pools often keep many vision destinations.
 	apiKey, targetURL, err := s.resolveCCFallbackTarget(account)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := s.sendCCUpstreamRequest(ctx, c, account, targetURL, chatBody, clientStream, apiKey, account.GetOpenAIUserAgent(), "")
-	if err != nil {
-		return nil, err
+	visionTried := map[string]struct{}{}
+	if OpenAIImageInputIntentFromContext(ctx) && strings.TrimSpace(upstreamModel) != "" {
+		visionTried[strings.ToLower(strings.TrimSpace(upstreamModel))] = struct{}{}
 	}
-	defer func() { _ = resp.Body.Close() }()
+	// One-shot salvage: some VL destinations reject Codex tool schemas while still
+	// accepting plain multimodal chat. Prefer recognizing the image over failing hard.
+	toolsStrippedForVision := false
 
-	if resp.StatusCode >= 400 {
-		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
-		if foErr := s.failoverOpenAIUpstreamHTTPError(ctx, c, account, resp, respBody, upstreamMsg, upstreamModel); foErr != nil {
-			return nil, foErr
+	for {
+		resp, sendErr := s.sendCCUpstreamRequest(ctx, c, account, targetURL, chatBody, clientStream, apiKey, account.GetOpenAIUserAgent(), "")
+		if sendErr != nil {
+			return nil, sendErr
 		}
-		return s.handleErrorResponse(ctx, resp, c, account, chatBody, billingModel)
-	}
 
-	if clientStream {
-		return s.streamChatCompletionsAsResponses(c, resp, originalModel, customTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
+		if resp.StatusCode >= 400 {
+			respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
+			_ = resp.Body.Close()
+			if OpenAIImageInputIntentFromContext(ctx) {
+				if nextModel, ok := shouldRetryOpenAISameAccountVisionModel(
+					account,
+					resp.StatusCode,
+					upstreamMsg,
+					respBody,
+					upstreamModel,
+					visionTried,
+				); ok {
+					prevModel := upstreamModel
+					upstreamModel = nextModel
+					billingModel = nextModel
+					chatReq.Model = nextModel
+					var marshalErr error
+					chatBody, marshalErr = json.Marshal(chatReq)
+					if marshalErr != nil {
+						return nil, fmt.Errorf("marshal chat completions vision retry body: %w", marshalErr)
+					}
+					chatBody, marshalErr = s.applyOpenAIFastPolicyToBody(ctx, account, upstreamModel, chatBody)
+					if marshalErr != nil {
+						var blocked *OpenAIFastBlockedError
+						if errors.As(marshalErr, &blocked) {
+							writeOpenAIFastPolicyBlockedResponse(c, blocked)
+						}
+						return nil, marshalErr
+					}
+					visionTried[strings.ToLower(nextModel)] = struct{}{}
+					logger.LegacyPrintf(
+						"service.openai_gateway",
+						"[OpenAI] Vision same-account model retry (responses->chat): %s -> %s (account: %s status=%d msg=%s)",
+						prevModel,
+						nextModel,
+						account.Name,
+						resp.StatusCode,
+						truncateString(upstreamMsg, 120),
+					)
+					continue
+				}
+				// Same model, drop tools/functions so pure VL models can still describe the image.
+				if !toolsStrippedForVision &&
+					(len(chatReq.Tools) > 0 || len(chatReq.Functions) > 0 || len(chatReq.ToolChoice) > 0 || len(chatReq.FunctionCall) > 0) &&
+					isOpenAICompatibleModelPayloadIncompatError(upstreamMsg, respBody) {
+					toolsStrippedForVision = true
+					chatReq.Tools = nil
+					chatReq.Functions = nil
+					chatReq.ToolChoice = nil
+					chatReq.FunctionCall = nil
+					chatReq.ParallelToolCalls = nil
+					// Drop empty custom/tool-search recovery sets; response is text-only now.
+					customTools = nil
+					toolSearch = false
+					namespaceTools = nil
+					var marshalErr error
+					chatBody, marshalErr = json.Marshal(chatReq)
+					if marshalErr != nil {
+						return nil, fmt.Errorf("marshal chat completions vision tools-stripped body: %w", marshalErr)
+					}
+					chatBody, marshalErr = s.applyOpenAIFastPolicyToBody(ctx, account, upstreamModel, chatBody)
+					if marshalErr != nil {
+						var blocked *OpenAIFastBlockedError
+						if errors.As(marshalErr, &blocked) {
+							writeOpenAIFastPolicyBlockedResponse(c, blocked)
+						}
+						return nil, marshalErr
+					}
+					logger.LegacyPrintf(
+						"service.openai_gateway",
+						"[OpenAI] Vision tools stripped for same-account retry (responses->chat): model=%s account=%s status=%d msg=%s",
+						upstreamModel,
+						account.Name,
+						resp.StatusCode,
+						truncateString(upstreamMsg, 120),
+					)
+					continue
+				}
+			}
+			// Re-wrap body for shared error handlers that may re-read it.
+			resp.Body = io.NopCloser(strings.NewReader(string(respBody)))
+			if foErr := s.failoverOpenAIUpstreamHTTPError(ctx, c, account, resp, respBody, upstreamMsg, upstreamModel); foErr != nil {
+				return nil, foErr
+			}
+			return s.handleErrorResponse(ctx, resp, c, account, chatBody, billingModel)
+		}
+
+		if clientStream {
+			return s.streamChatCompletionsAsResponses(c, resp, originalModel, customTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
+		}
+		return s.bufferChatCompletionsAsResponses(c, resp, originalModel, customTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
 	}
-	return s.bufferChatCompletionsAsResponses(c, resp, originalModel, customTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
 }
 
 func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(

@@ -683,6 +683,10 @@ func (r *usageLogRepository) GetStatsWithFilters(ctx context.Context, filters Us
 		args = append(args, int16(*filters.BillingType))
 	}
 	conditions, args = appendUsageLogBillingModeWhereCondition(conditions, args, filters.BillingMode)
+	if node := strings.TrimSpace(filters.IngressNode); node != "" {
+		conditions = append(conditions, fmt.Sprintf("ingress_node = $%d", len(args)+1))
+		args = append(args, node)
+	}
 	if filters.StartTime != nil {
 		conditions = append(conditions, fmt.Sprintf("created_at >= $%d", len(args)+1))
 		args = append(args, *filters.StartTime)
@@ -1145,35 +1149,85 @@ func (r *usageLogRepository) GetAccountUsageStats(ctx context.Context, accountID
 }
 
 // GetAccountLifetimeStats returns all-time totals for an account.
+// cost/standard_cost/user_cost 口径与 GetAccountTodayStats 一致。
 func (r *usageLogRepository) GetAccountLifetimeStats(ctx context.Context, accountID int64) (*usagestats.AccountStats, error) {
 	query := `
 		SELECT
 			COUNT(*) as requests,
 			COALESCE(SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens), 0) as tokens,
-			COALESCE(SUM(total_cost), 0) as cost,
-			COALESCE(SUM(COALESCE(account_stats_cost, total_cost) * COALESCE(account_rate_multiplier, 1)), 0) as standard_cost,
+			COALESCE(SUM(COALESCE(account_stats_cost, total_cost) * COALESCE(account_rate_multiplier, 1)), 0) as cost,
+			COALESCE(SUM(total_cost), 0) as standard_cost,
 			COALESCE(SUM(actual_cost), 0) as user_cost
 		FROM usage_logs
 		WHERE account_id = $1
 	`
-	var stats usagestats.AccountStats
-	rows, err := r.sql.QueryContext(ctx, query, accountID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	if !rows.Next() {
-		return &stats, nil
-	}
-	err = rows.Scan(
+
+	stats := &usagestats.AccountStats{}
+	if err := scanSingleRow(
+		ctx,
+		r.sql,
+		query,
+		[]any{accountID},
 		&stats.Requests,
 		&stats.Tokens,
 		&stats.Cost,
 		&stats.StandardCost,
 		&stats.UserCost,
-	)
+	); err != nil {
+		return nil, err
+	}
+	return stats, nil
+}
+
+// GetAccountLifetimeStatsBatch 批量获取账号全量（all-time）统计。
+// 返回 map[accountID]*AccountStats，未命中的账号返回零值，便于上层直接复用。
+func (r *usageLogRepository) GetAccountLifetimeStatsBatch(ctx context.Context, accountIDs []int64) (map[int64]*usagestats.AccountStats, error) {
+	result := make(map[int64]*usagestats.AccountStats, len(accountIDs))
+	if len(accountIDs) == 0 {
+		return result, nil
+	}
+
+	query := `
+		SELECT
+			account_id,
+			COUNT(*) as requests,
+			COALESCE(SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens), 0) as tokens,
+			COALESCE(SUM(COALESCE(account_stats_cost, total_cost) * COALESCE(account_rate_multiplier, 1)), 0) as cost,
+			COALESCE(SUM(total_cost), 0) as standard_cost,
+			COALESCE(SUM(actual_cost), 0) as user_cost
+		FROM usage_logs
+		WHERE account_id = ANY($1)
+		GROUP BY account_id
+	`
+	rows, err := r.sql.QueryContext(ctx, query, pq.Array(accountIDs))
 	if err != nil {
 		return nil, err
 	}
-	return &stats, nil
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var accountID int64
+		stats := &usagestats.AccountStats{}
+		if err := rows.Scan(
+			&accountID,
+			&stats.Requests,
+			&stats.Tokens,
+			&stats.Cost,
+			&stats.StandardCost,
+			&stats.UserCost,
+		); err != nil {
+			return nil, err
+		}
+		result[accountID] = stats
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	for _, accountID := range accountIDs {
+		if _, ok := result[accountID]; !ok {
+			result[accountID] = &usagestats.AccountStats{}
+		}
+	}
+	return result, nil
 }

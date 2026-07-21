@@ -289,6 +289,9 @@ type defaultOpenAIAccountScheduler struct {
 	service *OpenAIGatewayService
 	metrics openAIAccountSchedulerMetrics
 	stats   *openAIAccountRuntimeStats
+	// noCandidateLogAt 节流"选出 0 候选"的分类诊断日志(纳秒时间戳)。选号连续失败时
+	// 实测可达每分钟数百次，逐次输出会刷屏拖垮内存紧张的 VPS journal，故按 5s 采样。
+	noCandidateLogAt atomic.Int64
 }
 
 type openAISelectionProbeBudget struct {
@@ -1344,6 +1347,8 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		return nil, 0, 0, 0, err
 	}
 	if len(accounts) == 0 {
+		// 快照/DB 直接返回空：区别于"有候选但被全过滤"，通常指向快照未就绪或该组无号。
+		s.logOpenAINoCandidate(ctx, req, accounts, nil, "snapshot_empty")
 		return nil, 0, 0, 0, noAvailableOpenAISelectionError(req.RequestedModel, false)
 	}
 
@@ -1388,6 +1393,9 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		})
 	}
 	if len(filtered) == 0 {
+		// 有候选却被主过滤循环全部剔除：输出各原因计数(尤其内存 runtime block)以便定位
+		// "仪表盘显示可用却选不出"。
+		s.logOpenAINoCandidate(ctx, req, accounts, schedGroup, "all_filtered")
 		return nil, 0, 0, 0, noAvailableOpenAISelectionError(req.RequestedModel, false)
 	}
 
@@ -1446,6 +1454,181 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		return attempt.result, attempt.candidateCount, attempt.topK, attempt.loadSkew, nil
 	}
 	return s.finishLoadBalanceSelectionFallback(ctx, req, attempt, budget)
+}
+
+// logOpenAINoCandidate 在选号"零候选"时输出分类诊断，补齐 grok/OpenAI 选号路径原本
+// 只有一行 "no available Grok accounts" 的诊断黑洞：把每个账号被过滤的首要原因统计出来，
+// 尤其暴露对 DB/仪表盘不可见的内存 runtime block(它曾导致"仪表盘显示可用却一直选不出")。
+// 分类顺序与 selectByLoadBalance 主过滤循环保持一致，取首个命中的原因；日志按 5s 节流防刷屏。
+// stage 区分是快照/DB 直接返回空(snapshot_empty)还是候选被全部过滤(all_filtered)。
+func (s *defaultOpenAIAccountScheduler) logOpenAINoCandidate(ctx context.Context, req OpenAIAccountScheduleRequest, accounts []Account, schedGroup *Group, stage string) {
+	if s == nil || s.service == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := s.noCandidateLogAt.Load()
+	if now-last < int64(5*time.Second) {
+		return
+	}
+	if !s.noCandidateLogAt.CompareAndSwap(last, now) {
+		return
+	}
+
+	platform := normalizeOpenAICompatiblePlatform(req.Platform)
+	var excluded, notSchedulable, platformFiltered, runtimeBlocked, privacyUnset int
+	var modelUnsupported, quotaPaused, capability, transport, otherIncompat, eligible int
+	sampleBlocked := make([]int64, 0, 5)
+	for i := range accounts {
+		account := &accounts[i]
+		if req.ExcludedIDs != nil {
+			if _, ex := req.ExcludedIDs[account.ID]; ex {
+				excluded++
+				continue
+			}
+		}
+		if !account.IsSchedulable() {
+			notSchedulable++
+			continue
+		}
+		if account.Platform != platform || !account.IsOpenAICompatible() {
+			platformFiltered++
+			continue
+		}
+		// 内存 runtime block 不落 DB，是最隐蔽的过滤原因，单独统计并抽样账号 ID。
+		if s.service.isOpenAIAccountRequestRuntimeBlocked(account, req.RequestedModel) {
+			runtimeBlocked++
+			if len(sampleBlocked) < 5 {
+				sampleBlocked = append(sampleBlocked, account.ID)
+			}
+			continue
+		}
+		if schedGroup != nil && schedGroup.RequirePrivacySet && !account.IsPrivacySet() {
+			privacyUnset++
+			continue
+		}
+		if req.RequestedModel != "" && !account.IsModelSupported(req.RequestedModel) {
+			modelUnsupported++
+			continue
+		}
+		if paused, _ := shouldAutoPauseOpenAIAccountByQuota(ctx, account); paused {
+			quotaPaused++
+			continue
+		}
+		if !accountSupportsOpenAICapabilities(account, req.RequiredCapability, req.RequiredImageCapability) {
+			capability++
+			continue
+		}
+		if !s.isAccountTransportCompatible(account, req.RequiredTransport) {
+			transport++
+			continue
+		}
+		if !s.isAccountRequestCompatible(ctx, account, req) {
+			otherIncompat++
+			continue
+		}
+		// eligible>0 却仍走到"零候选"分支，说明主循环与本诊断口径漂移，需排查。
+		eligible++
+	}
+	slog.Warn("openai.select_no_candidate_detail",
+		"stage", stage,
+		"group_id", derefGroupID(req.GroupID),
+		"platform", platform,
+		"model", req.RequestedModel,
+		"snapshot_total", len(accounts),
+		"excluded", excluded,
+		"not_schedulable", notSchedulable,
+		"platform_filtered", platformFiltered,
+		"runtime_blocked", runtimeBlocked,
+		"privacy_unset", privacyUnset,
+		"model_unsupported", modelUnsupported,
+		"quota_paused", quotaPaused,
+		"capability_unsupported", capability,
+		"transport_filtered", transport,
+		"other_incompatible", otherIncompat,
+		"eligible", eligible,
+		"sample_runtime_blocked", sampleBlocked,
+	)
+}
+
+// logOpenAIFallbackNoCandidate 在负载均衡 fallback 仍选不出账号时，逐个打印 selectionOrder
+// 里每个候选被拒的首要原因，尤其区分"已冷却/限流(not_schedulable)" vs "配额暂停(quota_paused)"
+// vs "内存封禁(runtime_blocked)"。这是定位"健康号在池里却选不出、重试也不恢复"的关键：能看出
+// TopK 尝试队列里到底卡在哪、以及健康号有没有进 selectionOrder。复用 noCandidateLogAt 的 5s 节流。
+func (s *defaultOpenAIAccountScheduler) logOpenAIFallbackNoCandidate(ctx context.Context, req OpenAIAccountScheduleRequest, order []openAIAccountCandidateScore, candidateCount, topK int, stage string) {
+	if s == nil || s.service == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := s.noCandidateLogAt.Load()
+	if now-last < int64(5*time.Second) {
+		return
+	}
+	if !s.noCandidateLogAt.CompareAndSwap(last, now) {
+		return
+	}
+	reasons := map[string]int{}
+	samples := make([]string, 0, 12)
+	for i := range order {
+		acc := order[i].account
+		if acc == nil {
+			continue
+		}
+		reason := s.diagnoseOpenAICandidateReject(ctx, req, acc)
+		reasons[reason]++
+		if len(samples) < 12 {
+			samples = append(samples, fmt.Sprintf("%d:%s", acc.ID, reason))
+		}
+	}
+	slog.Warn("openai.select_fallback_no_candidate",
+		"stage", stage,
+		"group_id", derefGroupID(req.GroupID),
+		"platform", normalizeOpenAICompatiblePlatform(req.Platform),
+		"model", req.RequestedModel,
+		"candidate_count", candidateCount,
+		"top_k", topK,
+		"selection_order_len", len(order),
+		"reject_reasons", fmt.Sprintf("%v", reasons),
+		"samples", samples,
+	)
+}
+
+// diagnoseOpenAICandidateReject 复刻 resolveFresh/recheck 的检查顺序，返回该候选被拒的首要原因，
+// 供诊断日志归类；顺序须与真实过滤一致，取第一个命中项。
+func (s *defaultOpenAIAccountScheduler) diagnoseOpenAICandidateReject(ctx context.Context, req OpenAIAccountScheduleRequest, account *Account) string {
+	fresh := account
+	if s.service.schedulerSnapshot != nil {
+		cur, err := s.service.getSchedulableAccount(ctx, account.ID)
+		if err != nil || cur == nil {
+			return "snapshot_fetch_nil"
+		}
+		fresh = cur
+	}
+	if !fresh.IsSchedulable() {
+		return "not_schedulable"
+	}
+	if req.RequestedModel != "" && !fresh.IsSchedulableForModelWithContext(ctx, req.RequestedModel) {
+		return "model_rate_limited"
+	}
+	if fresh.IsGrok() {
+		if paused, _ := shouldAutoPauseGrokAccountByQuota(fresh); paused {
+			return "grok_quota_paused"
+		}
+	} else if fresh.IsOpenAI() {
+		if paused, _ := shouldAutoPauseOpenAIAccountByQuota(ctx, fresh); paused {
+			return "openai_quota_paused"
+		}
+	}
+	if req.RequestedModel != "" && !fresh.IsModelSupported(req.RequestedModel) {
+		return "model_unsupported"
+	}
+	if s.service.isOpenAIAccountRequestRuntimeBlocked(fresh, req.RequestedModel) {
+		return "runtime_blocked"
+	}
+	if !s.isAccountTransportCompatible(fresh, req.RequiredTransport) {
+		return "transport"
+	}
+	// 走到这说明该候选按当前状态本应可选——若大量出现说明主循环与本诊断口径漂移或存在竞态。
+	return "eligible_but_unpicked"
 }
 
 func partitionOpenAIChatGPTSubscriptionAccounts(accounts []*Account) ([]*Account, []*Account) {
@@ -1581,6 +1764,7 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 	loadSkew := attempt.loadSkew
 
 	if len(attempt.selectionOrder) == 0 {
+		s.logOpenAIFallbackNoCandidate(ctx, req, attempt.selectionOrder, candidateCount, topK, "empty_selection_order")
 		return nil, candidateCount, topK, loadSkew, noAvailableOpenAISelectionError(req.RequestedModel, attempt.compactBlocked)
 	}
 
@@ -1638,6 +1822,7 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 		}
 	}
 
+	s.logOpenAIFallbackNoCandidate(ctx, req, attempt.selectionOrder, candidateCount, topK, "all_rejected")
 	return nil, candidateCount, topK, loadSkew, noAvailableOpenAISelectionError(req.RequestedModel, compactBlocked)
 }
 
@@ -1690,6 +1875,11 @@ func (s *defaultOpenAIAccountScheduler) isAccountRequestCompatible(ctx context.C
 		return false
 	}
 	if req.RequestedModel != "" && !account.IsModelSupported(req.RequestedModel) {
+		return false
+	}
+	// After a GLM-mapped account hit a context-window limit, avoid selecting other
+	// accounts that still map the same request onto GLM.
+	if shouldSkipGLMMappedAccountForContextWindow(ctx, account, req.RequestedModel) {
 		return false
 	}
 	if req.GroupID != nil && s != nil && s.service != nil &&

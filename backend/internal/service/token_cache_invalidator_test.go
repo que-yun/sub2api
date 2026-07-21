@@ -191,6 +191,10 @@ func TestCompositeTokenCacheInvalidator_SkipNonOAuth(t *testing.T) {
 			cache.deletedKeys = nil
 			err := invalidator.InvalidateToken(context.Background(), tt.account)
 			require.NoError(t, err)
+			if tt.account.Type == AccountTypeSetupToken && tt.account.Platform == PlatformAnthropic {
+				require.Equal(t, []string{"claude:account:4"}, cache.deletedKeys)
+				return
+			}
 			require.Empty(t, cache.deletedKeys)
 		})
 	}

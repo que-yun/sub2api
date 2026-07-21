@@ -605,6 +605,10 @@ func normalizeWeChatConnectConfig(cfg *WeChatConnectConfig) {
 type TokenRefreshConfig struct {
 	// 是否启用自动刷新
 	Enabled bool `mapstructure:"enabled"`
+	// 是否允许在请求路径上按需刷新 access_token。
+	// 本机凭证权威节点保持 true；VPS standby 应设为 false，过期后冷却并等待本地同步，
+	// 避免与本机竞争一次性 refresh_token。
+	RequestRefreshEnabled bool `mapstructure:"request_refresh_enabled"`
 	// 检查间隔（分钟）
 	CheckIntervalMinutes int `mapstructure:"check_interval_minutes"`
 	// 提前刷新时间（小时），在token过期前多久开始刷新
@@ -625,6 +629,13 @@ type TokenRefreshConfig struct {
 	AttemptTimeoutSeconds int `mapstructure:"attempt_timeout_seconds"`
 	// 单个后台刷新周期的总超时（秒）
 	CycleTimeoutSeconds int `mapstructure:"cycle_timeout_seconds"`
+	// 本地 Anthropic setup-token 刷新成功后，是否立刻触发推送到 VPS 的脚本。
+	// 仅凭证权威节点应开启；VPS standby 保持 false。
+	AnthropicSetupTokenVPSSyncEnabled bool `mapstructure:"anthropic_setup_token_vps_sync_enabled"`
+	// 推送脚本路径（绝对路径或相对进程工作目录）。空则用默认 launchd 包装脚本。
+	AnthropicSetupTokenVPSSyncCommand string `mapstructure:"anthropic_setup_token_vps_sync_command"`
+	// 连续刷新成功时的触发防抖秒数；与脚本自身 lock 配合，避免打爆 SSH。
+	AnthropicSetupTokenVPSSyncDebounceSeconds int `mapstructure:"anthropic_setup_token_vps_sync_debounce_seconds"`
 }
 
 // GrokErrorRecoveryConfig 周期性探测 Grok OAuth entitlement/403 error 账号并尝试恢复。
@@ -2203,6 +2214,7 @@ func setDefaults() {
 
 	// TokenRefresh
 	viper.SetDefault("token_refresh.enabled", true)
+	viper.SetDefault("token_refresh.request_refresh_enabled", true) // 请求路径按需刷新；VPS 关
 	viper.SetDefault("token_refresh.check_interval_minutes", 5)        // 每5分钟检查一次
 	viper.SetDefault("token_refresh.refresh_before_expiry_hours", 0.5) // 提前30分钟刷新（适配Google 1小时token）
 	viper.SetDefault("token_refresh.max_retries", 3)                   // 最多重试3次
@@ -2213,6 +2225,9 @@ func setDefaults() {
 	viper.SetDefault("token_refresh.provider_failure_threshold", 3)
 	viper.SetDefault("token_refresh.attempt_timeout_seconds", 15)
 	viper.SetDefault("token_refresh.cycle_timeout_seconds", 240)
+	viper.SetDefault("token_refresh.anthropic_setup_token_vps_sync_enabled", false)
+	viper.SetDefault("token_refresh.anthropic_setup_token_vps_sync_command", "deploy/run_vps_anthropic_setup_token_sync_launchd.sh")
+	viper.SetDefault("token_refresh.anthropic_setup_token_vps_sync_debounce_seconds", 30)
 
 	// GrokErrorRecovery: sticky entitlement/403 recovery (not full-pool token refresh)
 	viper.SetDefault("grok_error_recovery.enabled", true)

@@ -713,6 +713,9 @@ func (s *AccountTestService) testGrokAccountConnection(c *gin.Context, account *
 		var err error
 		authToken, err = s.grokTokenProvider.GetAccessToken(ctx, account)
 		if err != nil {
+			// Admin test is an explicit health check: persist unrecoverable token failures
+			// so dead OAuth accounts leave the active/schedulable pool immediately.
+			MarkGrokTokenAcquisitionFailure(ctx, s.accountRepo, account, err)
 			return s.sendErrorAndEnd(c, fmt.Sprintf("Failed to get Grok access token: %s", err.Error()))
 		}
 	case AccountTypeAPIKey:
@@ -791,10 +794,17 @@ func (s *AccountTestService) testGrokAccountConnection(c *gin.Context, account *
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		// Mirror production readiness side effects for admin health checks.
+		ApplyGrokProbeOrTestStatus(ctx, s.accountRepo, nil, account, resp.StatusCode, resp.Header, body, "account_test")
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Grok Responses API returned %d: %s", resp.StatusCode, string(body)))
 	}
 
-	return s.processOpenAIStream(c, resp.Body)
+	err = s.processOpenAIStream(c, resp.Body)
+	if err == nil {
+		// Successful chat probe clears sticky 403/error so recovered accounts re-enter scheduling.
+		ClearGrokHoldAfterSuccess(ctx, s.accountRepo, nil, account)
+	}
+	return err
 }
 
 // testOpenAIChatCompletionsConnection tests an OpenAI-compatible APIKey account

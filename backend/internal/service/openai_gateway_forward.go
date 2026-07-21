@@ -84,6 +84,12 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	if account.Type == AccountTypeAPIKey && !openai_compat.ShouldUseResponsesAPI(account.Extra) {
 		return s.forwardResponsesViaRawChatCompletions(ctx, c, account, body)
 	}
+	// Image-input on multi-model OpenAI-compatible pools is more reliable via
+	// /v1/chat/completions + VL remap. force_responses on ollama/nvidia often
+	// 400/500s even when chat vision works on the same account.
+	if account.Type == AccountTypeAPIKey && OpenAIImageInputIntentFromContext(ctx) && preferOpenAIVisionChatFallback(account, reqModel) {
+		return s.forwardResponsesViaRawChatCompletions(ctx, c, account, body)
+	}
 
 	compatMessagesBridge := isOpenAICompatMessagesBridgeBody(body)
 	setOpenAICompatMessagesBridgeContext(c, compatMessagesBridge)
@@ -764,6 +770,18 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	httpInvalidEncryptedContentRetryTried := false
 	agentTaskRecoveryTried := false
 	rejectedFieldRetryState := newOpenAIResponsesRejectedFieldRetryState(body)
+	// Ollama large-body salvage: try other long-context models on the same
+	// account before account-level failover.
+	olamaLargeContextTriedModels := map[string]struct{}{}
+	if strings.TrimSpace(upstreamModel) != "" {
+		olamaLargeContextTriedModels[strings.ToLower(strings.TrimSpace(upstreamModel))] = struct{}{}
+	}
+	// Image-input salvage: prefer other multimodal models on the same multi-
+	// model account instead of immediately hopping accounts.
+	visionSameAccountTriedModels := map[string]struct{}{}
+	if OpenAIImageInputIntentFromContext(ctx) && strings.TrimSpace(upstreamModel) != "" {
+		visionSameAccountTriedModels[strings.ToLower(strings.TrimSpace(upstreamModel))] = struct{}{}
+	}
 	for {
 		// Build upstream request
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
@@ -865,7 +883,69 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying non-WSv2 request after %s (account: %s)", reason, account.Name)
 				continue
 			}
-			if s.shouldFailoverOpenAIUpstreamResponse(resp.StatusCode, upstreamMsg, respBody) {
+			// Same-account model ladder for Ollama: glm-5.2 often fails to ingest
+			// oversized Codex payloads ("failed to read request body"); upgrade to
+			// long-context models already exposed by this account before switching
+			// accounts.
+			if nextModel, ok := shouldRetryOpenAISameAccountLargeContextModel(
+				account,
+				resp.StatusCode,
+				upstreamMsg,
+				respBody,
+				upstreamModel,
+				olamaLargeContextTriedModels,
+			); ok {
+				prevModel := upstreamModel
+				body = ReplaceModelInBody(body, nextModel)
+				requestView = newOpenAIRequestView(body)
+				reqBody = nil
+				upstreamModel = nextModel
+				billingModel = nextModel
+				reqModel = nextModel
+				olamaLargeContextTriedModels[strings.ToLower(nextModel)] = struct{}{}
+				rejectedFieldRetryState.remember(body)
+				logger.LegacyPrintf(
+					"service.openai_gateway",
+					"[OpenAI] Ollama large-body same-account model retry: %s -> %s (account: %s status=%d msg=%s)",
+					prevModel,
+					nextModel,
+					account.Name,
+					resp.StatusCode,
+					truncateString(upstreamMsg, 120),
+				)
+				continue
+			}
+			if OpenAIImageInputIntentFromContext(ctx) {
+				if nextModel, ok := shouldRetryOpenAISameAccountVisionModel(
+					account,
+					resp.StatusCode,
+					upstreamMsg,
+					respBody,
+					upstreamModel,
+					visionSameAccountTriedModels,
+				); ok {
+					prevModel := upstreamModel
+					body = ReplaceModelInBody(body, nextModel)
+					requestView = newOpenAIRequestView(body)
+					reqBody = nil
+					upstreamModel = nextModel
+					billingModel = nextModel
+					reqModel = nextModel
+					visionSameAccountTriedModels[strings.ToLower(nextModel)] = struct{}{}
+					rejectedFieldRetryState.remember(body)
+					logger.LegacyPrintf(
+						"service.openai_gateway",
+						"[OpenAI] Vision same-account model retry: %s -> %s (account: %s status=%d msg=%s)",
+						prevModel,
+						nextModel,
+						account.Name,
+						resp.StatusCode,
+						truncateString(upstreamMsg, 120),
+					)
+					continue
+				}
+			}
+			if s.shouldFailoverOpenAIUpstreamResponse(resp.StatusCode, upstreamMsg, respBody, account, originalModel) {
 				upstreamDetail := ""
 				if s.cfg != nil && s.cfg.Gateway.LogUpstreamErrorBody {
 					maxBytes := s.cfg.Gateway.LogUpstreamErrorBodyMaxBytes
@@ -892,6 +972,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					respBody,
 					upstreamMsg,
 					account.IsPoolMode() && (account.IsPoolModeRetryableStatus(resp.StatusCode) || isOpenAITransientProcessingError(resp.StatusCode, upstreamMsg, respBody)),
+					account,
+					originalModel,
 				)
 			}
 			return s.handleErrorResponse(ctx, resp, c, account, body, billingModel)

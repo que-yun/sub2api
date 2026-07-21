@@ -85,6 +85,7 @@ type OpenAITokenProvider struct {
 	refreshAPI         *OAuthRefreshAPI
 	executor           OAuthRefreshExecutor
 	refreshPolicy      ProviderRefreshPolicy
+	requestRefreshOff  bool // true: 请求路径不刷新，等待本机同步
 }
 
 func NewOpenAITokenProvider(
@@ -116,6 +117,15 @@ func (p *OpenAITokenProvider) SetAccountRuntimeBlocker(blocker AccountRuntimeBlo
 	p.runtimeBlocker = blocker
 }
 
+// SetRequestRefreshEnabled controls refresh-token use from the request path.
+// Disable on VPS standby so only the local authority mints/rotates OpenAI OAuth tokens.
+func (p *OpenAITokenProvider) SetRequestRefreshEnabled(enabled bool) {
+	if p == nil {
+		return
+	}
+	p.requestRefreshOff = !enabled
+}
+
 func (p *OpenAITokenProvider) SnapshotRuntimeMetrics() OpenAITokenRuntimeMetrics {
 	if p == nil {
 		return OpenAITokenRuntimeMetrics{}
@@ -141,13 +151,23 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	}
 
 	cacheKey := OpenAITokenCacheKey(account)
+	expiresAt := account.GetCredentialAsTime("expires_at")
+	accountAccessToken := strings.TrimSpace(account.GetOpenAIAccessToken())
+	if accountAccessToken == "" {
+		accountAccessToken = strings.TrimSpace(account.GetCredential("access_token"))
+	}
 
-	// 1) Try cache first.
+	// 1) Try cache first. Only accept when cached AT matches DB credentials
+	// (after local->VPS push, stale Redis must not win over PG).
 	if p.tokenCache != nil {
-		if token, err := p.tokenCache.GetAccessToken(ctx, cacheKey); err == nil && strings.TrimSpace(token) != "" {
-			slog.Debug("openai_token_cache_hit", "account_id", account.ID)
-			return token, nil
-		} else if err != nil {
+		if token, err := p.tokenCache.GetAccessToken(ctx, cacheKey); err == nil {
+			cachedToken := strings.TrimSpace(token)
+			if cachedToken != "" && accountAccessToken != "" && cachedToken == accountAccessToken &&
+				(expiresAt == nil || time.Now().Before(*expiresAt)) {
+				slog.Debug("openai_token_cache_hit", "account_id", account.ID)
+				return cachedToken, nil
+			}
+		} else {
 			slog.Warn("openai_token_cache_get_failed", "account_id", account.ID, "error", err)
 		}
 	}
@@ -155,7 +175,6 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	slog.Debug("openai_token_cache_miss", "account_id", account.ID)
 
 	// 2) Refresh if needed (pre-expiry skew).
-	expiresAt := account.GetCredentialAsTime("expires_at")
 	needsRefresh := !account.IsOpenAIPersonalAccessToken() && (expiresAt == nil || time.Until(*expiresAt) <= openAITokenRefreshSkew)
 	if needsRefresh && strings.TrimSpace(account.GetOpenAIRefreshToken()) == "" {
 		if expiresAt != nil && !time.Now().Before(*expiresAt) {
@@ -169,7 +188,13 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	}
 	refreshFailed := false
 
-	if needsRefresh && p.refreshAPI != nil && p.executor != nil {
+	if needsRefresh && p.requestRefreshOff {
+		// VPS / 只读节点：不调用 token endpoint，沿用库内 access_token。
+		if expiresAt == nil || !time.Now().Before(*expiresAt) {
+			return "", errors.New("openai access_token expired; await local credential sync")
+		}
+		// 仍在 skew 窗口内：继续用现有 access_token，不刷新。
+	} else if needsRefresh && p.refreshAPI != nil && p.executor != nil {
 		p.metrics.refreshRequests.Add(1)
 		p.metrics.touchNow()
 

@@ -100,6 +100,66 @@ func MarkGrokHoldUntilSuccess(ctx context.Context, repo AccountRepository, accou
 	account.Extra[grokHoldUntilSuccessExtraKey] = true
 }
 
+// IsGrokPermissionDeniedBody reports whether an upstream body is a real
+// chat entitlement/permission denial rather than free-usage exhaustion.
+func IsGrokPermissionDeniedBody(body []byte) bool {
+	if freeInfo := xai.ParseFreeUsageExhaustedBody(body); freeInfo != nil && freeInfo.Exhausted {
+		return false
+	}
+	low := strings.ToLower(string(body))
+	if strings.Contains(low, "permission-denied") {
+		return true
+	}
+	if strings.Contains(low, "access to the chat endpoint is denied") {
+		return true
+	}
+	if strings.Contains(low, "entitlement") && (strings.Contains(low, "denied") || strings.Contains(low, "subscription")) {
+		return true
+	}
+	if strings.Contains(low, "subscription tier") {
+		return true
+	}
+	return false
+}
+
+// MarkGrokTokenAcquisitionFailure persists unrecoverable OAuth token failures
+// seen by admin test / explicit health checks. Recoverable transport noise is
+// left untouched so a single blip does not kill the account.
+func MarkGrokTokenAcquisitionFailure(ctx context.Context, repo AccountRepository, account *Account, err error) {
+	if repo == nil || account == nil || account.ID <= 0 || err == nil {
+		return
+	}
+	msg := strings.ToLower(err.Error())
+	permanent := strings.Contains(msg, "invalid_grant") ||
+		strings.Contains(msg, "refresh token has been revoked") ||
+		(strings.Contains(msg, "refresh_token") && strings.Contains(msg, "revoked")) ||
+		strings.Contains(msg, "oauth refresh account state changed") ||
+		strings.Contains(msg, "account state changed") ||
+		strings.Contains(msg, "token_expired") ||
+		strings.Contains(msg, "app_session_terminated") ||
+		strings.Contains(msg, "access token is missing") ||
+		strings.Contains(msg, "refresh token is missing") ||
+		strings.Contains(msg, "no refresh token")
+	if !permanent {
+		until := time.Now().Add(10 * time.Minute)
+		_ = repo.SetTempUnschedulable(ctx, account.ID, until, "grok oauth token acquisition failed")
+		account.TempUnschedulableUntil = &until
+		account.TempUnschedulableReason = "grok oauth token acquisition failed"
+		return
+	}
+	errMsg := "oauth refresh account state changed / token reauth required"
+	if strings.Contains(msg, "invalid_grant") || strings.Contains(msg, "revoked") {
+		errMsg = "oauth refresh token revoked / reauth required"
+	}
+	_ = repo.SetError(ctx, account.ID, errMsg)
+	account.Status = StatusError
+	account.Schedulable = false
+	account.ErrorMessage = errMsg
+	account.TempUnschedulableUntil = nil
+	account.TempUnschedulableReason = ""
+}
+
+
 // ApplyGrokProbeOrTestStatus applies the same readiness side effects that
 // production traffic uses when an admin probe/test hits upstream.
 //

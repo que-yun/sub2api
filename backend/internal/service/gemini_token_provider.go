@@ -23,6 +23,7 @@ type GeminiTokenProvider struct {
 	refreshAPI         *OAuthRefreshAPI
 	executor           OAuthRefreshExecutor
 	refreshPolicy      ProviderRefreshPolicy
+	requestRefreshOff  bool // true: 请求路径不刷新，等待本机同步
 }
 
 func NewGeminiTokenProvider(
@@ -49,6 +50,15 @@ func (p *GeminiTokenProvider) SetRefreshPolicy(policy ProviderRefreshPolicy) {
 	p.refreshPolicy = policy
 }
 
+// SetRequestRefreshEnabled controls refresh-token use from the request path.
+// Disable on VPS standby so only the local authority mints/rotates Gemini OAuth tokens.
+func (p *GeminiTokenProvider) SetRequestRefreshEnabled(enabled bool) {
+	if p == nil {
+		return
+	}
+	p.requestRefreshOff = !enabled
+}
+
 func (p *GeminiTokenProvider) GetAccessToken(ctx context.Context, account *Account) (string, error) {
 	if account == nil {
 		return "", errors.New("account is nil")
@@ -61,19 +71,30 @@ func (p *GeminiTokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	}
 
 	cacheKey := GeminiTokenCacheKey(account)
+	expiresAt := account.GetCredentialAsTime("expires_at")
+	accountAccessToken := strings.TrimSpace(account.GetCredential("access_token"))
 
-	// 1) Try cache first.
+	// 1) Try cache first. Only accept when cached AT matches DB credentials.
 	if p.tokenCache != nil {
-		if token, err := p.tokenCache.GetAccessToken(ctx, cacheKey); err == nil && strings.TrimSpace(token) != "" {
-			return token, nil
+		if token, err := p.tokenCache.GetAccessToken(ctx, cacheKey); err == nil {
+			cachedToken := strings.TrimSpace(token)
+			if cachedToken != "" && accountAccessToken != "" && cachedToken == accountAccessToken &&
+				(expiresAt == nil || time.Now().Before(*expiresAt)) {
+				return cachedToken, nil
+			}
 		}
 	}
 
 	// 2) Refresh if needed (pre-expiry skew).
-	expiresAt := account.GetCredentialAsTime("expires_at")
 	needsRefresh := expiresAt == nil || time.Until(*expiresAt) <= geminiTokenRefreshSkew
 
-	if needsRefresh && p.refreshAPI != nil && p.executor != nil {
+	if needsRefresh && p.requestRefreshOff {
+		// VPS / 只读节点：不调用 token endpoint，沿用库内 access_token。
+		if expiresAt == nil || !time.Now().Before(*expiresAt) {
+			return "", errors.New("gemini access_token expired; await local credential sync")
+		}
+		// 仍在 skew 窗口内：继续用现有 access_token，不刷新。
+	} else if needsRefresh && p.refreshAPI != nil && p.executor != nil {
 		result, err := p.refreshAPI.RefreshIfNeeded(ctx, account, p.executor, geminiTokenRefreshSkew)
 		if err != nil {
 			if p.refreshPolicy.OnRefreshError == ProviderRefreshErrorReturn {

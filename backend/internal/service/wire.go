@@ -41,8 +41,16 @@ func ProvideEmailQueueService(emailService *EmailService) *EmailQueueService {
 }
 
 // ProvideOAuthRefreshAPI creates OAuthRefreshAPI with the default lock TTL.
-func ProvideOAuthRefreshAPI(accountRepo AccountRepository, tokenCache GeminiTokenCache) *OAuthRefreshAPI {
-	return NewOAuthRefreshAPI(accountRepo, tokenCache)
+func ProvideOAuthRefreshAPI(accountRepo AccountRepository, tokenCache GeminiTokenCache, cfg *config.Config) *OAuthRefreshAPI {
+	api := NewOAuthRefreshAPI(accountRepo, tokenCache)
+	if cfg != nil {
+		api.SetAnthropicSetupTokenVPSSync(newAnthropicSetupTokenVPSSyncTrigger(
+			cfg.TokenRefresh.AnthropicSetupTokenVPSSyncEnabled,
+			cfg.TokenRefresh.AnthropicSetupTokenVPSSyncCommand,
+			cfg.TokenRefresh.AnthropicSetupTokenVPSSyncDebounceSeconds,
+		))
+	}
+	return api
 }
 
 func ProvideBatchImageModelPricingResolver(resolver *ModelPricingResolver) *BatchImageModelPricingResolver {
@@ -101,11 +109,15 @@ func ProvideClaudeTokenProvider(
 	tokenCache GeminiTokenCache,
 	oauthService *OAuthService,
 	refreshAPI *OAuthRefreshAPI,
+	cfg *config.Config,
 ) *ClaudeTokenProvider {
 	p := NewClaudeTokenProvider(accountRepo, tokenCache, oauthService)
 	executor := NewClaudeTokenRefresher(oauthService)
 	p.SetRefreshAPI(refreshAPI, executor)
 	p.SetRefreshPolicy(ClaudeProviderRefreshPolicy())
+	if cfg != nil {
+		p.SetRequestRefreshEnabled(cfg.TokenRefresh.RequestRefreshEnabled)
+	}
 	return p
 }
 
@@ -115,11 +127,15 @@ func ProvideOpenAITokenProvider(
 	tokenCache GeminiTokenCache,
 	openaiOAuthService *OpenAIOAuthService,
 	refreshAPI *OAuthRefreshAPI,
+	cfg *config.Config,
 ) *OpenAITokenProvider {
 	p := NewOpenAITokenProvider(accountRepo, tokenCache, openaiOAuthService)
 	executor := NewOpenAITokenRefresher(openaiOAuthService, accountRepo)
 	p.SetRefreshAPI(refreshAPI, executor)
 	p.SetRefreshPolicy(OpenAIProviderRefreshPolicy())
+	if cfg != nil {
+		p.SetRequestRefreshEnabled(cfg.TokenRefresh.RequestRefreshEnabled)
+	}
 	return p
 }
 
@@ -222,11 +238,15 @@ func ProvideGeminiTokenProvider(
 	tokenCache GeminiTokenCache,
 	geminiOAuthService *GeminiOAuthService,
 	refreshAPI *OAuthRefreshAPI,
+	cfg *config.Config,
 ) *GeminiTokenProvider {
 	p := NewGeminiTokenProvider(accountRepo, tokenCache, geminiOAuthService)
 	executor := NewGeminiTokenRefresher(geminiOAuthService)
 	p.SetRefreshAPI(refreshAPI, executor)
 	p.SetRefreshPolicy(GeminiProviderRefreshPolicy())
+	if cfg != nil {
+		p.SetRequestRefreshEnabled(cfg.TokenRefresh.RequestRefreshEnabled)
+	}
 	return p
 }
 
@@ -237,12 +257,16 @@ func ProvideAntigravityTokenProvider(
 	antigravityOAuthService *AntigravityOAuthService,
 	refreshAPI *OAuthRefreshAPI,
 	tempUnschedCache TempUnschedCache,
+	cfg *config.Config,
 ) *AntigravityTokenProvider {
 	p := NewAntigravityTokenProvider(accountRepo, tokenCache, antigravityOAuthService)
 	executor := NewAntigravityTokenRefresher(antigravityOAuthService)
 	p.SetRefreshAPI(refreshAPI, executor)
 	p.SetRefreshPolicy(AntigravityProviderRefreshPolicy())
 	p.SetTempUnschedCache(tempUnschedCache)
+	if cfg != nil {
+		p.SetRequestRefreshEnabled(cfg.TokenRefresh.RequestRefreshEnabled)
+	}
 	return p
 }
 
@@ -253,12 +277,16 @@ func ProvideGrokTokenProvider(
 	grokOAuthService *GrokOAuthService,
 	refreshAPI *OAuthRefreshAPI,
 	tempUnschedCache TempUnschedCache,
+	cfg *config.Config,
 ) *GrokTokenProvider {
 	p := NewGrokTokenProvider(accountRepo, tokenCache)
 	executor := NewGrokTokenRefresher(grokOAuthService)
 	p.SetRefreshAPI(refreshAPI, executor)
 	p.SetRefreshPolicy(GrokProviderRefreshPolicy())
 	p.SetTempUnschedCache(tempUnschedCache)
+	if cfg != nil {
+		p.SetRequestRefreshEnabled(cfg.TokenRefresh.RequestRefreshEnabled)
+	}
 	return p
 }
 

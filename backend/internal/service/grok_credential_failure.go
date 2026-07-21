@@ -25,6 +25,7 @@ const (
 
 	GrokCredentialReasonRevoked          GatewayFailureReason = "grok_oauth_credential_revoked"
 	GrokCredentialReasonMissing          GatewayFailureReason = "grok_oauth_credentials_missing"
+	GrokCredentialReasonAwaitLocalSync   GatewayFailureReason = "grok_oauth_await_local_sync"
 	GrokCredentialReasonEntitlement      GatewayFailureReason = "grok_oauth_entitlement_action_required"
 	GrokCredentialReasonProxyInvalid     GatewayFailureReason = "grok_oauth_proxy_invalid"
 	GrokCredentialReasonRefreshTransient GatewayFailureReason = "grok_oauth_refresh_transient"
@@ -251,8 +252,12 @@ func classifyGrokCredentialFailure(account *Account, err error) grokCredentialFa
 	var containmentErr *providerCycleContainmentRefreshError
 
 	switch {
-	case errors.Is(err, errGrokOAuthRefreshTokenMissing), errors.Is(err, errGrokOAuthAccessTokenMissing), errors.Is(err, errGrokOAuthAccessTokenExpired):
+	case errors.Is(err, errGrokOAuthRefreshTokenMissing), errors.Is(err, errGrokOAuthAccessTokenMissing):
 		return grokCredentialFailureClass{scope: GatewayFailureScopeAccount, reason: GrokCredentialReasonMissing, action: NextAccountRetry, permanent: true, message: "Grok OAuth credentials are missing or expired"}
+	case errors.Is(err, errGrokOAuthAccessTokenExpired):
+		// access 过期但 RT 可能仍有效：做临时冷却，等本机 remint/refresh 后同步恢复，
+		// 避免 VPS 永久 status=error 卡死、也避免 VPS 自行 refresh 与本机双写。
+		return grokCredentialFailureClass{scope: GatewayFailureScopeAccount, reason: GrokCredentialReasonAwaitLocalSync, action: NextAccountRetry, transient: true, message: "Grok OAuth access token expired; await local credential sync"}
 	case contains("invalid_grant", "invalid_refresh_token", "token_expired", "refresh_token_reused", "refresh_token_invalidated", "app_session_terminated"):
 		return grokCredentialFailureClass{scope: GatewayFailureScopeAccount, reason: GrokCredentialReasonRevoked, action: NextAccountRetry, permanent: true, message: "Grok OAuth credentials require account action"}
 	case contains("grok_oauth_entitlement_denied", "entitlement_denied", "access_denied", "subscription required", "no active grok subscription"):
@@ -495,6 +500,15 @@ func (s *OpenAIGatewayService) validateCurrentGrokCredentialFailure(
 		credentialsStillMissing := strings.TrimSpace(latest.GetGrokAccessToken()) == "" ||
 			strings.TrimSpace(latest.GetGrokRefreshToken()) == "" || expiresAt == nil || !time.Now().Before(*expiresAt)
 		if !credentialsStillMissing {
+			return "", errOAuthRefreshAccountStateChanged
+		}
+	}
+	if class.reason == GrokCredentialReasonAwaitLocalSync {
+		// 本机已同步了未过期 access_token 时，不再重复 temp-unsched。
+		expiresAt := latest.GetCredentialAsTime("expires_at")
+		stillExpired := strings.TrimSpace(latest.GetGrokAccessToken()) == "" ||
+			expiresAt == nil || !time.Now().Before(*expiresAt)
+		if !stillExpired {
 			return "", errOAuthRefreshAccountStateChanged
 		}
 	}

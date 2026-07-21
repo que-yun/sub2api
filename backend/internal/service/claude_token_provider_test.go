@@ -231,12 +231,14 @@ func (p *testClaudeTokenProvider) GetAccessToken(ctx context.Context, account *A
 
 func TestClaudeTokenProvider_CacheHit(t *testing.T) {
 	cache := newClaudeTokenCacheStub()
+	expiresAt := time.Now().Add(1 * time.Hour).Format(time.RFC3339)
 	account := &Account{
 		ID:       100,
 		Platform: PlatformAnthropic,
 		Type:     AccountTypeOAuth,
 		Credentials: map[string]any{
-			"access_token": "db-token",
+			"access_token": "cached-token",
+			"expires_at":   expiresAt,
 		},
 	}
 	cacheKey := ClaudeTokenCacheKey(account)
@@ -249,6 +251,82 @@ func TestClaudeTokenProvider_CacheHit(t *testing.T) {
 	require.Equal(t, "cached-token", token)
 	require.Equal(t, int32(1), atomic.LoadInt32(&cache.getCalled))
 	require.Equal(t, int32(0), atomic.LoadInt32(&cache.setCalled))
+}
+
+func TestClaudeTokenProvider_StaleCacheIgnoredWhenCredentialsChanged(t *testing.T) {
+	cache := newClaudeTokenCacheStub()
+	expiresAt := time.Now().Add(1 * time.Hour).Format(time.RFC3339)
+	account := &Account{
+		ID:       1001,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token": "new-db-token",
+			"expires_at":   expiresAt,
+		},
+	}
+	cacheKey := ClaudeTokenCacheKey(account)
+	cache.tokens[cacheKey] = "stale-cached-token"
+
+	provider := NewClaudeTokenProvider(nil, cache, nil)
+
+	token, err := provider.GetAccessToken(context.Background(), account)
+	require.NoError(t, err)
+	require.Equal(t, "new-db-token", token)
+	require.Equal(t, "new-db-token", cache.tokens[cacheKey])
+}
+
+func TestClaudeTokenProvider_RequestRefreshDisabledDoesNotRefresh(t *testing.T) {
+	cache := newClaudeTokenCacheStub()
+	expiresAt := time.Now().Add(-1 * time.Minute).Format(time.RFC3339)
+	account := &Account{
+		ID:       1002,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token":  "old-token",
+			"refresh_token": "rt-must-not-be-used",
+			"expires_at":    expiresAt,
+		},
+	}
+	repo := &tokenRefreshAccountRepo{}
+	repo.accountsByID = map[int64]*Account{account.ID: account}
+	stub := &tokenRefresherStub{err: errors.New("refresh must not be called")}
+	provider := NewClaudeTokenProvider(repo, cache, nil)
+	provider.SetRefreshAPI(NewOAuthRefreshAPI(repo, cache), stub)
+	provider.SetRequestRefreshEnabled(false)
+
+	token, err := provider.GetAccessToken(context.Background(), account)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "await local credential sync")
+	require.Empty(t, token)
+	require.Zero(t, stub.calls)
+}
+
+func TestClaudeTokenProvider_RequestRefreshDisabledUsesValidAccessTokenWithoutRefresh(t *testing.T) {
+	cache := newClaudeTokenCacheStub()
+	expiresAt := time.Now().Add(claudeTokenRefreshSkew / 2).Format(time.RFC3339)
+	account := &Account{
+		ID:       1003,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token":  "still-valid-access",
+			"refresh_token": "rt-must-not-be-used",
+			"expires_at":    expiresAt,
+		},
+	}
+	repo := &tokenRefreshAccountRepo{}
+	repo.accountsByID = map[int64]*Account{account.ID: account}
+	stub := &tokenRefresherStub{err: errors.New("refresh must not be called")}
+	provider := NewClaudeTokenProvider(repo, cache, nil)
+	provider.SetRefreshAPI(NewOAuthRefreshAPI(repo, cache), stub)
+	provider.SetRequestRefreshEnabled(false)
+
+	token, err := provider.GetAccessToken(context.Background(), account)
+	require.NoError(t, err)
+	require.Equal(t, "still-valid-access", token)
+	require.Zero(t, stub.calls)
 }
 
 func TestClaudeTokenProvider_CacheMiss_FromCredentials(t *testing.T) {

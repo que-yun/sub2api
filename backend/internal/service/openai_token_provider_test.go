@@ -136,15 +136,18 @@ func (s *openAIOAuthServiceStub) BuildAccountCredentials(info *OpenAITokenInfo) 
 
 func TestOpenAITokenProvider_CacheHit(t *testing.T) {
 	cache := newOpenAITokenCacheStub()
+	expiresAt := time.Now().Add(1 * time.Hour).Format(time.RFC3339)
 	account := &Account{
 		ID:       100,
 		Platform: PlatformOpenAI,
 		Type:     AccountTypeOAuth,
 		Credentials: map[string]any{
-			"access_token": "db-token",
+			"access_token": "cached-token",
+			"expires_at":   expiresAt,
 		},
 	}
 	cacheKey := OpenAITokenCacheKey(account)
+	// Cache hit only when cached AT matches PG credentials (post local->VPS push safety).
 	cache.tokens[cacheKey] = "cached-token"
 
 	provider := NewOpenAITokenProvider(nil, cache, nil)
@@ -154,6 +157,84 @@ func TestOpenAITokenProvider_CacheHit(t *testing.T) {
 	require.Equal(t, "cached-token", token)
 	require.Equal(t, int32(1), atomic.LoadInt32(&cache.getCalled))
 	require.Equal(t, int32(0), atomic.LoadInt32(&cache.setCalled))
+}
+
+func TestOpenAITokenProvider_StaleCacheIgnoredWhenCredentialsChanged(t *testing.T) {
+	cache := newOpenAITokenCacheStub()
+	expiresAt := time.Now().Add(1 * time.Hour).Format(time.RFC3339)
+	account := &Account{
+		ID:       1001,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token": "new-db-token",
+			"expires_at":   expiresAt,
+		},
+	}
+	cacheKey := OpenAITokenCacheKey(account)
+	cache.tokens[cacheKey] = "stale-cached-token"
+
+	provider := NewOpenAITokenProvider(nil, cache, nil)
+
+	token, err := provider.GetAccessToken(context.Background(), account)
+	require.NoError(t, err)
+	require.Equal(t, "new-db-token", token)
+	require.Equal(t, "new-db-token", cache.tokens[cacheKey])
+}
+
+func TestOpenAITokenProvider_RequestRefreshDisabledDoesNotRefresh(t *testing.T) {
+	cache := newOpenAITokenCacheStub()
+	// already expired
+	expiresAt := time.Now().Add(-1 * time.Minute).Format(time.RFC3339)
+	account := &Account{
+		ID:       1002,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token":  "old-token",
+			"refresh_token": "rt-must-not-be-used",
+			"expires_at":    expiresAt,
+		},
+	}
+	repo := &tokenRefreshAccountRepo{}
+	repo.accountsByID = map[int64]*Account{account.ID: account}
+	stub := &tokenRefresherStub{err: errors.New("refresh must not be called")}
+	provider := NewOpenAITokenProvider(repo, cache, nil)
+	provider.SetRefreshAPI(NewOAuthRefreshAPI(repo, cache), stub)
+	provider.SetRequestRefreshEnabled(false)
+
+	token, err := provider.GetAccessToken(context.Background(), account)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "await local credential sync")
+	require.Empty(t, token)
+	require.Zero(t, stub.calls)
+}
+
+func TestOpenAITokenProvider_RequestRefreshDisabledUsesValidAccessTokenWithoutRefresh(t *testing.T) {
+	cache := newOpenAITokenCacheStub()
+	// inside skew window but not expired
+	expiresAt := time.Now().Add(openAITokenRefreshSkew / 2).Format(time.RFC3339)
+	account := &Account{
+		ID:       1003,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token":  "still-valid-access",
+			"refresh_token": "rt-must-not-be-used",
+			"expires_at":    expiresAt,
+		},
+	}
+	repo := &tokenRefreshAccountRepo{}
+	repo.accountsByID = map[int64]*Account{account.ID: account}
+	stub := &tokenRefresherStub{err: errors.New("refresh must not be called")}
+	provider := NewOpenAITokenProvider(repo, cache, nil)
+	provider.SetRefreshAPI(NewOAuthRefreshAPI(repo, cache), stub)
+	provider.SetRequestRefreshEnabled(false)
+
+	token, err := provider.GetAccessToken(context.Background(), account)
+	require.NoError(t, err)
+	require.Equal(t, "still-valid-access", token)
+	require.Zero(t, stub.calls)
 }
 
 func TestOpenAITokenProvider_CacheMiss_FromCredentials(t *testing.T) {

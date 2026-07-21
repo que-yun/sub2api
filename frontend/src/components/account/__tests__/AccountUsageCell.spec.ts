@@ -1141,12 +1141,14 @@ describe('AccountUsageCell', () => {
       five_hour: {
         utilization: 41,
         resets_at: '2026-07-03T10:00:00Z',
-        remaining_seconds: 3600
+        remaining_seconds: 3600,
+        window_stats: { requests: 3, tokens: 1200, cost: 0.5, standard_cost: 0.5, user_cost: 0.2 }
       },
       seven_day: {
         utilization: 56,
         resets_at: '2026-07-06T22:00:00Z',
-        remaining_seconds: 300000
+        remaining_seconds: 300000,
+        window_stats: { requests: 90, tokens: 90000, cost: 42, standard_cost: 42, user_cost: 30 }
       },
       seven_day_sonnet: {
         utilization: 30,
@@ -1172,8 +1174,8 @@ describe('AccountUsageCell', () => {
       global: {
         stubs: {
           UsageProgressBar: {
-            props: ['label', 'utilization', 'resetsAt', 'color'],
-            template: '<div class="usage-bar">{{ label }}|{{ utilization }}</div>'
+            props: ['label', 'utilization', 'resetsAt', 'windowStats', 'color'],
+            template: '<div class="usage-bar">{{ label }}|{{ utilization }}|{{ windowStats?.tokens ?? "-" }}</div>'
           },
           AccountQuotaInfo: true,
           GrokQuotaProbeCell: true
@@ -1183,10 +1185,12 @@ describe('AccountUsageCell', () => {
 
     await flushPromises()
 
-    expect(wrapper.text()).toContain('5h|41')
-    expect(wrapper.text()).toContain('7d|56')
-    expect(wrapper.text()).toContain('7d S|30')
-    expect(wrapper.text()).toContain('7d F|100')
+    // 仅 5h/7d 配额条 + window window_stats；今日/历史走 today_stats 列
+    expect(wrapper.text()).toContain('5h|41|1200')
+    expect(wrapper.text()).toContain('7d|56|90000')
+    expect(wrapper.text()).toContain('7d S|30|-')
+    expect(wrapper.text()).toContain('7d F|100|-')
+    expect(wrapper.text()).not.toContain('total 1.9K req')
   })
 
   it('Anthropic OAuth 无 Fable 数据时不渲染 7d F 进度条', async () => {
@@ -1232,4 +1236,108 @@ describe('AccountUsageCell', () => {
     expect(wrapper.text()).not.toContain('7d S')
     expect(wrapper.text()).not.toContain('7d F')
   })
+
+  it('Anthropic Setup Token 展示 5h/7d 本地 window_stats，不重复今日/历史', async () => {
+    getUsage.mockResolvedValue({
+      source: 'passive',
+      five_hour: {
+        utilization: 0,
+        remaining_seconds: 0,
+        window_stats: { requests: 2, tokens: 800, cost: 0.1, standard_cost: 0.1, user_cost: 0.05 }
+      },
+      seven_day: {
+        utilization: 56,
+        resets_at: '2026-07-20T15:00:00Z',
+        remaining_seconds: 36000,
+        window_stats: { requests: 1903, tokens: 580000000, cost: 522.87, standard_cost: 522.87, user_cost: 400 }
+      }
+    })
+
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({
+          id: 21330,
+          platform: 'anthropic',
+          type: 'setup-token',
+          extra: {}
+        }),
+        // 即使 batch 传入今日/历史，用量列也不应再画一遍
+        todayStats: {
+          requests: 8,
+          tokens: 12000,
+          cost: 0.4,
+          standard_cost: 0.4,
+          user_cost: 0.3
+        },
+        lifetimeStats: {
+          requests: 1903,
+          tokens: 580000000,
+          cost: 522.87,
+          standard_cost: 522.87,
+          user_cost: 400
+        }
+      },
+      global: {
+        stubs: {
+          UsageProgressBar: {
+            props: ['label', 'utilization', 'resetsAt', 'windowStats', 'color'],
+            template: '<div class="usage-bar">{{ label }}|{{ utilization }}|{{ windowStats?.requests ?? "-" }}</div>'
+          },
+          AccountQuotaInfo: true,
+          GrokQuotaProbeCell: true
+        }
+      }
+    })
+
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('5h|0|2')
+    expect(wrapper.text()).toContain('7d|56|1903')
+    expect(wrapper.text()).not.toContain('8 req')
+    expect(wrapper.text()).not.toContain('total 1.9K req')
+  })
+
+
+
+  it('API Key 账号同时展示今日与全量 lifetime 统计', async () => {
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({
+          id: 21521,
+          platform: 'openai',
+          type: 'apikey',
+          credentials: { api_key: 'sk-test', base_url: 'https://ollama.com/v1' },
+          extra: {}
+        }),
+        todayStats: {
+          requests: 26,
+          tokens: 898032,
+          cost: 0.92,
+          standard_cost: 0.92,
+          user_cost: 0.92
+        },
+        lifetimeStats: {
+          requests: 72,
+          tokens: 2147091,
+          cost: 2.19,
+          standard_cost: 2.19,
+          user_cost: 2.19
+        }
+      },
+      global: {
+        stubs: {
+          UsageProgressBar: true,
+          AccountQuotaInfo: true
+        }
+      }
+    })
+
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('26 req')
+    expect(wrapper.text()).toContain('A $0.92')
+    expect(wrapper.text()).toContain('total 72 req')
+    expect(wrapper.text()).toContain('A $2.19')
+  })
+
 })

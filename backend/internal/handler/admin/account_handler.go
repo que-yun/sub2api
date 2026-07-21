@@ -61,6 +61,7 @@ type AccountHandler struct {
 	sessionLimitCache       service.SessionLimitCache
 	rpmCache                service.RPMCache
 	tokenCacheInvalidator   service.TokenCacheInvalidator
+	oauthRefreshAPI         *service.OAuthRefreshAPI
 	grokImportProber        grokUsageProber
 	upstreamBillingProbe    *service.UpstreamBillingProbeService
 }
@@ -68,6 +69,11 @@ type AccountHandler struct {
 // SetUpstreamBillingProbeService attaches the optional remote billing probe service.
 func (h *AccountHandler) SetUpstreamBillingProbeService(probe *service.UpstreamBillingProbeService) {
 	h.upstreamBillingProbe = probe
+}
+
+// SetOAuthRefreshAPI 注入 OAuth 刷新 API，用于 setup-token 管理端刷新后立刻推 VPS。
+func (h *AccountHandler) SetOAuthRefreshAPI(api *service.OAuthRefreshAPI) {
+	h.oauthRefreshAPI = api
 }
 
 // NewAccountHandler creates a new admin account handler
@@ -169,6 +175,7 @@ type BulkUpdateAccountFilters struct {
 	Group       string `json:"group"`
 	Search      string `json:"search"`
 	PrivacyMode string `json:"privacy_mode"`
+	PlanType    string `json:"plan_type"`
 }
 
 // CheckMixedChannelRequest represents check mixed channel risk request
@@ -463,14 +470,14 @@ func (h *AccountHandler) listAccountSchedulerScoreFilterPool(
 	ctx context.Context,
 	platform, accountType, status, search string,
 	groupID int64,
-	privacyMode string,
+	privacyMode, planType string,
 ) []service.Account {
 	if h.adminService == nil || (platform != "" && platform != service.PlatformOpenAI) {
 		return nil
 	}
 	// 池只用于 OpenAI 分数计算（非 OpenAI 账号会在打分时被丢弃），
 	// 无论列表页平台过滤为何，查询一律限定 openai，避免无过滤时全表扫描。
-	accounts, err := h.adminService.ListAccountsForSchedulerScoreFilter(ctx, service.PlatformOpenAI, accountType, status, search, groupID, privacyMode)
+	accounts, err := h.adminService.ListAccountsForSchedulerScoreFilter(ctx, service.PlatformOpenAI, accountType, status, search, groupID, privacyMode, planType)
 	if err != nil {
 		slog.Warn("openai_scheduler_filter_score_pool_failed", "error", err)
 		return nil
@@ -487,6 +494,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 	status := c.Query("status")
 	search := c.Query("search")
 	privacyMode := strings.TrimSpace(c.Query("privacy_mode"))
+	planType := strings.TrimSpace(c.Query("plan_type"))
 	sortBy := c.DefaultQuery("sort_by", "name")
 	sortOrder := c.DefaultQuery("sort_order", "asc")
 	// 标准化和验证 search 参数
@@ -516,7 +524,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 		}
 	}
 
-	accounts, total, err := h.adminService.ListAccounts(c.Request.Context(), page, pageSize, platform, accountType, status, search, groupID, privacyMode, sortBy, sortOrder)
+	accounts, total, err := h.adminService.ListAccounts(c.Request.Context(), page, pageSize, platform, accountType, status, search, groupID, privacyMode, planType, sortBy, sortOrder)
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
@@ -543,7 +551,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 		}
 	}
 	if includeSchedulerScore && pageHasOpenAIAccounts {
-		schedulerFilterPool := h.listAccountSchedulerScoreFilterPool(c.Request.Context(), platform, accountType, status, search, groupID, privacyMode)
+		schedulerFilterPool := h.listAccountSchedulerScoreFilterPool(c.Request.Context(), platform, accountType, status, search, groupID, privacyMode, planType)
 		schedulerScores, schedulerGroupScores = h.buildOpenAIAccountSchedulerScores(c.Request.Context(), accounts, schedulerFilterPool)
 	}
 
@@ -1292,6 +1300,15 @@ func (h *AccountHandler) refreshSingleAccount(ctx context.Context, account *serv
 	h.adminService.EnsureOpenAIPrivacy(ctx, updatedAccount)
 	// Antigravity OAuth: 刷新成功后检查并设置 privacy_mode
 	h.adminService.EnsureAntigravityPrivacy(ctx, updatedAccount)
+	// 本机 Anthropic setup-token：管理端手动/批量刷新也要立刻推 VPS
+	if h.oauthRefreshAPI != nil {
+		h.oauthRefreshAPI.NotifyAnthropicSetupTokenRefreshed(updatedAccount)
+	} else if updatedAccount != nil && updatedAccount.Platform == service.PlatformAnthropic && updatedAccount.Type == service.AccountTypeSetupToken {
+		slog.Warn("token_refresh.anthropic_setup_token_vps_sync_skipped",
+			"account_id", updatedAccount.ID,
+			"reason", "oauth_refresh_api_not_injected",
+		)
+	}
 
 	return updatedAccount, "", nil
 }
@@ -1422,6 +1439,10 @@ func (h *AccountHandler) ApplyOAuthCredentials(c *gin.Context) {
 				"err", invalidateErr,
 			)
 		}
+	}
+	// 重新授权落库后凭证已变，与 /refresh 一样推 VPS（仅 setup-token 生效）。
+	if h.oauthRefreshAPI != nil {
+		h.oauthRefreshAPI.NotifyAnthropicSetupTokenRefreshed(updatedAccount)
 	}
 
 	response.Success(c, h.buildAccountResponseWithRuntime(ctx, updatedAccount))
@@ -1963,6 +1984,7 @@ func toServiceBulkUpdateAccountFilters(filters *BulkUpdateAccountFilters) *servi
 		Group:       filters.Group,
 		Search:      filters.Search,
 		PrivacyMode: filters.PrivacyMode,
+		PlanType:    filters.PlanType,
 	}
 }
 
@@ -2280,6 +2302,75 @@ func (h *AccountHandler) GetBatchTodayStats(c *gin.Context) {
 	}
 
 	stats, err := h.accountUsageService.GetTodayStatsBatch(c.Request.Context(), accountIDs)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+
+	payload := gin.H{"stats": stats}
+	cached := accountTodayStatsBatchCache.Set(cacheKey, payload)
+	if cached.ETag != "" {
+		c.Header("ETag", cached.ETag)
+		c.Header("Vary", "If-None-Match")
+	}
+	c.Header("X-Snapshot-Cache", "miss")
+	response.Success(c, payload)
+}
+
+// GetLifetimeStats handles getting account all-time statistics
+// GET /api/v1/admin/accounts/:id/lifetime-stats
+func (h *AccountHandler) GetLifetimeStats(c *gin.Context) {
+	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid account ID")
+		return
+	}
+
+	stats, err := h.accountUsageService.GetLifetimeStats(c.Request.Context(), accountID)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+
+	response.Success(c, stats)
+}
+
+// BatchLifetimeStatsRequest 批量全量统计请求体。
+type BatchLifetimeStatsRequest struct {
+	AccountIDs []int64 `json:"account_ids" binding:"required"`
+}
+
+// GetBatchLifetimeStats 批量获取多个账号的全量（all-time）统计。
+// POST /api/v1/admin/accounts/lifetime-stats/batch
+func (h *AccountHandler) GetBatchLifetimeStats(c *gin.Context) {
+	var req BatchLifetimeStatsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+
+	accountIDs := normalizeInt64IDList(req.AccountIDs)
+	if len(accountIDs) == 0 {
+		response.Success(c, gin.H{"stats": map[string]any{}})
+		return
+	}
+
+	cacheKey := "lifetime:" + buildAccountTodayStatsBatchCacheKey(accountIDs)
+	if cached, ok := accountTodayStatsBatchCache.Get(cacheKey); ok {
+		if cached.ETag != "" {
+			c.Header("ETag", cached.ETag)
+			c.Header("Vary", "If-None-Match")
+			if ifNoneMatchMatched(c.GetHeader("If-None-Match"), cached.ETag) {
+				c.Status(http.StatusNotModified)
+				return
+			}
+		}
+		c.Header("X-Snapshot-Cache", "hit")
+		response.Success(c, cached.Payload)
+		return
+	}
+
+	stats, err := h.accountUsageService.GetLifetimeStatsBatch(c.Request.Context(), accountIDs)
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
@@ -2718,7 +2809,7 @@ func (h *AccountHandler) BatchRefreshTier(c *gin.Context) {
 	accounts := make([]*service.Account, 0)
 
 	if len(req.AccountIDs) == 0 {
-		allAccounts, _, err := h.adminService.ListAccounts(ctx, 1, 10000, "gemini", "oauth", "", "", 0, "", "name", "asc")
+		allAccounts, _, err := h.adminService.ListAccounts(ctx, 1, 10000, "gemini", "oauth", "", "", 0, "", "", "name", "asc")
 		if err != nil {
 			response.ErrorFrom(c, err)
 			return

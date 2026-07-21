@@ -83,6 +83,9 @@ type TokenRefreshService struct {
 
 	// Test-only duration seam; production uses TokenRefreshConfig seconds.
 	attemptTimeoutOverride time.Duration
+
+	// 本机 setup-token 刷新成功后触发推 VPS（可选，默认关）
+	anthropicSetupTokenVPSSync *anthropicSetupTokenVPSSyncTrigger
 }
 
 // NewTokenRefreshService 创建token刷新服务
@@ -139,6 +142,17 @@ func NewTokenRefreshService(
 		{platform: PlatformGrok, refresher: grokRefresher, executor: grokRefresher},
 	}
 
+	// VPS sync trigger 优先从 OAuthRefreshAPI 共享（见 SetRefreshAPI），
+	// 避免后台路径与请求路径各建一份导致 debounce 失效、脚本连跑两次。
+	// 若未注入 refreshAPI，则在此创建本地 trigger，覆盖 legacy 直接 Refresh 路径。
+	if refreshCfg != nil {
+		s.anthropicSetupTokenVPSSync = newAnthropicSetupTokenVPSSyncTrigger(
+			refreshCfg.AnthropicSetupTokenVPSSyncEnabled,
+			refreshCfg.AnthropicSetupTokenVPSSyncCommand,
+			refreshCfg.AnthropicSetupTokenVPSSyncDebounceSeconds,
+		)
+	}
+
 	return s
 }
 
@@ -173,6 +187,11 @@ func (s *TokenRefreshService) SetPrivacyDeps(factory PrivacyClientFactory, proxy
 // SetRefreshAPI 注入统一的 OAuth 刷新 API
 func (s *TokenRefreshService) SetRefreshAPI(api *OAuthRefreshAPI) {
 	s.refreshAPI = api
+	// 与 OAuthRefreshAPI 共用同一 trigger：RefreshIfNeeded 成功时会触发一次，
+	// postRefreshActions 再触发时会命中同一 debounce，不会连推两次。
+	if api != nil && api.anthropicSetupTokenVPSSync != nil {
+		s.anthropicSetupTokenVPSSync = api.anthropicSetupTokenVPSSync
+	}
 }
 
 // SetRefreshPolicy 注入后台刷新调用侧策略（用于显式化平台/场景差异行为）。
@@ -1200,6 +1219,10 @@ func (s *TokenRefreshService) postRefreshActions(ctx context.Context, account *A
 	s.ensureOpenAIPrivacy(ctx, account)
 	// Antigravity OAuth: 刷新成功后，检查是否已设置 privacy_mode，未设置则调用 setUserSettings
 	s.ensureAntigravityPrivacy(ctx, account)
+	// 本机 Anthropic setup-token：刷新成功立刻推 VPS，缩短旧 token 401 窗口
+	if s.anthropicSetupTokenVPSSync != nil {
+		s.anthropicSetupTokenVPSSync.NotifyRefreshed(account)
+	}
 }
 
 func (s *TokenRefreshService) postRefreshStateSyncWithCleanup(parent context.Context, account *Account) {
@@ -1213,8 +1236,10 @@ func (s *TokenRefreshService) postRefreshStateSyncWithCleanup(parent context.Con
 }
 
 func (s *TokenRefreshService) postRefreshStateSync(ctx context.Context, account *Account) {
-	// 对所有 OAuth 账号调用缓存失效（InvalidateToken 内部根据平台判断是否需要处理）
-	if s.cacheInvalidator != nil && account.Type == AccountTypeOAuth {
+	// 对所有带 OAuth 凭据的账号调用缓存失效，包括 Anthropic setup-token。
+	// setup-token 也会被 ClaudeTokenProvider 缓存；只判断 AccountTypeOAuth 会让
+	// 刷新后的旧 access token 继续留在 Redis，直到 TTL 自然过期。
+	if s.cacheInvalidator != nil && account.IsOAuth() {
 		if err := s.cacheInvalidator.InvalidateToken(ctx, account); err != nil {
 			slog.Warn("token_refresh.invalidate_token_cache_failed",
 				"account_id", account.ID,

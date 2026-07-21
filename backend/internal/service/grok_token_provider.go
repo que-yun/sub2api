@@ -27,12 +27,13 @@ var (
 type GrokTokenCache = GeminiTokenCache
 
 type GrokTokenProvider struct {
-	accountRepo      AccountRepository
-	tokenCache       GrokTokenCache
-	refreshAPI       *OAuthRefreshAPI
-	executor         OAuthRefreshExecutor
-	refreshPolicy    ProviderRefreshPolicy
-	tempUnschedCache TempUnschedCache
+	accountRepo        AccountRepository
+	tokenCache         GrokTokenCache
+	refreshAPI         *OAuthRefreshAPI
+	executor           OAuthRefreshExecutor
+	refreshPolicy      ProviderRefreshPolicy
+	tempUnschedCache   TempUnschedCache
+	requestRefreshOff  bool // true: 请求路径不刷新，等待本机同步
 }
 
 func NewGrokTokenProvider(
@@ -57,6 +58,15 @@ func (p *GrokTokenProvider) SetRefreshPolicy(policy ProviderRefreshPolicy) {
 
 func (p *GrokTokenProvider) SetTempUnschedCache(cache TempUnschedCache) {
 	p.tempUnschedCache = cache
+}
+
+// SetRequestRefreshEnabled controls refresh-token use from the request path.
+// Disable on VPS standby so only the local authority mints/rotates Grok OAuth tokens.
+func (p *GrokTokenProvider) SetRequestRefreshEnabled(enabled bool) {
+	if p == nil {
+		return
+	}
+	p.requestRefreshOff = !enabled
 }
 
 func (p *GrokTokenProvider) GetAccessToken(ctx context.Context, account *Account) (string, error) {
@@ -91,7 +101,14 @@ func (p *GrokTokenProvider) GetAccessToken(ctx context.Context, account *Account
 	}
 
 	needsRefresh := expiresAt == nil || time.Until(*expiresAt) <= grokTokenRefreshSkew
-	if needsRefresh {
+	if needsRefresh && p.requestRefreshOff {
+		// VPS / 只读节点：不调用 xAI token endpoint，沿用库内 access_token。
+		// 若已过期则返回 expired，由 failure 分类做临时冷却，等本机同步新凭证。
+		if expiresAt == nil || !time.Now().Before(*expiresAt) {
+			return "", withGrokCredentialFailureSnapshot(errGrokOAuthAccessTokenExpired, account)
+		}
+		// 仍在 skew 窗口内：继续用现有 access_token，不刷新。
+	} else if needsRefresh {
 		if p.refreshAPI == nil || p.executor == nil {
 			return "", errGrokOAuthRefreshNotConfigured
 		}
@@ -189,9 +206,13 @@ func (p *GrokTokenProvider) GetAccessTokenForOperatorProbe(ctx context.Context, 
 	if accessToken != "" && expiresAt != nil && time.Now().Before(*expiresAt) && strings.TrimSpace(account.GetGrokRefreshToken()) == "" {
 		return accessToken, nil
 	}
-	if p == nil || p.refreshAPI == nil || p.executor == nil {
+	if p == nil || p.refreshAPI == nil || p.executor == nil || p.requestRefreshOff {
+		// requestRefreshOff: 管理探测也不在 VPS 上 mint/rotate RT，只读库内 access。
 		if accessToken != "" && expiresAt != nil && time.Now().Before(*expiresAt) {
 			return accessToken, nil
+		}
+		if p != nil && p.requestRefreshOff {
+			return "", withGrokCredentialFailureSnapshot(errGrokOAuthAccessTokenExpired, account)
 		}
 		return "", errGrokOAuthRefreshNotConfigured
 	}

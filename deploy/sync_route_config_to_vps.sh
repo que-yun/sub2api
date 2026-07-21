@@ -6,7 +6,7 @@ REMOTE_COPY_HOST="${REMOTE_COPY_HOST:-root@100.99.28.61}"
 SSH_PORT="${SSH_PORT:-}"
 SSH_IDENTITY_FILE="${SSH_IDENTITY_FILE:-}"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-30}"
-REMOTE_RETRIES="${REMOTE_RETRIES:-3}"
+REMOTE_RETRIES="${REMOTE_RETRIES:-5}"
 REMOTE_COMMAND_TIMEOUT="${REMOTE_COMMAND_TIMEOUT:-120}"
 LOCAL_PG_CONTAINER="${LOCAL_PG_CONTAINER:-sub2api-postgres}"
 LOCAL_PG_SOURCE="${LOCAL_PG_SOURCE:-host}"
@@ -101,8 +101,8 @@ local_psql() {
 ssh_args=(
   -o BatchMode=yes
   -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}"
-  -o ServerAliveInterval=10
-  -o ServerAliveCountMax=3
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=4
   -o ChannelTimeout=global=120
   -o StrictHostKeyChecking=accept-new
 )
@@ -116,8 +116,8 @@ fi
 scp_args=(
   -o BatchMode=yes
   -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}"
-  -o ServerAliveInterval=10
-  -o ServerAliveCountMax=3
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=4
   -o StrictHostKeyChecking=accept-new
 )
 if [[ -n "${SSH_PORT}" ]]; then

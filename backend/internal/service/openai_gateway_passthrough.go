@@ -229,7 +229,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		// 透传模式默认保持原样代理；容量错误以及 API-key 上游的瞬时
 		// 5xx 应先触发多账号 failover，且此时尚未写入下游响应。
 		// probeBody 已在上方任务探测时读取过一次，直接复用避免重复读取。
-		if shouldFailoverOpenAIPassthroughResponse(account, resp.StatusCode, probeBody) {
+		if shouldFailoverOpenAIPassthroughResponse(account, resp.StatusCode, probeBody, reqModel) {
 			return nil, s.handleFailoverErrorResponsePassthrough(ctx, resp, c, account, body, probeBody)
 		}
 		return nil, s.handleErrorResponsePassthrough(ctx, resp, c, account, body, probeBody)
@@ -464,9 +464,11 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 	return req, nil
 }
 
-func shouldFailoverOpenAIPassthroughResponse(account *Account, statusCode int, responseBody []byte) bool {
+func shouldFailoverOpenAIPassthroughResponse(account *Account, statusCode int, responseBody []byte, requestedModel string) bool {
+	// GLM-mapped accounts can still salvage oversized prompts by switching to a
+	// non-GLM account in the same group. Native large-context accounts stay fail-fast.
 	if isOpenAIContextWindowError("", responseBody) {
-		return false
+		return shouldFailoverOpenAIContextWindow(account, requestedModel, "", responseBody)
 	}
 	if isOpenAIRequestBodyTooLargeError(statusCode, "", responseBody) {
 		return true
@@ -606,6 +608,8 @@ func (s *OpenAIGatewayService) handleFailoverErrorResponsePassthrough(
 		body,
 		upstreamMsg,
 		account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode),
+		account,
+		canonicalModel,
 	)
 }
 
@@ -664,9 +668,9 @@ func (s *OpenAIGatewayService) handleErrorResponsePassthrough(
 		Detail:               upstreamDetail,
 		UpstreamResponseBody: upstreamDetail,
 	})
-	// context-window 超限是确定性请求失败（shouldFailoverOpenAIPassthroughResponse
-	// 已保证不切号），其文案对客户端可操作（如触发自动压缩）；在净化信封内保留
-	// 脱敏后的上游消息，而不是抹成通用文案。
+	// context-window 超限：非 GLM 映射账号 fail-fast 到这里；GLM 映射账号已在
+	// shouldFailoverOpenAIPassthroughResponse 里切号。文案对客户端可操作
+	// （如触发自动压缩），在净化信封内保留脱敏后的上游消息。
 	if isOpenAIContextWindowError(upstreamMsg, body) && upstreamMsg != "" {
 		writeOpenAIPassthroughErrorEnvelope(c, resp.StatusCode, resp.Header, upstreamMsg)
 	} else {

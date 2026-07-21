@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -468,6 +469,13 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				line = "data: " + data
 				eventType = strings.TrimSpace(gjson.GetBytes(dataBytes, "type").String())
 			}
+			// Grok/部分上游会把整数参数写成 1000.0；Codex 的 u64/i32 schema 会直接拒收。
+			if normalizedData, normalized := normalizeOpenAIResponsesFunctionCallArguments(dataBytes); normalized {
+				dataBytes = normalizedData
+				data = string(normalizedData)
+				line = "data: " + data
+				eventType = strings.TrimSpace(gjson.GetBytes(dataBytes, "type").String())
+			}
 			if imageOutput, ok := extractImageGenerationOutputFromSSEData(dataBytes, streamSeenImages); ok {
 				streamImageOutputs = append(streamImageOutputs, imageOutput)
 			}
@@ -879,16 +887,24 @@ func normalizeOpenAIResponsesFunctionCallArguments(data []byte) ([]byte, bool) {
 
 	updated := data
 	changed := false
-	setDedupedArgument := func(path string) {
+	// 1) 去掉重复拼接的 arguments JSON  2) 把 1000.0 这类整数值浮点收敛成整数，
+	// 避免 Codex 侧 "invalid type: floating point ... expected u64/i32"。
+	setNormalizedArgument := func(path string) {
 		arg := gjson.GetBytes(updated, path)
 		if !arg.Exists() || arg.Type != gjson.String {
 			return
 		}
-		deduped, ok := dedupeRepeatedJSONArgumentString(arg.Str)
-		if !ok {
+		nextArg := arg.Str
+		if deduped, ok := dedupeRepeatedJSONArgumentString(nextArg); ok {
+			nextArg = deduped
+		}
+		if coerced, ok := coerceWholeNumberFloatsInJSONArguments(nextArg); ok {
+			nextArg = coerced
+		}
+		if nextArg == arg.Str {
 			return
 		}
-		next, err := sjson.SetBytes(updated, path, deduped)
+		next, err := sjson.SetBytes(updated, path, nextArg)
 		if err != nil {
 			return
 		}
@@ -898,15 +914,71 @@ func normalizeOpenAIResponsesFunctionCallArguments(data []byte) ([]byte, bool) {
 
 	eventType := strings.TrimSpace(gjson.GetBytes(updated, "type").String())
 	if eventType == "response.function_call_arguments.done" {
-		setDedupedArgument("arguments")
+		setNormalizedArgument("arguments")
 	}
 	if itemType := strings.TrimSpace(gjson.GetBytes(updated, "item.type").String()); isResponsesFunctionCallItemType(itemType) {
-		setDedupedArgument("item.arguments")
+		setNormalizedArgument("item.arguments")
 	}
-	dedupeResponsesFunctionCallOutputArguments(updated, "response.output", setDedupedArgument)
-	dedupeResponsesFunctionCallOutputArguments(updated, "output", setDedupedArgument)
+	dedupeResponsesFunctionCallOutputArguments(updated, "response.output", setNormalizedArgument)
+	dedupeResponsesFunctionCallOutputArguments(updated, "output", setNormalizedArgument)
 
 	return updated, changed
+}
+
+// coerceWholeNumberFloatsInJSONArguments 将 arguments JSON 里“看起来是浮点、实际是整数”
+// 的数值（如 1000.0 / 1.0）改成整数编码。真实小数（1.5）保持不变。
+// 这是 Grok/xAI 与 Codex 工具 schema（u64/i32）的兼容补丁。
+func coerceWholeNumberFloatsInJSONArguments(arguments string) (string, bool) {
+	if arguments == "" || !strings.Contains(arguments, ".") {
+		return "", false
+	}
+	dec := json.NewDecoder(strings.NewReader(arguments))
+	dec.UseNumber()
+	var root any
+	if err := dec.Decode(&root); err != nil {
+		return "", false
+	}
+	changed := false
+	var walk func(any) any
+	walk = func(v any) any {
+		switch t := v.(type) {
+		case map[string]any:
+			for k, val := range t {
+				t[k] = walk(val)
+			}
+			return t
+		case []any:
+			for i := range t {
+				t[i] = walk(t[i])
+			}
+			return t
+		case json.Number:
+			s := t.String()
+			if !strings.ContainsAny(s, ".eE") {
+				return t
+			}
+			f, err := t.Float64()
+			if err != nil || math.IsInf(f, 0) || math.IsNaN(f) || math.Trunc(f) != f {
+				return t
+			}
+			if f < math.MinInt64 || f > math.MaxInt64 {
+				return t
+			}
+			changed = true
+			return int64(f)
+		default:
+			return v
+		}
+	}
+	root = walk(root)
+	if !changed {
+		return "", false
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
 }
 
 func dedupeResponsesFunctionCallOutputArguments(data []byte, outputPath string, setDedupedArgument func(string)) {

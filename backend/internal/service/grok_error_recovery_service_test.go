@@ -155,7 +155,7 @@ func runGrokErrorRecoveryOnceWithProbe(
 ) GrokErrorRecoveryCycleResult {
 	// Clone of RunOnce with injectable probe for unit tests.
 	result := GrokErrorRecoveryCycleResult{}
-	accounts, err := repo.ListAllWithFilters(ctx, PlatformGrok, AccountTypeOAuth, StatusError, "", 0, "")
+	accounts, err := repo.ListAllWithFilters(ctx, PlatformGrok, AccountTypeOAuth, StatusError, "", 0, "", "")
 	if err != nil {
 		return result
 	}
@@ -229,7 +229,7 @@ type recoveryListRepo struct {
 	accounts []Account
 }
 
-func (r *recoveryListRepo) ListAllWithFilters(context.Context, string, string, string, string, int64, string) ([]Account, error) {
+func (r *recoveryListRepo) ListAllWithFilters(context.Context, string, string, string, string, int64, string, string) ([]Account, error) {
 	out := make([]Account, len(r.accounts))
 	copy(out, r.accounts)
 	return out, nil

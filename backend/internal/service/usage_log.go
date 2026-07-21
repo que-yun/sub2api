@@ -165,6 +165,9 @@ type UsageLog struct {
 	FirstTokenMs *int
 	UserAgent    *string
 	IPAddress    *string
+	// IngressNode 记录请求由哪个 sub2api 入口实例处理（通常取 log.service_name）。
+	// 用于合并本机/VPS usage 后区分来源；历史行可能为 nil。
+	IngressNode  *string
 
 	// Cache TTL Override 标记（管理员强制替换了缓存 TTL 计费）
 	CacheTTLOverridden bool

@@ -194,3 +194,91 @@ func TestAccountTestService_Grok429WithoutQuotaHeadersUsesFallback(t *testing.T)
 	require.Equal(t, 1, repo.rateLimitedCalls)
 	require.WithinDuration(t, before.Add(grokRateLimitFallbackCooldown), repo.resetAt, time.Second)
 }
+
+
+func TestAccountTestService_TestAccountConnection_Grok403MarksError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	account := &Account{
+		ID:          14,
+		Name:        "grok-oauth-denied",
+		Platform:    PlatformGrok,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"access_token":  "grok-access-token",
+			"refresh_token": "grok-refresh-token",
+			"expires_at":    time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	}
+	repo := &grokQuotaAccountRepo{
+		mockAccountRepoForPlatform: &mockAccountRepoForPlatform{
+			accountsByID: map[int64]*Account{account.ID: account},
+		},
+	}
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusForbidden,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"code":"permission-denied","error":"Access to the chat endpoint is denied."}`)),
+	}}
+	svc := &AccountTestService{
+		accountRepo:       repo,
+		grokTokenProvider: NewGrokTokenProvider(repo, nil),
+		httpUpstream:      upstream,
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/admin/accounts/14/test", nil)
+
+	err := svc.TestAccountConnection(c, account.ID, "grok-4.5", "", AccountTestModeDefault)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "permission-denied")
+	require.Contains(t, rec.Body.String(), "permission-denied")
+	require.Equal(t, StatusError, account.Status)
+	require.False(t, account.Schedulable)
+	require.Equal(t, grokHoldUntilSuccessReason, account.ErrorMessage)
+	require.Equal(t, 1, repo.setErrorCalls)
+	require.True(t, GrokAccountRequiresSuccessBeforeSchedule(account))
+}
+
+func TestAccountTestService_TestAccountConnection_GrokTokenFailureMarksError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	account := &Account{
+		ID:          15,
+		Name:        "grok-oauth-token-dead",
+		Platform:    PlatformGrok,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{},
+	}
+	repo := &grokQuotaAccountRepo{
+		mockAccountRepoForPlatform: &mockAccountRepoForPlatform{
+			accountsByID: map[int64]*Account{account.ID: account},
+		},
+	}
+	svc := &AccountTestService{
+		accountRepo:       repo,
+		grokTokenProvider: NewGrokTokenProvider(repo, nil),
+		httpUpstream:      &httpUpstreamRecorder{},
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/admin/accounts/15/test", nil)
+
+	err := svc.TestAccountConnection(c, account.ID, "grok-4.5", "", AccountTestModeDefault)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Failed to get Grok access token")
+	require.Contains(t, rec.Body.String(), "Failed to get Grok access token")
+	// Missing access token is treated as permanent token acquisition failure for admin tests.
+	require.Equal(t, 1, repo.setErrorCalls)
+	require.Equal(t, StatusError, account.Status)
+	require.False(t, account.Schedulable)
+	require.Contains(t, account.ErrorMessage, "reauth required")
+}

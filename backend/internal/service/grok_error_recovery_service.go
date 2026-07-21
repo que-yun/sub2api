@@ -179,7 +179,7 @@ func (s *GrokErrorRecoveryService) RunOnce(ctx context.Context) GrokErrorRecover
 		ctx = context.Background()
 	}
 
-	accounts, err := s.accountRepo.ListAllWithFilters(ctx, PlatformGrok, AccountTypeOAuth, StatusError, "", 0, "")
+	accounts, err := s.accountRepo.ListAllWithFilters(ctx, PlatformGrok, AccountTypeOAuth, StatusError, "", 0, "", "")
 	if err != nil {
 		slog.Error("grok_error_recovery.list_accounts_failed", "error", err)
 		return result

@@ -515,6 +515,9 @@ type UsageLog struct {
 	UserAgent *string `json:"user_agent"`
 	// IPAddress is visible to the owner of the usage record.
 	IPAddress *string `json:"ip_address,omitempty"`
+	// IngressNode is the sub2api entry instance that handled the request (log.service_name).
+	// Empty/omitted for historical rows written before ingress tagging.
+	IngressNode *string `json:"ingress_node,omitempty"`
 
 	// Cache TTL Override 标记
 	CacheTTLOverridden bool `json:"cache_ttl_overridden"`

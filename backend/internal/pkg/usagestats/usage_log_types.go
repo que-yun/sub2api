@@ -271,6 +271,8 @@ type UsageLogFilters struct {
 	AccountID int64
 	GroupID   int64
 	Model     string
+	// IngressNode filters by usage_logs.ingress_node (sub2api entry instance name).
+	IngressNode string
 	// ModelFilterSource controls how Model is matched. Empty preserves raw usage_logs.model semantics.
 	ModelFilterSource string
 	RequestType       *int16

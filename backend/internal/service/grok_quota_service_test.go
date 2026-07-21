@@ -37,6 +37,14 @@ type grokQuotaAccountRepo struct {
 	recoveryObservedAt    time.Time
 	recoveryObservedReset time.Time
 	recoveryClearResult   bool
+	setErrorCalls         int
+	lastErrorID           int64
+	lastErrorMsg          string
+	clearErrorCalls       int
+	lastClearErrorID      int64
+	setSchedulableCalls   int
+	lastSetSchedulableID  int64
+	lastSetSchedulable    bool
 }
 
 func (r *grokQuotaAccountRepo) UpdateExtra(_ context.Context, id int64, updates map[string]any) error {
@@ -73,6 +81,28 @@ func (r *grokQuotaAccountRepo) SetTempUnschedulable(_ context.Context, id int64,
 	r.lastTempUnschedReason = reason
 	return nil
 }
+
+
+func (r *grokQuotaAccountRepo) SetError(_ context.Context, id int64, errorMsg string) error {
+	r.setErrorCalls++
+	r.lastErrorID = id
+	r.lastErrorMsg = errorMsg
+	return nil
+}
+
+func (r *grokQuotaAccountRepo) ClearError(_ context.Context, id int64) error {
+	r.clearErrorCalls++
+	r.lastClearErrorID = id
+	return nil
+}
+
+func (r *grokQuotaAccountRepo) SetSchedulable(_ context.Context, id int64, schedulable bool) error {
+	r.setSchedulableCalls++
+	r.lastSetSchedulableID = id
+	r.lastSetSchedulable = schedulable
+	return nil
+}
+
 
 type grokQuotaProxyRepo struct {
 	proxyRepoStub
@@ -792,7 +822,7 @@ func TestGrokQuotaServiceQueryQuotaFreeHard403NotMaskedByBilling(t *testing.T) {
 	}}
 	// No authoritative usage/plan in billing (free), so hybrid path reaches active probe.
 	upstream := &grokForbiddenActiveUpstream{inner: &grokHybridUpstream{}}
-	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream)
+	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream, nil)
 
 	result, err := svc.QueryQuota(context.Background(), account.ID)
 	require.Error(t, err)
@@ -816,7 +846,7 @@ func TestGrokQuotaServiceQueryQuotaActiveProbeForcesChatEvenWhenBillingAuthorita
 	}}
 	usagePercent := 33.0
 	upstream := &grokHybridUpstream{weeklyUsagePercent: &usagePercent}
-	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream)
+	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream, nil)
 
 	result, err := svc.QueryQuotaActiveProbe(context.Background(), account.ID)
 	require.NoError(t, err)
@@ -844,7 +874,7 @@ func TestGrokQuotaServiceQueryQuotaActiveProbeHard403IgnoresAuthoritativeBilling
 	}}
 	usagePercent := 25.0
 	upstream := &grokForbiddenActiveUpstream{inner: &grokHybridUpstream{weeklyUsagePercent: &usagePercent}}
-	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream)
+	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream, nil)
 
 	result, err := svc.QueryQuotaActiveProbe(context.Background(), account.ID)
 	require.Error(t, err)

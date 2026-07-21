@@ -1457,6 +1457,8 @@ export interface UsageLog {
   // User-Agent
   user_agent: string | null
   ip_address?: string | null
+  // sub2api entry instance (log.service_name); null for historical rows
+  ingress_node?: string | null
 
   // Cache TTL Override
   cache_ttl_overridden: boolean

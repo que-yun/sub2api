@@ -1606,6 +1606,46 @@ func TestGetRequestCredentialRecoversConcurrentRefreshWithoutFailover(t *testing
 	require.False(t, hasEvents)
 }
 
+
+func TestClassifyGrokCredentialFailureAccessTokenExpiredIsTransientAwaitLocalSync(t *testing.T) {
+	class := classifyGrokCredentialFailure(nil, errGrokOAuthAccessTokenExpired)
+	require.Equal(t, GrokCredentialReasonAwaitLocalSync, class.reason)
+	require.True(t, class.transient)
+	require.False(t, class.permanent)
+	require.Equal(t, NextAccountRetry, class.action)
+	require.Equal(t, GatewayFailureScopeAccount, class.scope)
+}
+
+func TestGetRequestCredentialAccessTokenExpiredTempsUnschedulableAwaitLocalSync(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	account := expiredGrokOAuthAccountForCredentialTest(9201)
+	account.Status = StatusActive
+	account.Schedulable = true
+	baseRepo := &tokenRefreshAccountRepo{}
+	baseRepo.accountsByID = map[int64]*Account{account.ID: account}
+	repo := &grokCredentialPersistingRepo{tokenRefreshAccountRepo: baseRepo}
+	cache := &grokTokenCacheForProviderTest{lockResult: true}
+	// refresh would fail if called; expired path should go transient without permanent SetError
+	provider := NewGrokTokenProvider(repo, cache)
+	provider.SetRefreshAPI(NewOAuthRefreshAPI(repo, cache), &tokenRefresherStub{err: errors.New("should not matter for classification after expire")})
+	// Force expire classification by leaving credentials expired and disabling request refresh
+	provider.SetRequestRefreshEnabled(false)
+	svc := &OpenAIGatewayService{accountRepo: repo, grokTokenProvider: provider}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	_, _, err := svc.getRequestCredential(context.Background(), c, account)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, GrokCredentialReasonAwaitLocalSync, failoverErr.Reason)
+	require.Equal(t, GatewayFailureScopeAccount, failoverErr.Scope)
+	require.Zero(t, baseRepo.setErrorCalls)
+	require.Equal(t, 1, baseRepo.setTempUnschedCalls)
+	require.Equal(t, string(GrokCredentialReasonAwaitLocalSync), baseRepo.lastTempUnschedReason)
+	require.NotNil(t, account.TempUnschedulableUntil)
+	require.Equal(t, StatusActive, account.Status)
+	require.True(t, account.Schedulable)
+}
+
 func expiredGrokOAuthAccountForCredentialTest(id int64) *Account {
 	return &Account{
 		ID:          id,

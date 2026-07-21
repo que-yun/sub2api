@@ -317,3 +317,64 @@ func TestGrokTokenProviderRejectsIneligibleSelectedAccountBeforeWarmCache(t *tes
 		})
 	}
 }
+
+
+func TestGrokTokenProviderRequestRefreshDisabledDoesNotRefresh(t *testing.T) {
+	account := expiredGrokOAuthAccountForCredentialTest(9101)
+	account.Status = StatusActive
+	account.Schedulable = true
+	repo := &tokenRefreshAccountRepo{}
+	repo.accountsByID = map[int64]*Account{account.ID: account}
+	cache := &grokTokenCacheForProviderTest{lockResult: true}
+	stub := &tokenRefresherStub{err: errors.New("refresh must not be called")}
+	provider := NewGrokTokenProvider(repo, cache)
+	provider.SetRefreshAPI(NewOAuthRefreshAPI(repo, cache), stub)
+	provider.SetRequestRefreshEnabled(false)
+
+	token, err := provider.GetAccessToken(context.Background(), account)
+
+	require.ErrorIs(t, err, errGrokOAuthAccessTokenExpired)
+	require.Empty(t, token)
+	require.Zero(t, stub.calls, "VPS/no-request-refresh path must not call xAI token endpoint")
+}
+
+func TestGrokTokenProviderRequestRefreshDisabledUsesValidAccessTokenWithoutRefresh(t *testing.T) {
+	account := expiredGrokOAuthAccountForCredentialTest(9102)
+	account.Status = StatusActive
+	account.Schedulable = true
+	account.Credentials["access_token"] = "still-valid-access"
+	// inside skew window (would normally refresh) but still not expired
+	account.Credentials["expires_at"] = time.Now().Add(grokTokenRefreshSkew / 2).UTC().Format(time.RFC3339)
+	repo := &tokenRefreshAccountRepo{}
+	repo.accountsByID = map[int64]*Account{account.ID: account}
+	cache := &grokTokenCacheForProviderTest{lockResult: true}
+	stub := &tokenRefresherStub{err: errors.New("refresh must not be called")}
+	provider := NewGrokTokenProvider(repo, cache)
+	provider.SetRefreshAPI(NewOAuthRefreshAPI(repo, cache), stub)
+	provider.SetRequestRefreshEnabled(false)
+
+	token, err := provider.GetAccessToken(context.Background(), account)
+
+	require.NoError(t, err)
+	require.Equal(t, "still-valid-access", token)
+	require.Zero(t, stub.calls)
+}
+
+func TestGrokTokenProviderOperatorProbeRequestRefreshDisabledDoesNotRefresh(t *testing.T) {
+	account := expiredGrokOAuthAccountForCredentialTest(9103)
+	account.Status = StatusError
+	account.Schedulable = false
+	repo := &tokenRefreshAccountRepo{}
+	repo.accountsByID = map[int64]*Account{account.ID: account}
+	cache := &grokTokenCacheForProviderTest{lockResult: true}
+	stub := &tokenRefresherStub{err: errors.New("refresh must not be called")}
+	provider := NewGrokTokenProvider(repo, cache)
+	provider.SetRefreshAPI(NewOAuthRefreshAPI(repo, cache), stub)
+	provider.SetRequestRefreshEnabled(false)
+
+	token, err := provider.GetAccessTokenForOperatorProbe(context.Background(), account)
+
+	require.ErrorIs(t, err, errGrokOAuthAccessTokenExpired)
+	require.Empty(t, token)
+	require.Zero(t, stub.calls)
+}

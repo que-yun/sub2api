@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -104,3 +105,31 @@ func TestApplyGrokProbeOrTestStatusSuccessRecoversErrorAccount(t *testing.T) {
 	require.Equal(t, acc.ID, repo.lastSetSchedulableID)
 	require.True(t, repo.lastSetSchedulable)
 }
+
+func TestIsGrokPermissionDeniedBody(t *testing.T) {
+	require.True(t, IsGrokPermissionDeniedBody([]byte(`{"code":"permission-denied","error":"Access to the chat endpoint is denied."}`)))
+	require.False(t, IsGrokPermissionDeniedBody([]byte(`{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage"}`)))
+	require.False(t, IsGrokPermissionDeniedBody(nil))
+}
+
+func TestMarkGrokTokenAcquisitionFailurePermanent(t *testing.T) {
+	repo := &grokQuotaAccountRepo{}
+	acc := &Account{ID: 2001, Platform: PlatformGrok, Status: StatusActive, Schedulable: true}
+	MarkGrokTokenAcquisitionFailure(context.Background(), repo, acc, errors.New("oauth refresh account state changed"))
+	require.Equal(t, 1, repo.setErrorCalls)
+	require.Equal(t, StatusError, acc.Status)
+	require.False(t, acc.Schedulable)
+	require.Contains(t, acc.ErrorMessage, "token reauth required")
+}
+
+func TestMarkGrokTokenAcquisitionFailureTransient(t *testing.T) {
+	repo := &grokQuotaAccountRepo{}
+	acc := &Account{ID: 2002, Platform: PlatformGrok, Status: StatusActive, Schedulable: true}
+	MarkGrokTokenAcquisitionFailure(context.Background(), repo, acc, errors.New("temporary network timeout"))
+	require.Equal(t, 0, repo.setErrorCalls)
+	require.Equal(t, 1, repo.tempUnschedCalls)
+	require.Equal(t, StatusActive, acc.Status)
+	require.True(t, acc.Schedulable)
+	require.NotNil(t, acc.TempUnschedulableUntil)
+}
+

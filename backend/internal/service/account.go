@@ -1491,17 +1491,68 @@ func (a *Account) SupportsOpenAIEndpointCapability(capability OpenAIEndpointCapa
 	return configured[string(capability)]
 }
 
+// SupportsOpenAIVisionModel reports whether this account can serve a multimodal
+// (image-input) request for requestedModel.
+//
+// Selection prefers same-account model remapping over dropping the account:
+//  1. explicit vision_model_mapping hit (even without openai_capabilities.vision)
+//  2. explicit openai_capabilities.vision (+ optional vision_models whitelist)
+//  3. inferred multimodal destination already present in model_mapping
+//
+// Text-only defaults such as gpt-* -> glm-5.2 must not force account failover
+// when the same account already owns a VL model that can read the image.
 func (a *Account) SupportsOpenAIVisionModel(requestedModel string) bool {
-	if a == nil || !a.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityVision) {
+	if a == nil {
 		return false
 	}
+
+	// Explicit vision mapping is enough to schedule the account. Forward will
+	// rewrite the model via resolveOpenAIForwardModelForContext.
+	if mappedModel, matched := a.ResolveVisionMappedModel(requestedModel); matched {
+		return a.matchesOpenAIVisionModelWhitelist(mappedModel, requestedModel)
+	}
+
+	if a.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityVision) {
+		models, found := a.openAIVisionModelPatterns()
+		if !found {
+			return true
+		}
+		return a.matchesOpenAIVisionModelWhitelistCandidates(requestedModel, models)
+	}
+
+	// Multi-model API-key pools often ship many VL models in model_mapping but
+	// forget openai_capabilities.vision. Prefer remapping on the same account
+	// over "no available accounts supporting model".
+	if _, ok := a.ResolveInferredVisionModel(requestedModel); ok {
+		return true
+	}
+	return false
+}
+
+// matchesOpenAIVisionModelWhitelist checks optional vision_models patterns.
+// When no whitelist is configured, any candidate is accepted.
+func (a *Account) matchesOpenAIVisionModelWhitelist(mappedModel, requestedModel string) bool {
 	models, found := a.openAIVisionModelPatterns()
 	if !found {
 		return true
 	}
-	candidates := []string{strings.TrimSpace(requestedModel)}
+	return a.matchesOpenAIVisionModelWhitelistCandidates(requestedModel, models, mappedModel)
+}
+
+func (a *Account) matchesOpenAIVisionModelWhitelistCandidates(requestedModel string, models map[string]struct{}, extraCandidates ...string) bool {
+	candidates := make([]string, 0, 4+len(extraCandidates))
+	for _, model := range extraCandidates {
+		if model = strings.TrimSpace(model); model != "" {
+			candidates = append(candidates, model)
+		}
+	}
 	if upstreamModel, matched := a.ResolveVisionMappedModel(requestedModel); matched {
-		candidates = append([]string{strings.TrimSpace(upstreamModel)}, candidates...)
+		if upstreamModel = strings.TrimSpace(upstreamModel); upstreamModel != "" {
+			candidates = append(candidates, upstreamModel)
+		}
+	}
+	if requestedModel = strings.TrimSpace(requestedModel); requestedModel != "" {
+		candidates = append(candidates, requestedModel)
 	}
 	if upstreamModel := strings.TrimSpace(a.GetMappedModel(requestedModel)); upstreamModel != "" {
 		candidates = append(candidates, upstreamModel)
@@ -1522,6 +1573,110 @@ func (a *Account) SupportsOpenAIVisionModel(requestedModel string) bool {
 		}
 	}
 	return false
+}
+
+// ResolveInferredVisionModel picks a multimodal upstream model already present
+// on this account when vision_model_mapping is absent. It never invents model
+// IDs that are not already listed in model_mapping keys/values.
+func (a *Account) ResolveInferredVisionModel(requestedModel string) (string, bool) {
+	if a == nil {
+		return "", false
+	}
+	if mappedModel, matched := a.ResolveVisionMappedModel(requestedModel); matched {
+		return mappedModel, true
+	}
+	mapping := a.GetModelMapping()
+	if len(mapping) == 0 {
+		return "", false
+	}
+
+	// Prefer destinations already wired for the requested model family, then
+	// any multimodal model shipped in this account's catalog.
+	candidates := make([]string, 0, len(mapping)*2)
+	if textMapped, matched := a.ResolveMappedModel(requestedModel); matched {
+		if textMapped = strings.TrimSpace(textMapped); textMapped != "" {
+			candidates = append(candidates, textMapped)
+		}
+	}
+	for source, dest := range mapping {
+		if dest = strings.TrimSpace(dest); dest != "" {
+			candidates = append(candidates, dest)
+		}
+		if source = strings.TrimSpace(source); source != "" {
+			candidates = append(candidates, source)
+		}
+	}
+
+	bestScore := 0
+	bestModel := ""
+	seen := make(map[string]struct{}, len(candidates))
+	for _, model := range candidates {
+		if model == "" {
+			continue
+		}
+		if _, exists := seen[model]; exists {
+			continue
+		}
+		seen[model] = struct{}{}
+		score := openAIVisionModelNameScore(model)
+		if score <= 0 {
+			continue
+		}
+		// Prefer higher score; ties keep first-seen (stable enough for pools).
+		if score > bestScore {
+			bestScore = score
+			bestModel = model
+		}
+	}
+	if bestModel == "" {
+		return "", false
+	}
+	return bestModel, true
+}
+
+// openAIVisionModelNameScore ranks catalog model ids that are likely
+// multimodal. Higher is better. 0 means "do not treat as vision".
+func openAIVisionModelNameScore(model string) int {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return 0
+	}
+	// Explicit non-vision destinations that commonly appear next to VL models.
+	if strings.Contains(model, "embed") || strings.Contains(model, "guard") ||
+		strings.Contains(model, "safety") || strings.Contains(model, "rerank") ||
+		strings.Contains(model, "tts") || strings.Contains(model, "whisper") ||
+		strings.Contains(model, "translate") {
+		return 0
+	}
+	switch {
+	case strings.Contains(model, "llama-3.2-11b-vision"):
+		return 100
+	case strings.Contains(model, "llama-3.2-90b-vision"):
+		return 95
+	case strings.Contains(model, "nemotron-nano-12b-v2-vl"):
+		return 90
+	case strings.Contains(model, "nemotron-nano-vl") || strings.Contains(model, "nano-vl"):
+		return 85
+	case strings.Contains(model, "phi-3-vision"):
+		return 80
+	case strings.Contains(model, "mimo-v2.5") || strings.Contains(model, "mimo-v2-omni"):
+		return 75
+	case strings.Contains(model, "qwen3.7-plus") || strings.Contains(model, "qwen3-vl") || strings.Contains(model, "qwen2-vl") || strings.Contains(model, "qwen2.5-vl"):
+		return 70
+	case strings.Contains(model, "vision"):
+		return 60
+	case strings.Contains(model, "-vl-") || strings.HasSuffix(model, "-vl") || strings.Contains(model, "-vl/") || strings.Contains(model, "/vl-"):
+		return 55
+	case strings.Contains(model, "vlm"):
+		return 50
+	case strings.Contains(model, "neva") || strings.Contains(model, "vila") || strings.Contains(model, "kosmos") || strings.Contains(model, "fuyu") || strings.Contains(model, "deplot"):
+		return 40
+	case strings.Contains(model, "gemma-3") || strings.Contains(model, "gemma3") || strings.Contains(model, "gemma4") || strings.Contains(model, "gemma-4"):
+		// Gemma 3/4 family is commonly multimodal in OpenAI-compatible pools.
+		return 35
+	default:
+		return 0
+	}
 }
 
 func (a *Account) openAIVisionModelPatterns() (map[string]struct{}, bool) {

@@ -25,6 +25,7 @@ type ClaudeTokenProvider struct {
 	refreshAPI    *OAuthRefreshAPI
 	executor      OAuthRefreshExecutor
 	refreshPolicy ProviderRefreshPolicy
+	requestRefreshOff  bool // true: 请求路径不刷新，等待本机同步
 }
 
 func NewClaudeTokenProvider(
@@ -51,6 +52,15 @@ func (p *ClaudeTokenProvider) SetRefreshPolicy(policy ProviderRefreshPolicy) {
 	p.refreshPolicy = policy
 }
 
+// SetRequestRefreshEnabled controls refresh-token use from the request path.
+// Disable on VPS standby so only the local authority mints/rotates Claude OAuth tokens.
+func (p *ClaudeTokenProvider) SetRequestRefreshEnabled(enabled bool) {
+	if p == nil {
+		return
+	}
+	p.requestRefreshOff = !enabled
+}
+
 // GetAccessToken returns a valid access_token.
 func (p *ClaudeTokenProvider) GetAccessToken(ctx context.Context, account *Account) (string, error) {
 	if account == nil {
@@ -64,13 +74,19 @@ func (p *ClaudeTokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	}
 
 	cacheKey := ClaudeTokenCacheKey(account)
+	expiresAt := account.GetCredentialAsTime("expires_at")
+	accountAccessToken := strings.TrimSpace(account.GetCredential("access_token"))
 
-	// 1) Try cache first.
+	// 1) Try cache first. Only accept when cached AT matches DB credentials.
 	if p.tokenCache != nil {
-		if token, err := p.tokenCache.GetAccessToken(ctx, cacheKey); err == nil && strings.TrimSpace(token) != "" {
-			slog.Debug("claude_token_cache_hit", "account_id", account.ID)
-			return token, nil
-		} else if err != nil {
+		if token, err := p.tokenCache.GetAccessToken(ctx, cacheKey); err == nil {
+			cachedToken := strings.TrimSpace(token)
+			if cachedToken != "" && accountAccessToken != "" && cachedToken == accountAccessToken &&
+				(expiresAt == nil || time.Now().Before(*expiresAt)) {
+				slog.Debug("claude_token_cache_hit", "account_id", account.ID)
+				return cachedToken, nil
+			}
+		} else {
 			slog.Warn("claude_token_cache_get_failed", "account_id", account.ID, "error", err)
 		}
 	}
@@ -78,11 +94,16 @@ func (p *ClaudeTokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	slog.Debug("claude_token_cache_miss", "account_id", account.ID)
 
 	// 2) Refresh if needed (pre-expiry skew).
-	expiresAt := account.GetCredentialAsTime("expires_at")
 	needsRefresh := expiresAt == nil || time.Until(*expiresAt) <= claudeTokenRefreshSkew
 	refreshFailed := false
 
-	if needsRefresh && p.refreshAPI != nil && p.executor != nil {
+	if needsRefresh && p.requestRefreshOff {
+		// VPS / 只读节点：不调用 token endpoint，沿用库内 access_token。
+		if expiresAt == nil || !time.Now().Before(*expiresAt) {
+			return "", errors.New("claude access_token expired; await local credential sync")
+		}
+		// 仍在 skew 窗口内：继续用现有 access_token，不刷新。
+	} else if needsRefresh && p.refreshAPI != nil && p.executor != nil {
 		result, err := p.refreshAPI.RefreshIfNeeded(ctx, account, p.executor, claudeTokenRefreshSkew)
 		if err != nil {
 			// 终端凭证错误（invalid_grant / token endpoint 403 等）必须硬失败，

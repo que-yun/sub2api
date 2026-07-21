@@ -8,6 +8,7 @@ import (
 	"time"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	gocache "github.com/patrickmn/go-cache"
 )
@@ -137,6 +138,7 @@ func appendUsageLogModelQueryFilter(query string, args []any, model string, sour
 }
 
 type usageLogRepository struct {
+	defaultIngressNode string
 	client *dbent.Client
 	sql    sqlExecutor
 	db     *sql.DB
@@ -148,8 +150,10 @@ type usageLogRepository struct {
 	bestEffortRecent    *gocache.Cache
 }
 
-func NewUsageLogRepository(client *dbent.Client, sqlDB *sql.DB) service.UsageLogRepository {
-	return newUsageLogRepositoryWithSQL(client, sqlDB)
+func NewUsageLogRepository(client *dbent.Client, sqlDB *sql.DB, cfg *config.Config) service.UsageLogRepository {
+	repo := newUsageLogRepositoryWithSQL(client, sqlDB)
+	repo.defaultIngressNode = resolveDefaultIngressNode(cfg)
+	return repo
 }
 
 func newUsageLogRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor) *usageLogRepository {
@@ -219,4 +223,14 @@ func buildRequestTypeFilterConditionWithAlias(startArgIndex int, requestType int
 	default:
 		return fmt.Sprintf("%srequest_type = $%d", prefix, startArgIndex), []any{requestTypeArg}
 	}
+}
+
+
+// resolveDefaultIngressNode 用 log.service_name 作为 usage_logs.ingress_node 默认值。
+// 本机与 VPS 已分别配置不同的 LOG_SERVICE_NAME，合并 usage 后即可区分入口。
+func resolveDefaultIngressNode(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.Log.ServiceName)
 }

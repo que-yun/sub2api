@@ -87,6 +87,7 @@ export default {
       // Filter options
       allPlatforms: '全部平台',
       allTypes: '全部类型',
+      allPlanTypes: '全部套餐',
       allStatus: '全部状态',
       allGroups: '全部分组',
       ungroupedGroup: '未分配分组',
@@ -114,6 +115,7 @@ export default {
         status: '状态',
         schedulable: '调度',
         todayStats: '今日统计',
+        lifetimeStats: '累计统计',
         groups: '分组',
         usageWindows: '用量窗口',
         proxy: '代理',
@@ -418,6 +420,7 @@ export default {
         allPlatforms: '全部平台',
         type: '类型',
         allTypes: '全部类型',
+        allPlanTypes: '全部套餐',
         status: '状态',
         allStatuses: '全部状态'
       },

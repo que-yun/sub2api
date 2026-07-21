@@ -269,15 +269,18 @@ func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Acc
 			shouldDisable = true
 			break
 		}
-		// OAuth 账号在 401 错误时临时不可调度（给 token 刷新窗口）；非 OAuth 账号保持原有 SetError 行为。
-		if authAccount.Type == AccountTypeOAuth {
+		// 可刷新凭证账号（oauth / setup-token）在 401 时临时不可调度，给刷新或本机凭证同步窗口；
+		// 其它类型保持 SetError 永久 error。
+		// setup-token 的 type 不是 oauth，但同样持有短期 access_token + refresh_token；
+		// 若 VPS request-refresh-off 且 token 落后本机，401 是同步滞后，不是账号永久死亡。
+		if authAccount.IsOAuth() {
 			// 1. 失效缓存
 			if s.tokenCacheInvalidator != nil {
 				if err := s.tokenCacheInvalidator.InvalidateToken(ctx, authAccount); err != nil {
 					slog.Warn("oauth_401_invalidate_cache_failed", "account_id", authAccount.ID, "error", err)
 				}
 			}
-			// 缺少 refresh_token 的 OAuth 账号无法在冷却期内自愈（后台刷新服务也会跳过），
+			// 缺少 refresh_token 的账号无法在冷却期内自愈（后台刷新服务也会跳过），
 			// 直接走 SetError 永久禁用，避免冷却结束后再被选中产生一发无意义的 502。
 			if strings.TrimSpace(authAccount.GetCredential("refresh_token")) == "" {
 				msg := "Authentication failed (401): refresh_token missing, cannot recover"
@@ -288,7 +291,7 @@ func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Acc
 				shouldDisable = true
 				break
 			}
-			// 2. 临时不可调度，替代 SetError（保持 status=active 让刷新服务能拾取）
+			// 2. 临时不可调度，替代 SetError（保持 status=active 让刷新服务或本机同步拾取）
 			// 注意：此处不再写回 account.Credentials/expires_at。
 			// 原实现使用请求开始时的 account 快照整列覆盖 credentials JSONB（见
 			// persistAccountCredentials → accountRepository.UpdateCredentials → SetCredentials），
@@ -296,10 +299,20 @@ func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Acc
 			// 导致下一周期用旧 refresh_token 调上游拿到 invalid_grant 后，
 			// tryRecoverFromRefreshRace 重读 DB 发现 currentRT == usedRT 也救不回来，账号被错误 disable。
 			// 这里仅依赖 InvalidateToken + SetTempUnschedulable 让账号在冷却期内不被调度，
-			// 冷却结束后由 token_provider 的 NeedsRefresh / token_refresh_service 走带分布式锁的正路刷新。
+			// 冷却结束后由 token_provider 的 NeedsRefresh / token_refresh_service 走带分布式锁的正路刷新；
+			// VPS standby 则等待本机 setup-token 同步。
+			awaitLocalSync := authAccount.IsAnthropicOAuthOrSetupToken() &&
+				s.cfg != nil && !s.cfg.TokenRefresh.RequestRefreshEnabled
 			msg := "Authentication failed (401): invalid or expired credentials"
+			if awaitLocalSync {
+				msg = "Pending local credential sync (401): access_token stale; await local refresh push"
+			}
 			if upstreamMsg != "" {
-				msg = "OAuth 401: " + upstreamMsg
+				if awaitLocalSync {
+					msg = "Pending local credential sync (401): " + upstreamMsg
+				} else {
+					msg = "OAuth 401: " + upstreamMsg
+				}
 			}
 			if authAccount.Platform == PlatformAntigravity {
 				extraUpdates := antigravityForceTokenRefreshExtra("401_invalid")
@@ -315,18 +328,26 @@ func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Acc
 					slog.Info("antigravity_401_force_refresh_marked", "account_id", authAccount.ID)
 				}
 			}
-			cooldownMinutes := s.cfg.RateLimit.OAuth401CooldownMinutes
-			if cooldownMinutes <= 0 {
-				cooldownMinutes = 10
+			cooldownMinutes := 10
+			if s.cfg != nil && s.cfg.RateLimit.OAuth401CooldownMinutes > 0 {
+				cooldownMinutes = s.cfg.RateLimit.OAuth401CooldownMinutes
+			}
+			// standby 节点无法本地刷新 setup-token；给更长窗口等本机 sync，避免反复 error 下线。
+			if awaitLocalSync && cooldownMinutes < 15 {
+				cooldownMinutes = 15
 			}
 			until := time.Now().Add(time.Duration(cooldownMinutes) * time.Minute)
-			s.notifyAccountSchedulingBlocked(authAccount, until, "oauth_401")
+			blockReason := "oauth_401"
+			if awaitLocalSync {
+				blockReason = "pending_local_credential_sync"
+			}
+			s.notifyAccountSchedulingBlocked(authAccount, until, blockReason)
 			if err := s.accountRepo.SetTempUnschedulable(ctx, authAccount.ID, until, msg); err != nil {
 				slog.Warn("oauth_401_set_temp_unschedulable_failed", "account_id", authAccount.ID, "error", err)
 			}
 			shouldDisable = true
 		} else {
-			// 非 OAuth：保持 SetError 行为
+			// 非可刷新凭证：保持 SetError 行为
 			msg := "Authentication failed (401): invalid or expired credentials"
 			if upstreamMsg != "" {
 				msg = "Authentication failed (401): " + upstreamMsg

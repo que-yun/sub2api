@@ -110,6 +110,7 @@ func (h *UsageHandler) List(c *gin.Context) {
 	}
 
 	model := c.Query("model")
+	ingressNode := strings.TrimSpace(c.Query("ingress_node"))
 	billingMode := strings.TrimSpace(c.Query("billing_mode"))
 
 	var requestType *int16
@@ -177,6 +178,7 @@ func (h *UsageHandler) List(c *gin.Context) {
 		AccountID:   accountID,
 		GroupID:     groupID,
 		Model:       model,
+		IngressNode: ingressNode,
 		RequestType: requestType,
 		Stream:      stream,
 		BillingType: billingType,
@@ -241,6 +243,7 @@ func (h *UsageHandler) Stats(c *gin.Context) {
 	}
 
 	model := c.Query("model")
+	ingressNode := strings.TrimSpace(c.Query("ingress_node"))
 	billingMode := strings.TrimSpace(c.Query("billing_mode"))
 
 	var requestType *int16
@@ -317,6 +320,7 @@ func (h *UsageHandler) Stats(c *gin.Context) {
 		AccountID:   accountID,
 		GroupID:     groupID,
 		Model:       model,
+		IngressNode: ingressNode,
 		RequestType: requestType,
 		Stream:      stream,
 		BillingType: billingType,

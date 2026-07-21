@@ -225,6 +225,10 @@
           <span v-else class="text-sm text-gray-400 dark:text-gray-500">-</span>
         </template>
 
+        <template #cell-ingress_node="{ row }">
+          <span v-if="row.ingress_node" class="text-sm font-mono text-gray-600 dark:text-gray-400">{{ row.ingress_node }}</span>
+          <span v-else class="text-sm text-gray-400">—</span>
+        </template>
         <template #cell-ip_address="{ row }">
           <div v-if="row.ip_address">
             <span class="text-sm font-mono text-gray-600 dark:text-gray-400">{{ row.ip_address }}</span>

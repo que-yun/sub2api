@@ -92,7 +92,17 @@ func (s *OpenAIGatewayService) failoverOpenAIUpstreamHTTPError(
 	if account != nil && account.Platform == PlatformGrok {
 		s.handleGrokAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody)
 	}
-	if !s.shouldFailoverOpenAIUpstreamResponse(resp.StatusCode, upstreamMsg, respBody) {
+	// Prefer the model the client actually requested so mapping decisions are
+	// based on gpt-* (or whatever the client sent), not the already-mapped GLM id.
+	requestedModel := strings.TrimSpace(upstreamModel)
+	if c != nil {
+		if v, ok := c.Get("ops_model"); ok {
+			if model, ok := v.(string); ok && strings.TrimSpace(model) != "" {
+				requestedModel = strings.TrimSpace(model)
+			}
+		}
+	}
+	if !s.shouldFailoverOpenAIUpstreamResponse(resp.StatusCode, upstreamMsg, respBody, account, requestedModel) {
 		return nil
 	}
 	upstreamDetail := ""
@@ -122,6 +132,8 @@ func (s *OpenAIGatewayService) failoverOpenAIUpstreamHTTPError(
 		respBody,
 		upstreamMsg,
 		account.IsPoolMode() && (account.IsPoolModeRetryableStatus(resp.StatusCode) || isOpenAITransientProcessingError(resp.StatusCode, upstreamMsg, respBody)),
+		account,
+		requestedModel,
 	)
 }
 

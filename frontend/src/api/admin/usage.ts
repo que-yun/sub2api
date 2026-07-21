@@ -82,6 +82,7 @@ export interface CreateUsageCleanupTaskRequest {
 
 export interface AdminUsageQueryParams extends UsageQueryParams {
   user_id?: number
+  ingress_node?: string
   exact_total?: boolean
   billing_mode?: string
   sort_by?: string

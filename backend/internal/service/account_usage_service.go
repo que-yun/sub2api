@@ -87,6 +87,11 @@ type accountWindowStatsBatchReader interface {
 	GetAccountWindowStatsBatch(ctx context.Context, accountIDs []int64, startTime time.Time) (map[int64]*usagestats.AccountStats, error)
 }
 
+// accountLifetimeStatsBatchReader 可选接口：批量拉取账号全量统计。
+type accountLifetimeStatsBatchReader interface {
+	GetAccountLifetimeStatsBatch(ctx context.Context, accountIDs []int64) (map[int64]*usagestats.AccountStats, error)
+}
+
 // apiUsageCache 缓存从 Anthropic API 获取的使用率数据（utilization, resets_at）
 // 同时支持缓存错误响应（负缓存），防止 429 等错误导致的重试风暴
 type apiUsageCache struct {
@@ -95,9 +100,11 @@ type apiUsageCache struct {
 	timestamp time.Time
 }
 
-// windowStatsCache 缓存从本地数据库查询的窗口统计（requests, tokens, cost）
+// windowStatsCache 缓存从本地数据库查询的窗口统计（requests, tokens, cost）。
+// fiveHour / sevenDay 分别对应 5h session 窗与 7d 配额窗的本地聚合。
 type windowStatsCache struct {
-	stats     *WindowStats
+	fiveHour  *WindowStats
+	sevenDay  *WindowStats
 	timestamp time.Time
 }
 
@@ -469,7 +476,10 @@ func (s *AccountUsageService) GetUsage(ctx context.Context, accountID int64, for
 	// Setup Token账号：根据session_window推算（没有profile scope，无法调用usage API）
 	if account.Type == AccountTypeSetupToken {
 		usage := s.estimateSetupTokenUsage(account)
-		// 添加窗口统计
+		// Setup Token 无 profile scope，7d/7d_oi 只能来自网关响应头被动采样
+		usage.SevenDay = buildPassiveUsageWindow(account.Extra, "passive_usage_7d_utilization", "passive_usage_7d_reset")
+		usage.SevenDayFable = buildPassiveUsageWindow(account.Extra, "passive_usage_7d_oi_utilization", "passive_usage_7d_oi_reset")
+		// 添加窗口统计（本地 usage_logs 聚合）
 		s.addWindowStats(ctx, account, usage)
 		return usage, nil
 	}
@@ -1201,52 +1211,65 @@ func enrichUsageWithAccountError(info *UsageInfo, account *Account) {
 	info.NeedsReauth = false
 }
 
-// addWindowStats 为 usage 数据添加窗口期统计
-// 使用独立缓存（1 分钟），与 API 缓存分离
+// addWindowStats 为 Anthropic usage 数据添加本地窗口统计。
+// 5h 按 session 窗（或预测整点窗）聚合；7d 按重置时间回推 7 天（无 reset 则 now-7d）。
+// 使用独立缓存（1 分钟），与 API 缓存分离。
 func (s *AccountUsageService) addWindowStats(ctx context.Context, account *Account, usage *UsageInfo) {
-	// 修复：即使 FiveHour 为 nil，也要尝试获取统计数据
-	// 因为 SevenDay/SevenDaySonnet/SevenDayFable 可能需要
-	if usage.FiveHour == nil && usage.SevenDay == nil && usage.SevenDaySonnet == nil && usage.SevenDayFable == nil {
+	if usage == nil || account == nil || s.usageLogRepo == nil {
+		return
+	}
+	if usage.FiveHour == nil && usage.SevenDay == nil {
 		return
 	}
 
+	now := time.Now()
+	var fiveHourStats *WindowStats
+	var sevenDayStats *WindowStats
+	cacheHit := false
+
 	// 检查窗口统计缓存（1 分钟）
-	var windowStats *WindowStats
 	if cached, ok := s.cache.windowStatsCache.Load(account.ID); ok {
 		if cache, ok := cached.(*windowStatsCache); ok && time.Since(cache.timestamp) < windowStatsCacheTTL {
-			windowStats = cache.stats
+			fiveHourStats = cache.fiveHour
+			sevenDayStats = cache.sevenDay
+			cacheHit = true
 		}
 	}
 
-	// 如果没有缓存，从数据库查询
-	if windowStats == nil {
-		// 使用统一的窗口开始时间计算逻辑（考虑窗口过期情况）
-		startTime := account.GetCurrentWindowStartTime()
-
-		stats, err := s.usageLogRepo.GetAccountWindowStats(ctx, account.ID, startTime)
-		if err != nil {
-			log.Printf("Failed to get window stats for account %d: %v", account.ID, err)
-			return
+	// 按需补查：缓存未命中，或本次需要的维度还没查过
+	needFive := usage.FiveHour != nil && fiveHourStats == nil
+	needSeven := usage.SevenDay != nil && sevenDayStats == nil
+	if !cacheHit || needFive || needSeven {
+		if needFive {
+			// 5h：优先用账号记录的 session 窗起点（过期则预测当前整点）
+			fiveStart := account.GetCurrentWindowStartTime()
+			if stats, err := s.usageLogRepo.GetAccountWindowStats(ctx, account.ID, fiveStart); err != nil {
+				log.Printf("Failed to get 5h window stats for account %d: %v", account.ID, err)
+			} else {
+				fiveHourStats = windowStatsFromAccountStats(stats)
+			}
 		}
-
-		windowStats = &WindowStats{
-			Requests:     stats.Requests,
-			Tokens:       stats.Tokens,
-			Cost:         stats.Cost,
-			StandardCost: stats.StandardCost,
-			UserCost:     stats.UserCost,
+		if needSeven {
+			// 7d：与 Codex/OpenAI 一致，有有效 reset 则回推 7 天，否则 now-7d
+			sevenStart := codexWindowStatsStart(usage.SevenDay, 7*24*time.Hour, now)
+			if stats, err := s.usageLogRepo.GetAccountWindowStats(ctx, account.ID, sevenStart); err != nil {
+				log.Printf("Failed to get 7d window stats for account %d: %v", account.ID, err)
+			} else {
+				sevenDayStats = windowStatsFromAccountStats(stats)
+			}
 		}
-
-		// 缓存窗口统计（1 分钟）
 		s.cache.windowStatsCache.Store(account.ID, &windowStatsCache{
-			stats:     windowStats,
-			timestamp: time.Now(),
+			fiveHour:  fiveHourStats,
+			sevenDay:  sevenDayStats,
+			timestamp: now,
 		})
 	}
 
-	// 为 FiveHour 添加 WindowStats（5h 窗口统计）
-	if usage.FiveHour != nil {
-		usage.FiveHour.WindowStats = windowStats
+	if usage.FiveHour != nil && fiveHourStats != nil {
+		usage.FiveHour.WindowStats = fiveHourStats
+	}
+	if usage.SevenDay != nil && sevenDayStats != nil {
+		usage.SevenDay.WindowStats = sevenDayStats
 	}
 }
 
@@ -1305,6 +1328,73 @@ func (s *AccountUsageService) GetTodayStatsBatch(ctx context.Context, accountIDs
 		id := accountID
 		g.Go(func() error {
 			stats, err := s.usageLogRepo.GetAccountWindowStats(gctx, id, startTime)
+			if err != nil {
+				return nil
+			}
+			mu.Lock()
+			result[id] = windowStatsFromAccountStats(stats)
+			mu.Unlock()
+			return nil
+		})
+	}
+
+	_ = g.Wait()
+
+	for _, accountID := range uniqueIDs {
+		if _, ok := result[accountID]; !ok {
+			result[accountID] = &WindowStats{}
+		}
+	}
+	return result, nil
+}
+
+// GetLifetimeStats 获取账号全量（all-time）统计。
+func (s *AccountUsageService) GetLifetimeStats(ctx context.Context, accountID int64) (*WindowStats, error) {
+	stats, err := s.usageLogRepo.GetAccountLifetimeStats(ctx, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("get lifetime stats failed: %w", err)
+	}
+	return windowStatsFromAccountStats(stats), nil
+}
+
+// GetLifetimeStatsBatch 批量获取账号全量统计，优先走批量 SQL，失败时回退单账号查询。
+func (s *AccountUsageService) GetLifetimeStatsBatch(ctx context.Context, accountIDs []int64) (map[int64]*WindowStats, error) {
+	uniqueIDs := make([]int64, 0, len(accountIDs))
+	seen := make(map[int64]struct{}, len(accountIDs))
+	for _, accountID := range accountIDs {
+		if accountID <= 0 {
+			continue
+		}
+		if _, exists := seen[accountID]; exists {
+			continue
+		}
+		seen[accountID] = struct{}{}
+		uniqueIDs = append(uniqueIDs, accountID)
+	}
+
+	result := make(map[int64]*WindowStats, len(uniqueIDs))
+	if len(uniqueIDs) == 0 {
+		return result, nil
+	}
+
+	if batchReader, ok := s.usageLogRepo.(accountLifetimeStatsBatchReader); ok {
+		statsByAccount, err := batchReader.GetAccountLifetimeStatsBatch(ctx, uniqueIDs)
+		if err == nil {
+			for _, accountID := range uniqueIDs {
+				result[accountID] = windowStatsFromAccountStats(statsByAccount[accountID])
+			}
+			return result, nil
+		}
+	}
+
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(8)
+
+	for _, accountID := range uniqueIDs {
+		id := accountID
+		g.Go(func() error {
+			stats, err := s.usageLogRepo.GetAccountLifetimeStats(gctx, id)
 			if err != nil {
 				return nil
 			}

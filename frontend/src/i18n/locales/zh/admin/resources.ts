@@ -541,6 +541,8 @@ export default {
       billingModeVideo: '按次(视频)',
       allBillingModes: '全部计费模式',
       ipAddress: 'IP',
+      allIngressNodes: '全部入口',
+      ingressNode: '入口节点',
       clickToViewBalance: '点击查看充值记录',
       failedToLoadUser: '加载用户信息失败',
       userDeletedBadge: '已删除',
