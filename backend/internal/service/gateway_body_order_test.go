@@ -192,7 +192,7 @@ func TestGatewayCacheTTLGlobalSetting_TargetResolution(t *testing.T) {
 
 	target, ok := svc.resolveCacheTTLUsageOverrideTarget(context.Background(), account)
 	require.True(t, ok)
-	require.Equal(t, cacheTTLTarget5m, target)
+	require.Equal(t, cacheTTLTarget1h, target)
 
 	account.Extra = map[string]any{
 		"cache_ttl_override_enabled": true,

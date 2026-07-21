@@ -896,7 +896,7 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 		}
 
 		// Cache TTL Override: 重写 SSE 事件中的 cache_creation 分类。
-		// 账号级设置优先；全局 1h 请求注入开启时，默认把 usage 计费归回 5m。
+		// 账号级设置优先；全局 1h 请求注入开启时，usage 与实际请求保持一致。
 		if overrideTarget, ok := s.resolveCacheTTLUsageOverrideTarget(ctx, account); ok {
 			if eventType == "message_start" {
 				if msg, ok := event["message"].(map[string]any); ok {
@@ -1323,7 +1323,7 @@ func (s *GatewayService) resolveCacheTTLUsageOverrideTarget(ctx context.Context,
 		return account.GetCacheTTLOverrideTarget(), true
 	}
 	if account.IsAnthropicOAuthOrSetupToken() && s != nil && s.settingService != nil && s.settingService.IsAnthropicCacheTTL1hInjectionEnabled(ctx) {
-		return cacheTTLTarget5m, true
+		return cacheTTLTarget1h, true
 	}
 	return "", false
 }
@@ -1368,7 +1368,7 @@ func (s *GatewayService) handleNonStreamingResponse(ctx context.Context, resp *h
 	}
 
 	// Cache TTL Override: 重写 non-streaming 响应中的 cache_creation 分类。
-	// 账号级设置优先；全局 1h 请求注入开启时，默认把 usage 计费归回 5m。
+	// 账号级设置优先；全局 1h 请求注入开启时，usage 与实际请求保持一致。
 	if overrideTarget, ok := s.resolveCacheTTLUsageOverrideTarget(ctx, account); ok {
 		if applyCacheTTLOverride(&response.Usage, overrideTarget) {
 			// 同步更新 body JSON 中的嵌套 cache_creation 对象
