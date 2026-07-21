@@ -16,10 +16,14 @@ import (
 const (
 	grokConversationIDHeader         = "X-Grok-Conv-Id"
 	claudeCodeSessionHeader          = "X-Claude-Code-Session-Id"
+	claudeCodeAgentHeader            = "X-Claude-Code-Agent-Id"
+	codexTurnMetadataHeader          = "X-Codex-Turn-Metadata"
+	codexWindowIDHeader              = "X-Codex-Window-Id"
 	grokClientToolCacheOptInHeader   = "X-Sub2API-Grok-Client-Tool-Cache"
 	grokFreeCacheNativeToolsJSON     = `[{"type":"web_search"},{"type":"x_search"}]`
 	grokFreeCacheDisabledToolChoice  = "none"
 	grokClientToolCacheOptInExtraKey = "grok_client_tool_cache_enabled"
+	maxCodexTurnMetadataBytes        = 16 << 10
 )
 
 // Claude Code metadata.user_id often ends with _session_<uuid>.
@@ -107,7 +111,10 @@ func explicitGrokCacheSeed(c *gin.Context, body []byte, explicitKey string) stri
 		// Claude Code session is the most stable multi-turn identity for
 		// /v1/messages → Grok bridges. Prefer it over generic session headers
 		// so prompt cache routing matches CPA behavior.
-		seed = extractClaudeCodeSessionID(c, body)
+		seed = claudeCodeGrokCacheSeed(c, body)
+		if seed == "" && c.Request != nil {
+			seed = codexGrokCacheSeedFromHeaders(c.Request.Header)
+		}
 		if seed == "" {
 			seed = strings.TrimSpace(c.GetHeader("session_id"))
 		}
@@ -119,7 +126,10 @@ func explicitGrokCacheSeed(c *gin.Context, body []byte, explicitKey string) stri
 		}
 	}
 	if seed == "" && len(body) > 0 {
-		seed = extractClaudeCodeSessionIDFromPayload(body)
+		seed = claudeCodeGrokCacheSeedFromPayload(body)
+	}
+	if seed == "" && len(body) > 0 {
+		seed = codexGrokCacheSeedFromPayload(body)
 	}
 	if seed == "" && len(body) > 0 {
 		seed = strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
@@ -128,6 +138,81 @@ func explicitGrokCacheSeed(c *gin.Context, body []byte, explicitKey string) stri
 		seed = strings.TrimSpace(explicitKey)
 	}
 	return seed
+}
+
+// claudeCodeGrokCacheSeed separates concurrent Claude Code agents that share
+// one parent session. The value is later tenant-isolated and hashed before it
+// is forwarded to xAI.
+func claudeCodeGrokCacheSeed(c *gin.Context, body []byte) string {
+	sessionID := extractClaudeCodeSessionID(c, body)
+	if sessionID == "" {
+		return ""
+	}
+	agentID := "main"
+	if c != nil {
+		if value := strings.TrimSpace(c.GetHeader(claudeCodeAgentHeader)); value != "" {
+			agentID = value
+		}
+	}
+	return "claude:" + sessionID + ":agent:" + agentID
+}
+
+func claudeCodeGrokCacheSeedFromPayload(body []byte) string {
+	sessionID := extractClaudeCodeSessionIDFromPayload(body)
+	if sessionID == "" {
+		return ""
+	}
+	return "claude:" + sessionID + ":agent:main"
+}
+
+func codexGrokCacheSeedFromHeaders(headers http.Header) string {
+	if headers == nil {
+		return ""
+	}
+	if seed := codexGrokCacheSeedFromTurnMetadata(headers.Get(codexTurnMetadataHeader)); seed != "" {
+		return seed
+	}
+	if windowID := strings.TrimSpace(headers.Get(codexWindowIDHeader)); windowID != "" {
+		return "codex:window:" + windowID
+	}
+	return ""
+}
+
+func codexGrokCacheSeedFromPayload(body []byte) string {
+	metadata := gjson.GetBytes(body, "client_metadata")
+	if !metadata.IsObject() {
+		return ""
+	}
+	if turnMetadata := metadata.Get("x-codex-turn-metadata"); turnMetadata.Exists() {
+		if seed := codexGrokCacheSeedFromTurnMetadata(turnMetadata.String()); seed != "" {
+			return seed
+		}
+	}
+	if windowID := strings.TrimSpace(metadata.Get("x-codex-window-id").String()); windowID != "" {
+		return "codex:window:" + windowID
+	}
+	return ""
+}
+
+func codexGrokCacheSeedFromTurnMetadata(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > maxCodexTurnMetadataBytes {
+		return ""
+	}
+	var metadata struct {
+		PromptCacheKey string `json:"prompt_cache_key"`
+		WindowID       string `json:"window_id"`
+	}
+	if json.Unmarshal([]byte(value), &metadata) != nil {
+		return ""
+	}
+	if seed := strings.TrimSpace(metadata.PromptCacheKey); seed != "" {
+		return seed
+	}
+	if windowID := strings.TrimSpace(metadata.WindowID); windowID != "" {
+		return "codex:window:" + windowID
+	}
+	return ""
 }
 
 func isGrokRequestContext(c *gin.Context) bool {

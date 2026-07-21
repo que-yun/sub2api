@@ -5,6 +5,7 @@ package service
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -162,6 +163,54 @@ func TestResolveGrokCacheIdentityPrefersClaudeCodeSession(t *testing.T) {
 	require.Equal(t, metaID, resolveGrokCacheIdentity(metaOnly, metaBody2, "", "grok-4.5"))
 }
 
+func TestResolveGrokCacheIdentityUsesCodexWindowAcrossTurns(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c := newGrokCacheTestContext(703)
+	c.Request.Header.Set(codexTurnMetadataHeader, `{"prompt_cache_key":"codex-cache-key","window_id":"ignored-window"}`)
+
+	first := resolveGrokCacheIdentity(c, []byte(`{"model":"grok","input":"turn one"}`), "", "grok-4.5")
+	second := resolveGrokCacheIdentity(c, []byte(`{"model":"grok","input":"turn two"}`), "", "grok-4.5")
+
+	require.NotEmpty(t, first)
+	require.Equal(t, first, second)
+
+	bodyContext := newGrokCacheTestContext(703)
+	body := []byte(`{"model":"grok","client_metadata":{"x-codex-turn-metadata":"{\"prompt_cache_key\":\"codex-cache-key\"}"},"input":"different transport"}`)
+	require.Equal(t, first, resolveGrokCacheIdentity(bodyContext, body, "", "grok-4.5"))
+
+	windowHeader := newGrokCacheTestContext(703)
+	windowHeader.Request.Header.Set(codexWindowIDHeader, "codex-window")
+	windowBody := newGrokCacheTestContext(703)
+	windowBodyRequest := []byte(`{"model":"grok","client_metadata":{"x-codex-window-id":"codex-window"},"input":"another transport"}`)
+	require.Equal(t,
+		resolveGrokCacheIdentity(windowHeader, []byte(`{"model":"grok","input":"header window"}`), "", "grok-4.5"),
+		resolveGrokCacheIdentity(windowBody, windowBodyRequest, "", "grok-4.5"),
+	)
+}
+
+func TestResolveGrokCacheIdentitySeparatesClaudeCodeAgents(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"model":"grok","input":"same conversation"}`)
+	main := newGrokCacheTestContext(704)
+	main.Request.Header.Set(claudeCodeSessionHeader, "claude-session")
+	worker := newGrokCacheTestContext(704)
+	worker.Request.Header.Set(claudeCodeSessionHeader, "claude-session")
+	worker.Request.Header.Set(claudeCodeAgentHeader, "worker-1")
+
+	require.NotEqual(t,
+		resolveGrokCacheIdentity(main, body, "", "grok-4.5"),
+		resolveGrokCacheIdentity(worker, body, "", "grok-4.5"),
+	)
+}
+
+func TestResolveGrokCacheIdentityIgnoresOversizedCodexMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c := newGrokCacheTestContext(705)
+	c.Request.Header.Set(codexTurnMetadataHeader, strings.Repeat("x", maxCodexTurnMetadataBytes+1))
+
+	require.Empty(t, resolveGrokCacheIdentity(c, []byte(`{"model":"grok"}`), "", "grok-4.5"))
+}
+
 func TestResolveGrokCacheIdentityFailsClosedWithoutAPIKeyContext(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c := newGrokCacheTestContext(0)
@@ -182,6 +231,8 @@ func TestGrokConversationHeaderIsScopedToGrokRequestScheduling(t *testing.T) {
 	openAIContext := newGrokCacheTestContext(601)
 	openAIContext.Set("api_key", &APIKey{ID: 601, Group: &Group{Platform: PlatformOpenAI}})
 	openAIContext.Request.Header.Set(grokConversationIDHeader, "must-be-ignored")
+	openAIContext.Request.Header.Set(codexTurnMetadataHeader, `{"prompt_cache_key":"must-not-affect-openai"}`)
+	openAIContext.Request.Header.Set(claudeCodeAgentHeader, "must-not-affect-openai")
 	require.Equal(t, "body-session", (&OpenAIGatewayService{}).ExtractSessionID(openAIContext, body))
 
 	withoutGrokHeader := newGrokCacheTestContext(601)
@@ -194,7 +245,7 @@ func TestGrokConversationHeaderIsScopedToGrokRequestScheduling(t *testing.T) {
 
 func TestApplyGrokFreeFunctionToolCacheRouteInfersFreeFrom2MTokenLimit(t *testing.T) {
 	account := healthyGrokOAuthGatewayTestAccount(910, "access-token")
-	limit := int64(grokFreeRolling24hTokenLimit)
+	limit := int64(xai.GrokFreeRolling24hTokenLimit)
 	remaining := limit
 	account.Extra = map[string]any{
 		grokQuotaSnapshotExtraKey: &xai.QuotaSnapshot{
