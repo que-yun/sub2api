@@ -1,0 +1,18 @@
+[
+  {
+    "n": 1,
+    "title": "chenyme/grok2api at 11bb5e20e7409ecaa64cf083c1e302fbb6ab30e7",
+    "url": "https://github.com/chenyme/grok2api/tree/11bb5e20e7409ecaa64cf083c1e302fbb6ab30e7",
+    "engine": "git clone",
+    "fetched_at": "2026-07-21",
+    "quote": "routing.reasoningReplayEnabled: true; reasoningReplayTTL: 1h; server-side replay restores missing encrypted_content."
+  },
+  {
+    "n": 2,
+    "title": "Sub2API local usage_logs and Grok forwarding implementation",
+    "url": "local://sub2api-upstream-custom",
+    "engine": "local PostgreSQL and source inspection",
+    "fetched_at": "2026-07-21",
+    "quote": "72h: 7,812 Grok requests; 5,838 cache-read hits; 445,763,840 cache-read tokens out of 600,921,973 complete prompt tokens."
+  }
+]
