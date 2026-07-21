@@ -44,10 +44,12 @@ if [[ "${FORCE_REBUILD:-false}" == "true" ]]; then
 elif [[ ! -x "${BIN_PATH}" ]]; then
   need_build=true
 elif command -v strings >/dev/null 2>&1; then
-  if strings "${BIN_PATH}" | grep -F -q "Frontend not embedded"; then
+  # NOTE: do not use grep -q under pipefail — early exit SIGPIPEs strings and
+  # makes a successful marker match look like a failed pipeline (! becomes true).
+  if strings "${BIN_PATH}" | grep -F "Frontend not embedded" >/dev/null; then
     echo "Existing binary is non-embed; rebuilding host binary."
     need_build=true
-  elif ! strings "${BIN_PATH}" | grep -F -q "__CSP_NONCE_VALUE__"; then
+  elif ! strings "${BIN_PATH}" | grep -F "__CSP_NONCE_VALUE__" >/dev/null; then
     echo "Existing binary missing frontend markers; rebuilding host binary."
     need_build=true
   fi
