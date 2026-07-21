@@ -799,19 +799,11 @@ inserted AS (
   WHERE NOT EXISTS (SELECT 1 FROM public.api_keys k WHERE k.id = p.id)
     AND NOT EXISTS (SELECT 1 FROM public.api_keys k WHERE k.key = p.key)
   RETURNING id
-),
-stale AS (
-  UPDATE public.api_keys k
-  SET deleted_at = now(),
-      status = CASE WHEN k.status = 'active' THEN 'disabled' ELSE k.status END,
-      updated_at = now()
-  WHERE k.deleted_at IS NULL
-    AND NOT EXISTS (SELECT 1 FROM local_route_api_keys l WHERE l.id = k.id OR l.key = k.key)
-  RETURNING k.id
 )
+-- The standby may contain keys managed only on that host. Route sync is an
+-- upsert of local route keys, not a destructive mirror of the whole key set.
 SELECT 'synced_api_keys updated=' || (SELECT count(*) FROM updated)
-  || ' inserted=' || (SELECT count(*) FROM inserted)
-  || ' soft_deleted_stale=' || (SELECT count(*) FROM stale);
+  || ' inserted=' || (SELECT count(*) FROM inserted);
 
 WITH api_key_group_remaps(from_group_name, to_group_name) AS (
   ${remap_values_sql}
