@@ -52,18 +52,23 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	if isGrokImageGenerationModel(upstreamModel) {
 		return nil, fmt.Errorf("model %s is an image model and is not available on the Responses endpoint; use /v1/images/generations instead", upstreamModel)
 	}
-	cacheIdentity := resolveGrokCacheIdentity(c, body, "", upstreamModel)
 	patchedBody, err := patchGrokResponsesBody(body, upstreamModel)
 	if err != nil {
 		return nil, err
 	}
+	// Derive the identity from the request xAI will actually see. This makes
+	// Codex Responses Lite additional_tools part of the stable tool prefix.
+	cacheIdentity := resolveGrokCacheIdentity(c, patchedBody, "", upstreamModel)
+	mixedCacheIntentBody := append([]byte(nil), patchedBody...)
 	patchedBody, err = applyGrokResponsesCacheIdentity(patchedBody, body, cacheIdentity, account.IsGrokOAuth())
 	if err != nil {
 		return nil, fmt.Errorf("apply grok prompt cache identity: %w", err)
 	}
-	// Free OAuth + client function tools: Codex/Responses 与 Messages 共用 Free 抬升，
-	// function tools 场景补 native search tools，尽量避开 non-cacheable build-free 路径。
-	patchedBody, err = applyGrokFreeMessagesFunctionToolCacheRoute(patchedBody, body, account, cacheIdentity)
+	// Free OAuth + client function tools: reuse Messages mixed-tools cache route
+	// (append web_search/x_search so xAI does not force non-cacheable build-free).
+	// Request-scoped opt-in/out via applyGrokFreeRequestToolCacheRoute; intent comes from
+	// the already-patched body so Codex additional_tools promotions stay visible.
+	patchedBody, err = applyGrokFreeRequestToolCacheRoute(c, patchedBody, mixedCacheIntentBody, account, cacheIdentity)
 	if err != nil {
 		return nil, fmt.Errorf("apply grok Free function-tool cache route: %w", err)
 	}
@@ -98,6 +103,8 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	// GPT/OpenAI 会话切到 Grok 后，Codex 可能仍携带外来 previous_response_id。
 	// 同账号允许一次 drop-and-retry，并对孤儿 function_call_output 做可重建修复。
 	prevResponseRecovered := false
+	// xAI 可能拒绝来自其他账号/缓存身份的 encrypted reasoning；同路由同凭证允许剥掉后重试一次。
+	encryptedContentRetried := false
 	for i, baseURL := range tryBaseURLs {
 		for {
 			upstreamReq, reqErr := buildGrokResponsesRequestWithBase(upstreamCtx, c, account, patchedBody, token, cacheIdentity, s.cfg, baseURL)
@@ -139,6 +146,24 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 						"account_id", account.ID,
 						"upstream_model", upstreamModel,
 						"upstream_status", currentResp.StatusCode,
+						"upstream_request_id", requestID,
+					)
+					continue
+				}
+			}
+
+			// Invalid encrypted_content from another account/cache identity: strip and retry once.
+			if !encryptedContentRetried && isGrokInvalidEncryptedContentResponse(currentResp.StatusCode, respBody) {
+				retryBody, changed, trimErr := trimGrokInvalidEncryptedContentRetryBody(patchedBody)
+				if trimErr != nil {
+					return nil, fmt.Errorf("prepare Grok invalid encrypted_content retry: %w", trimErr)
+				}
+				if changed {
+					encryptedContentRetried = true
+					patchedBody = retryBody
+					slog.Info("grok_invalid_encrypted_content_retry",
+						"account_id", account.ID,
+						"cache_identity_present", cacheIdentity != "",
 						"upstream_request_id", requestID,
 					)
 					continue
@@ -220,6 +245,167 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		Duration:        time.Since(startTime),
 		FirstTokenMs:    firstTokenMs,
 	}, nil
+}
+
+func isGrokInvalidEncryptedContentResponse(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadRequest {
+		return false
+	}
+
+	// xAI has used both flat and nested error envelopes:
+	//   {"code":"invalid-argument","error":"Could not decrypt the provided encrypted_content."}
+	//   {"error":{"message":"Could not decrypt the provided encrypted_content."}}
+	code := strings.TrimSpace(gjson.GetBytes(body, "code").String())
+	message := ""
+	errNode := gjson.GetBytes(body, "error")
+	switch {
+	case errNode.Type == gjson.String:
+		message = errNode.String()
+	case errNode.IsObject():
+		message = firstNonEmpty(errNode.Get("message").String(), errNode.Get("error").String())
+		if code == "" {
+			code = strings.TrimSpace(errNode.Get("code").String())
+		}
+	default:
+		message = gjson.GetBytes(body, "message").String()
+	}
+	normalizedMessage := strings.ToLower(strings.TrimSpace(message))
+	if normalizedMessage == "" {
+		return false
+	}
+
+	if strings.EqualFold(code, "invalid_encrypted_content") {
+		return true
+	}
+	// Keep the official xAI flat-code gate so unrelated 400s are not retried.
+	if !strings.EqualFold(code, "invalid-argument") && code != "" {
+		return false
+	}
+	// Nested OpenAI-style envelopes may omit top-level code; require decrypt text.
+	if code == "" && !strings.Contains(normalizedMessage, "decrypt") {
+		return false
+	}
+	return strings.Contains(normalizedMessage, "encrypted_content") &&
+		(strings.Contains(normalizedMessage, "decrypt") ||
+			strings.Contains(normalizedMessage, "unmodified"))
+}
+
+// requestHasGrokEncryptedReasoning reports whether the outbound Responses body
+// still carries reasoning.encrypted_content that can be stripped for retry.
+func requestHasGrokEncryptedReasoning(body []byte) bool {
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() {
+		return false
+	}
+	items := input.Array()
+	if input.IsObject() {
+		items = []gjson.Result{input}
+	}
+	for _, item := range items {
+		if strings.TrimSpace(item.Get("type").String()) != "reasoning" {
+			continue
+		}
+		enc := item.Get("encrypted_content")
+		if enc.Exists() && enc.Type != gjson.Null && strings.TrimSpace(enc.String()) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+type grokEncryptedContentStripRetriedKey struct{}
+
+func markGrokEncryptedContentStripRetried(ctx context.Context) context.Context {
+	return context.WithValue(ctx, grokEncryptedContentStripRetriedKey{}, true)
+}
+
+func grokEncryptedContentStripRetried(ctx context.Context) bool {
+	v, _ := ctx.Value(grokEncryptedContentStripRetriedKey{}).(bool)
+	return v
+}
+
+// stripAnthropicThinkingSignatures removes thinking.signature from Claude
+// history so a different Grok OAuth account can accept multi-turn tool
+// continuations after decrypt failures. Returns ok=false when nothing changed.
+func stripAnthropicThinkingSignatures(body []byte) ([]byte, bool) {
+	if len(body) == 0 || !bytes.Contains(body, []byte(`"signature"`)) {
+		return body, false
+	}
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body, false
+	}
+	messages, ok := req["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		return body, false
+	}
+	changed := false
+	for _, rawMsg := range messages {
+		msg, ok := rawMsg.(map[string]any)
+		if !ok {
+			continue
+		}
+		content, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawBlock := range content {
+			block, ok := rawBlock.(map[string]any)
+			if !ok {
+				continue
+			}
+			if typ, _ := block["type"].(string); typ != "thinking" {
+				continue
+			}
+			if _, has := block["signature"]; has {
+				delete(block, "signature")
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	out, err := json.Marshal(req)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+func trimGrokInvalidEncryptedContentRetryBody(body []byte) ([]byte, bool, error) {
+	input := gjson.GetBytes(body, "input")
+	items := input.Array()
+	if input.IsObject() {
+		items = []gjson.Result{input}
+	}
+
+	hasEncryptedReasoning := false
+	for _, item := range items {
+		if strings.TrimSpace(item.Get("type").String()) == "reasoning" && item.Get("encrypted_content").Exists() {
+			hasEncryptedReasoning = true
+			break
+		}
+	}
+	if !hasEncryptedReasoning {
+		return body, false, nil
+	}
+
+	var requestBody map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&requestBody); err != nil {
+		return nil, false, err
+	}
+	if !trimOpenAIEncryptedReasoningItems(requestBody) {
+		return body, false, nil
+	}
+
+	retryBody, err := marshalOpenAIUpstreamJSON(requestBody)
+	if err != nil {
+		return nil, false, err
+	}
+	return retryBody, true, nil
 }
 
 func patchGrokResponsesBody(body []byte, upstreamModel string) ([]byte, error) {
@@ -827,10 +1013,10 @@ func extractGrokInputItemText(item gjson.Result) string {
 }
 
 // additional_tools is a Codex/Responses Lite private input carrier. xAI's
-// Responses schema accepts ordinary message/function-call input items but
-// rejects this carrier before inference with a ModelInput deserialization
-// error. Before dropping the carrier, promote any usable nested tools into
-// the top-level tools array so Codex Desktop still keeps executable tools.
+// Responses schema rejects the carrier itself, but accepts supported tools at
+// the top level. Before dropping the carrier, convert Codex-only nested tools
+// (shell/local_shell/namespace) into xAI-supported shapes and merge them into
+// top-level tools so Codex Desktop still keeps executable tools.
 func sanitizeGrokResponsesInput(body []byte) ([]byte, error) {
 	if !bytes.Contains(body, []byte(`"additional_tools"`)) {
 		return body, nil
@@ -848,6 +1034,13 @@ func sanitizeGrokResponsesInput(body []byte) ([]byte, error) {
 			for _, nested := range item.Get("tools").Array() {
 				if converted, ok := convertGrokCodexTool(nested); ok {
 					promotedTools = append(promotedTools, converted)
+				} else if nested.Get("tools").IsArray() {
+					// Flatten namespace.tools when present inside additional_tools.
+					for _, nestedTool := range nested.Get("tools").Array() {
+						if converted, ok := convertGrokCodexTool(nestedTool); ok {
+							promotedTools = append(promotedTools, converted)
+						}
+					}
 				}
 			}
 			continue
@@ -902,6 +1095,21 @@ func stripGrokUnsupportedReasoningItems(body []byte) ([]byte, error) {
 		return nil, err
 	}
 	return sjson.SetRawBytes(body, "input", encoded)
+}
+
+func grokResponsesToolDedupKey(tool gjson.Result) string {
+	toolType := strings.TrimSpace(tool.Get("type").String())
+	if toolType != "" {
+		if name := strings.TrimSpace(tool.Get("name").String()); name != "" {
+			return "type:" + toolType + "\x00name:" + name
+		}
+		if toolType == "mcp" {
+			if label := strings.TrimSpace(tool.Get("server_label").String()); label != "" {
+				return "type:mcp\x00server_label:" + label
+			}
+		}
+	}
+	return "json:" + normalizeCompatSeedJSON(json.RawMessage(tool.Raw))
 }
 
 // sanitizeGrokReasoningNullContent 删除 reasoning 项中的 "content": null。

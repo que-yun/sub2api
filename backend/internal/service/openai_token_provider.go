@@ -157,15 +157,19 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 		accountAccessToken = strings.TrimSpace(account.GetCredential("access_token"))
 	}
 
-	// 1) Try cache first. Only accept when cached AT matches DB credentials
-	// (after local->VPS push, stale Redis must not win over PG).
+	// 1) Try cache first.
+	// - DB 有 access_token：仅当缓存与 DB 一致且未过期才命中，避免 local->VPS 后 Redis 旧 token 盖过 PG。
+	// - DB 无 access_token：沿用缓存（测试/过渡态），避免无意义 miss。
 	if p.tokenCache != nil {
 		if token, err := p.tokenCache.GetAccessToken(ctx, cacheKey); err == nil {
 			cachedToken := strings.TrimSpace(token)
-			if cachedToken != "" && accountAccessToken != "" && cachedToken == accountAccessToken &&
-				(expiresAt == nil || time.Now().Before(*expiresAt)) {
-				slog.Debug("openai_token_cache_hit", "account_id", account.ID)
-				return cachedToken, nil
+			if cachedToken != "" {
+				cacheUsable := expiresAt == nil || time.Now().Before(*expiresAt)
+				matchesDB := accountAccessToken == "" || cachedToken == accountAccessToken
+				if cacheUsable && matchesDB {
+					slog.Debug("openai_token_cache_hit", "account_id", account.ID)
+					return cachedToken, nil
+				}
 			}
 		} else {
 			slog.Warn("openai_token_cache_get_failed", "account_id", account.ID, "error", err)

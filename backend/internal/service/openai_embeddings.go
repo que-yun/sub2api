@@ -132,13 +132,13 @@ func (s *OpenAIGatewayService) ForwardEmbeddings(
 				Message:            upstreamMsg,
 				Detail:             upstreamDetail,
 			})
-			s.handleOpenAIAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody, upstreamModel)
+			shouldDisable := s.handleOpenAIAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody, upstreamModel)
 			return nil, newOpenAIUpstreamFailoverError(
 				resp.StatusCode,
 				resp.Header,
 				respBody,
 				upstreamMsg,
-				account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode),
+				!shouldDisable && account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode),
 				account,
 				originalModel,
 			)

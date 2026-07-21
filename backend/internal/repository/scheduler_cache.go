@@ -966,6 +966,8 @@ func filterSchedulerExtra(extra map[string]any) map[string]any {
 		// 而 TopK 被这些 held 号占满时会整批复检失败 → 无候选 503，健康号反而永远排不进 TopK。
 		"grok_hold_until_success",
 		service.UpstreamBillingProbeExtraKey,
+		service.GrokMediaEligibleExtraKey,
+		"grok_billing_snapshot",
 	}
 	filtered := make(map[string]any)
 	for _, key := range keys {

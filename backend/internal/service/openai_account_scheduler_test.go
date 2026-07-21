@@ -10,9 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/failclass"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/failsafebreaker"
+
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1095,6 +1096,70 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_ImageInputVisionMapping
 	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
 }
 
+func TestOpenAIGatewayService_SelectAccountWithScheduler_GrokMediaCapabilityFiltersIneligibleAccounts(t *testing.T) {
+	resetOpenAIAdvancedSchedulerSettingCacheForTest()
+
+	ctx := context.Background()
+	groupID := int64(10114)
+	ineligible := Account{
+		ID: 36051, Platform: PlatformGrok, Type: AccountTypeOAuth,
+		Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 5,
+		Extra: map[string]any{GrokMediaEligibleExtraKey: false},
+	}
+	eligible := Account{
+		ID: 36052, Platform: PlatformGrok, Type: AccountTypeOAuth,
+		Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 0,
+		Extra: map[string]any{GrokMediaEligibleExtraKey: true},
+	}
+	newService := func(accounts []Account) *OpenAIGatewayService {
+		cfg := &config.Config{}
+		cfg.Gateway.Scheduling.LoadBatchEnabled = false
+		return &OpenAIGatewayService{
+			accountRepo:        schedulerTestOpenAIAccountRepo{accounts: accounts},
+			cache:              &schedulerTestGatewayCache{},
+			cfg:                cfg,
+			concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{}),
+		}
+	}
+
+	t.Run("media generation skips higher priority ineligible account", func(t *testing.T) {
+		selection, _, err := newService([]Account{ineligible, eligible}).SelectAccountWithSchedulerForCapability(
+			ctx, &groupID, "", "", "grok-imagine-video", nil,
+			OpenAIUpstreamTransportHTTPSSE, OpenAIEndpointCapabilityGrokMediaGeneration,
+			false, false, false, PlatformGrok,
+		)
+
+		require.NoError(t, err)
+		require.NotNil(t, selection)
+		require.NotNil(t, selection.Account)
+		require.Equal(t, eligible.ID, selection.Account.ID)
+	})
+
+	t.Run("media generation fails closed when all accounts are ineligible", func(t *testing.T) {
+		selection, _, err := newService([]Account{ineligible}).SelectAccountWithSchedulerForCapability(
+			ctx, &groupID, "", "", "grok-imagine-video", nil,
+			OpenAIUpstreamTransportHTTPSSE, OpenAIEndpointCapabilityGrokMediaGeneration,
+			false, false, false, PlatformGrok,
+		)
+
+		require.Error(t, err)
+		require.ErrorIs(t, err, ErrNoAvailableAccounts)
+		require.Nil(t, selection)
+	})
+
+	t.Run("chat remains routable on media-ineligible account", func(t *testing.T) {
+		selection, _, err := newService([]Account{ineligible}).SelectAccountWithSchedulerForCapability(
+			ctx, &groupID, "", "", "grok-4.3", nil,
+			OpenAIUpstreamTransportHTTPSSE, OpenAIEndpointCapabilityChatCompletions,
+			false, false, false, PlatformGrok,
+		)
+
+		require.NoError(t, err)
+		require.NotNil(t, selection)
+		require.NotNil(t, selection.Account)
+		require.Equal(t, ineligible.ID, selection.Account.ID)
+	})
+}
 
 func TestOpenAIGatewayService_SelectAccountWithScheduler_EnabledUsesAdvancedPreviousResponseRouting(t *testing.T) {
 	resetOpenAIAdvancedSchedulerSettingCacheForTest()
@@ -3455,6 +3520,7 @@ func TestBuildOpenAIFailsafeTieredSelectionOrder_ExcludedGroupKeepsLegacyOrder(t
 }
 
 // 全组语义正向覆盖: 非首灰度组(24+1)在 flag=full 下同样走分档(无排除时)。
+
 func TestBuildOpenAIFailsafeTieredSelectionOrder_AnyGroupAppliesTier(t *testing.T) {
 	t.Setenv("GATEWAY_FAILSAFE_ROUTING", "1")
 	resetFailsafeObserveRegistryForTest(t)
@@ -3557,49 +3623,6 @@ func TestBuildOpenAIFailsafeTieredSelectionOrder_TargetGroupAllBrokenUsesPickBes
 	require.True(t, ok)
 	require.True(t, pick.Panic)
 	require.Equal(t, int64(61001), pick.AccountID)
-}
-
-func resetFailsafeObserveRegistryForTest(t *testing.T) {
-	t.Helper()
-	original := failsafeObserveReg
-	failsafeObserveReg = failsafebreaker.NewRegistry(failsafebreaker.DefaultConfig())
-	t.Cleanup(func() {
-		failsafeObserveReg = original
-	})
-}
-
-func openAIFailsafeTieredSelectionTestCandidates() []openAIAccountCandidateScore {
-	return []openAIAccountCandidateScore{
-		{
-			account:  &Account{ID: 61001, Priority: 0},
-			loadInfo: &AccountLoadInfo{LoadRate: 0, WaitingCount: 0},
-			score:    3,
-		},
-		{
-			account:  &Account{ID: 61002, Priority: 1},
-			loadInfo: &AccountLoadInfo{LoadRate: 0, WaitingCount: 0},
-			score:    2,
-		},
-		{
-			account:  &Account{ID: 61003, Priority: 2},
-			loadInfo: &AccountLoadInfo{LoadRate: 0, WaitingCount: 0},
-			score:    1,
-		},
-	}
-}
-
-func openAIFailsafeTestLegacyOrder(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
-	return append([]openAIAccountCandidateScore(nil), pool...)
-}
-
-func openAIFailsafeCandidateIDs(order []openAIAccountCandidateScore) []int64 {
-	ids := make([]int64, 0, len(order))
-	for _, candidate := range order {
-		if candidate.account != nil {
-			ids = append(ids, candidate.account.ID)
-		}
-	}
-	return ids
 }
 
 func TestOpenAISelectionRNG_SeedZeroStillWorks(t *testing.T) {
@@ -3886,3 +3909,47 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_SubscriptionPriorityWai
 	require.Equal(t, int64(38011), selection.WaitPlan.AccountID)
 	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
 }
+
+func resetFailsafeObserveRegistryForTest(t *testing.T) {
+	t.Helper()
+	original := failsafeObserveReg
+	failsafeObserveReg = failsafebreaker.NewRegistry(failsafebreaker.DefaultConfig())
+	t.Cleanup(func() {
+		failsafeObserveReg = original
+	})
+}
+
+func openAIFailsafeTieredSelectionTestCandidates() []openAIAccountCandidateScore {
+	return []openAIAccountCandidateScore{
+		{
+			account:  &Account{ID: 61001, Priority: 0},
+			loadInfo: &AccountLoadInfo{LoadRate: 0, WaitingCount: 0},
+			score:    3,
+		},
+		{
+			account:  &Account{ID: 61002, Priority: 1},
+			loadInfo: &AccountLoadInfo{LoadRate: 0, WaitingCount: 0},
+			score:    2,
+		},
+		{
+			account:  &Account{ID: 61003, Priority: 2},
+			loadInfo: &AccountLoadInfo{LoadRate: 0, WaitingCount: 0},
+			score:    1,
+		},
+	}
+}
+
+func openAIFailsafeTestLegacyOrder(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
+	return append([]openAIAccountCandidateScore(nil), pool...)
+}
+
+func openAIFailsafeCandidateIDs(order []openAIAccountCandidateScore) []int64 {
+	ids := make([]int64, 0, len(order))
+	for _, candidate := range order {
+		if candidate.account != nil {
+			ids = append(ids, candidate.account.ID)
+		}
+	}
+	return ids
+}
+

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -18,7 +19,7 @@ import (
 type githubReleaseClient struct {
 	httpClient         *http.Client
 	downloadHTTPClient *http.Client
-	token              string
+	updateGitHubToken  string
 }
 
 type githubReleaseClientError struct {
@@ -33,7 +34,7 @@ type githubReleaseClientError struct {
 func NewGitHubReleaseClient(proxyURL string, allowDirectOnProxyError bool, token string) service.GitHubReleaseClient {
 	// 安全说明：httpclient.GetClient 的错误链（url.Parse / proxyutil）不含明文代理凭据，
 	// 但仍通过 slog 仅在服务端日志记录，不会暴露给 HTTP 响应。
-	// token 只用于 Authorization 头，不写日志。
+	// token 只用于 Authorization 头，不写日志；未传时回退环境变量 UPDATE_GITHUB_TOKEN。
 	sharedClient, err := httpclient.GetClient(httpclient.Options{
 		Timeout:  30 * time.Second,
 		ProxyURL: proxyURL,
@@ -45,6 +46,8 @@ func NewGitHubReleaseClient(proxyURL string, allowDirectOnProxyError bool, token
 		}
 		sharedClient = &http.Client{Timeout: 30 * time.Second}
 	}
+	apiClient := cloneHTTPClient(sharedClient)
+	apiClient.CheckRedirect = githubAPICheckRedirect(apiClient.CheckRedirect)
 
 	// 下载客户端需要更长的超时时间
 	downloadClient, err := httpclient.GetClient(httpclient.Options{
@@ -58,21 +61,48 @@ func NewGitHubReleaseClient(proxyURL string, allowDirectOnProxyError bool, token
 		}
 		downloadClient = &http.Client{Timeout: 10 * time.Minute}
 	}
+	downloadClient = cloneHTTPClient(downloadClient)
 
 	return &githubReleaseClient{
-		httpClient:         sharedClient,
+		httpClient:         apiClient,
 		downloadHTTPClient: downloadClient,
-		token:              strings.TrimSpace(token),
+		updateGitHubToken:  firstNonEmpty(strings.TrimSpace(token), strings.TrimSpace(os.Getenv("UPDATE_GITHUB_TOKEN"))),
 	}
 }
 
-// setGitHubAPIHeaders 设置 GitHub API 请求头；有 token 时走认证配额（约 5000/h）。
-func (c *githubReleaseClient) setGitHubAPIHeaders(req *http.Request) {
+func cloneHTTPClient(client *http.Client) *http.Client {
+	cloned := *client
+	return &cloned
+}
+
+func isGitHubAPIURL(url *url.URL) bool {
+	return url != nil && strings.EqualFold(url.Scheme, "https") && url.User == nil &&
+		strings.EqualFold(url.Host, "api.github.com")
+}
+
+func githubAPICheckRedirect(previous func(*http.Request, []*http.Request) error) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if !isGitHubAPIURL(req.URL) {
+			req.Header.Del("Authorization")
+		}
+		if previous != nil {
+			return previous(req, via)
+		}
+		return nil
+	}
+}
+
+func (c *githubReleaseClient) newAPIRequest(ctx context.Context, url string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	req.Header.Set("User-Agent", "Sub2API-Updater")
-	if c != nil && c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if c.updateGitHubToken != "" && isGitHubAPIURL(req.URL) {
+		req.Header.Set("Authorization", "Bearer "+c.updateGitHubToken)
 	}
+	return req, nil
 }
 
 func (c *githubReleaseClientError) FetchLatestRelease(ctx context.Context, repo string) (*service.GitHubRelease, error) {
@@ -94,11 +124,10 @@ func (c *githubReleaseClientError) FetchChecksumFile(ctx context.Context, url st
 func (c *githubReleaseClient) FetchLatestRelease(ctx context.Context, repo string) (*service.GitHubRelease, error) {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := c.newAPIRequest(ctx, url)
 	if err != nil {
 		return nil, err
 	}
-	c.setGitHubAPIHeaders(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -127,11 +156,10 @@ func (c *githubReleaseClient) FetchRecentReleases(ctx context.Context, repo stri
 	}
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=%d", repo, perPage)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := c.newAPIRequest(ctx, url)
 	if err != nil {
 		return nil, err
 	}
-	c.setGitHubAPIHeaders(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -217,3 +245,13 @@ func (c *githubReleaseClient) FetchChecksumFile(ctx context.Context, url string)
 
 	return io.ReadAll(resp.Body)
 }
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
