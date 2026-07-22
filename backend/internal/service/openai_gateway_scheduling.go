@@ -27,15 +27,26 @@ func (s *OpenAIGatewayService) ExtractSessionID(c *gin.Context, body []byte) str
 	return explicitOpenAIRequestSessionID(c, body)
 }
 
+// explicitOpenAIHeaderSessionID resolves stable conversation identifiers sent by
+// OpenAI-compatible clients (fork-local minimal: session-scoped headers only).
+func explicitOpenAIHeaderSessionID(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	for _, header := range []string{"session_id", "conversation_id"} {
+		if sessionID := strings.TrimSpace(c.GetHeader(header)); sessionID != "" {
+			return sessionID
+		}
+	}
+	return ""
+}
+
 func explicitOpenAISessionID(c *gin.Context, body []byte) string {
 	if c == nil {
 		return ""
 	}
 
-	sessionID := strings.TrimSpace(c.GetHeader("session_id"))
-	if sessionID == "" {
-		sessionID = strings.TrimSpace(c.GetHeader("conversation_id"))
-	}
+	sessionID := explicitOpenAIHeaderSessionID(c)
 	if sessionID == "" && len(body) > 0 {
 		sessionID = strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
 	}
@@ -51,10 +62,7 @@ func explicitOpenAIRequestSessionID(c *gin.Context, body []byte) string {
 		return ""
 	}
 
-	sessionID := strings.TrimSpace(c.GetHeader("session_id"))
-	if sessionID == "" {
-		sessionID = strings.TrimSpace(c.GetHeader("conversation_id"))
-	}
+	sessionID := explicitOpenAIHeaderSessionID(c)
 	if sessionID == "" && isGrokRequestContext(c) {
 		sessionID = strings.TrimSpace(c.GetHeader(grokConversationIDHeader))
 	}
@@ -197,14 +205,24 @@ func normalizeOpenAICompatiblePlatform(platform string) string {
 	return PlatformOpenAI
 }
 
-func noAvailableOpenAISelectionError(requestedModel string, compactBlocked bool) error {
+// details carries an optional machine-parseable exclusion summary (e.g.
+// "pool=2, filtered: quota_auto_pause_7d=1 runtime_blocked=1") appended in
+// parentheses. It is for server-side logs / ops diagnostics only: handlers
+// never forward this error text to OpenAI-platform clients (they respond with
+// the generic classification message). Callers that must preserve the legacy
+// message pass "".
+func noAvailableOpenAISelectionError(requestedModel string, compactBlocked bool, details string) error {
 	if compactBlocked {
 		return ErrNoAvailableCompactAccounts
 	}
+	message := "no available OpenAI accounts"
 	if requestedModel != "" {
-		return openAINoAvailableSelectionError{message: fmt.Sprintf("no available OpenAI accounts supporting model: %s", requestedModel)}
+		message = fmt.Sprintf("no available OpenAI accounts supporting model: %s", requestedModel)
 	}
-	return openAINoAvailableSelectionError{message: "no available OpenAI accounts"}
+	if details != "" {
+		message += " (" + details + ")"
+	}
+	return openAINoAvailableSelectionError{message: message}
 }
 
 type openAINoAvailableSelectionError struct {
@@ -219,10 +237,16 @@ func (e openAINoAvailableSelectionError) Unwrap() error {
 	return ErrNoAvailableAccounts
 }
 
-// openAICompactSupportTier classifies an OpenAI account by compact capability.
+// openAICompactSupportTier classifies an OpenAI-compatible account by compact capability.
 // 0 = explicitly unsupported, 1 = unknown / not yet probed, 2 = explicitly supported.
 func openAICompactSupportTier(account *Account) int {
-	if account == nil || !account.IsOpenAI() {
+	if account == nil {
+		return 0
+	}
+	if account.IsGrok() {
+		return 2
+	}
+	if !account.IsOpenAI() {
 		return 0
 	}
 	supported, known := account.OpenAICompactSupportKnown()
@@ -285,7 +309,7 @@ func isOpenAICompatibleAccountEligibleForRequest(ctx context.Context, account *A
 		}
 		return false
 	}
-	if requireCompact && (!account.IsOpenAI() || openAICompactSupportTier(account) == 0) {
+	if requireCompact && openAICompactSupportTier(account) == 0 {
 		return false
 	}
 	if OpenAIImageInputIntentFromContext(ctx) && !account.SupportsOpenAIVisionModel(requestedModel) {
@@ -657,7 +681,7 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.C
 	selected, compactBlocked := s.selectBestAccount(ctx, groupID, platform, accounts, requestedModel, excludedIDs, requireCompact, requiredCapability, preferLowUpstreamRate)
 
 	if selected == nil {
-		return nil, noAvailableOpenAISelectionError(requestedModel, compactBlocked)
+		return nil, noAvailableOpenAISelectionError(requestedModel, compactBlocked, "")
 	}
 
 	hydrated, err := s.hydrateSelectedAccount(ctx, selected)

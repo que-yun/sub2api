@@ -1,12 +1,11 @@
 package service
 
-// Ported from upstream Wei-Shaw/sub2api #4719 (grok_upstream_errors.go):
-// content-policy vs account-entitlement 403 分类。仅移植请求级内容策略识别,
-// 用于让内容安全 403 直接返回、不误踢/不 failover 账号。
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // isGrokContentPolicyRejection identifies request-scoped safety refusals from
@@ -179,4 +178,61 @@ func grokContentPolicyMessage(value string) bool {
 	}
 
 	return false
+}
+
+func grokContentPolicyClientMessage(responseBody []byte) string {
+	message := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(responseBody)))
+	if message == "" {
+		return "Request blocked by upstream content policy"
+	}
+	return message
+}
+
+// shouldFailoverGrokUpstreamError is the body-aware counterpart of the
+// status-only failover helper. Grok content refusals must stay on the current
+// account and be returned to the caller instead of consuming the account pool.
+func (s *OpenAIGatewayService) shouldFailoverGrokUpstreamError(statusCode int, responseBody []byte) bool {
+	if isGrokContentPolicyRejection(statusCode, responseBody) {
+		return false
+	}
+	return s.shouldFailoverUpstreamError(statusCode)
+}
+
+// applyGrokForbiddenPolicy applies an administrator's existing temporary
+// unschedulable rules to a non-content 403. It reports true only when a rule
+// matched; unmatched responses retain the legacy entitlement cooldown.
+func (s *OpenAIGatewayService) applyGrokForbiddenPolicy(ctx context.Context, account *Account, responseBody []byte) bool {
+	if account == nil || !account.IsTempUnschedulableEnabled() {
+		return false
+	}
+
+	matches := matchTempUnschedulableRules(account, http.StatusForbidden, responseBody)
+	if len(matches) == 0 {
+		return false
+	}
+
+	match := matches[0]
+	// Reuse the central policy implementation when it has a repository. This
+	// preserves the existing reason/cache format and avoids duplicating writes.
+	if s != nil && s.rateLimitService != nil && s.rateLimitService.accountRepo != nil {
+		stateCtx, cancel := openAIAccountStateContext(ctx)
+		handled := s.rateLimitService.tryTempUnschedulable(
+			stateCtx,
+			account,
+			http.StatusForbidden,
+			responseBody,
+		)
+		cancel()
+		if handled {
+			return true
+		}
+	}
+
+	// A partially constructed service (for example a unit-test gateway) still
+	// honors the configured duration instead of silently falling back to 30m.
+	cooldown := time.Duration(match.rule.DurationMinutes) * time.Minute
+	if cooldown > 0 {
+		s.tempUnscheduleGrok(ctx, account, cooldown, "grok configured forbidden rule")
+	}
+	return true
 }
