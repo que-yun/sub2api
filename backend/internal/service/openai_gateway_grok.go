@@ -2296,6 +2296,11 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 	if s == nil || account == nil {
 		return
 	}
+	// #4719 定点移植：请求级内容安全 403 由 prompt/媒体触发，换账号也改变不了结果，
+	// 直接返回，不踢号、不 failover、不污染账号状态。账号级 entitlement/封禁 403 走下面正常路径。
+	if isGrokContentPolicyRejection(statusCode, responseBody) {
+		return
+	}
 	now := time.Now()
 	s.updateGrokUsageSnapshot(ctx, account, parseGrokQuotaSnapshot(headers, statusCode, now))
 	switch statusCode {
