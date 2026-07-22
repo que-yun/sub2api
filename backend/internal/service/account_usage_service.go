@@ -117,6 +117,7 @@ type antigravityUsageCache struct {
 const (
 	apiCacheTTL             = 3 * time.Minute
 	apiErrorCacheTTL        = 1 * time.Minute        // 负缓存 TTL：429 等错误缓存 1 分钟
+	passiveUsageMaxAge      = 20 * time.Minute       // 超过一个 VPS 用量回拉周期后不再展示旧快照
 	antigravityErrorTTL     = 1 * time.Minute        // Antigravity 错误缓存 TTL（可恢复错误）
 	apiQueryMaxJitter       = 800 * time.Millisecond // 用量查询最大随机延迟
 	windowStatsCacheTTL     = 1 * time.Minute
@@ -194,6 +195,7 @@ type AICredit struct {
 type UsageInfo struct {
 	Source             string         `json:"source,omitempty"`               // "passive" or "active"
 	UpdatedAt          *time.Time     `json:"updated_at,omitempty"`           // 更新时间
+	Stale              bool           `json:"stale,omitempty"`                // 被动快照过期，不可用于展示配额
 	FiveHour           *UsageProgress `json:"five_hour"`                      // 5小时窗口
 	SevenDay           *UsageProgress `json:"seven_day,omitempty"`            // 7天窗口
 	SevenDaySonnet     *UsageProgress `json:"seven_day_sonnet,omitempty"`     // 7天Sonnet窗口
@@ -393,16 +395,19 @@ func (s *AccountUsageService) GetUsage(ctx context.Context, accountID int64, for
 	if account.CanGetUsage() {
 		var apiResp *ClaudeUsageResponse
 
-		// 1. 检查缓存（成功响应 3 分钟 / 错误响应 1 分钟）
-		if cached, ok := s.cache.apiCache.Load(accountID); ok {
-			if cache, ok := cached.(*apiUsageCache); ok {
-				age := time.Since(cache.timestamp)
-				if cache.err != nil && age < apiErrorCacheTTL {
-					// 负缓存命中：返回缓存的错误，避免重试风暴
-					return nil, cache.err
-				}
-				if cache.response != nil && age < apiCacheTTL {
-					apiResp = cache.response
+		// 1. 检查缓存（成功响应 3 分钟 / 错误响应 1 分钟）。
+		// 管理端的手动「查询」传 force=true，必须绕过该缓存并直接请求上游。
+		if !forceProbe {
+			if cached, ok := s.cache.apiCache.Load(accountID); ok {
+				if cache, ok := cached.(*apiUsageCache); ok {
+					age := time.Since(cache.timestamp)
+					if cache.err != nil && age < apiErrorCacheTTL {
+						// 负缓存命中：返回缓存的错误，避免重试风暴
+						return nil, cache.err
+					}
+					if cache.response != nil && age < apiCacheTTL {
+						apiResp = cache.response
+					}
 				}
 			}
 		}
@@ -421,14 +426,16 @@ func (s *AccountUsageService) GetUsage(ctx context.Context, accountID int64, for
 			flightKey := fmt.Sprintf("usage:%d", accountID)
 			result, flightErr, _ := s.cache.apiFlight.Do(flightKey, func() (any, error) {
 				// 再次检查缓存（可能在等待 singleflight 期间被其他请求填充）
-				if cached, ok := s.cache.apiCache.Load(accountID); ok {
-					if cache, ok := cached.(*apiUsageCache); ok {
-						age := time.Since(cache.timestamp)
-						if cache.err != nil && age < apiErrorCacheTTL {
-							return nil, cache.err
-						}
-						if cache.response != nil && age < apiCacheTTL {
-							return cache.response, nil
+				if !forceProbe {
+					if cached, ok := s.cache.apiCache.Load(accountID); ok {
+						if cache, ok := cached.(*apiUsageCache); ok {
+							age := time.Since(cache.timestamp)
+							if cache.err != nil && age < apiErrorCacheTTL {
+								return nil, cache.err
+							}
+							if cache.response != nil && age < apiCacheTTL {
+								return cache.response, nil
+							}
 						}
 					}
 				}
@@ -476,13 +483,7 @@ func (s *AccountUsageService) GetUsage(ctx context.Context, accountID int64, for
 
 	// Setup Token账号：根据session_window推算（没有profile scope，无法调用usage API）
 	if account.Type == AccountTypeSetupToken {
-		usage := s.estimateSetupTokenUsage(account)
-		// Setup Token 无 profile scope，7d/7d_oi 只能来自网关响应头被动采样
-		usage.SevenDay = buildPassiveUsageWindow(account.Extra, "passive_usage_7d_utilization", "passive_usage_7d_reset")
-		usage.SevenDayFable = buildPassiveUsageWindow(account.Extra, "passive_usage_7d_oi_utilization", "passive_usage_7d_oi_reset")
-		// 添加窗口统计（本地 usage_logs 聚合）
-		s.addWindowStats(ctx, account, usage)
-		return usage, nil
+		return s.getPassiveUsageForAccount(ctx, account), nil
 	}
 
 	// API Key账号不支持usage查询
@@ -501,29 +502,58 @@ func (s *AccountUsageService) GetPassiveUsage(ctx context.Context, accountID int
 		return nil, fmt.Errorf("passive usage only supported for Anthropic OAuth/SetupToken accounts")
 	}
 
-	// 复用 estimateSetupTokenUsage 构建 5h 窗口（OAuth 和 SetupToken 逻辑一致）
-	info := s.estimateSetupTokenUsage(account)
-	info.Source = "passive"
+	return s.getPassiveUsageForAccount(ctx, account), nil
+}
 
-	// 设置采样时间
-	if raw, ok := account.Extra["passive_usage_sampled_at"]; ok {
-		if str, ok := raw.(string); ok {
-			if t, err := time.Parse(time.RFC3339, str); err == nil {
-				info.UpdatedAt = &t
-			}
-		}
+func (s *AccountUsageService) getPassiveUsageForAccount(ctx context.Context, account *Account) *UsageInfo {
+	info := &UsageInfo{Source: "passive"}
+	if account == nil {
+		return info
 	}
 
+	if sampledAt, ok := passiveUsageSampledAt(account.Extra); ok {
+		info.UpdatedAt = &sampledAt
+		if time.Since(sampledAt) > passiveUsageMaxAge {
+			info.Stale = true
+			return info
+		}
+	} else {
+		// 没有采样时间的快照无法判断时效，不把它伪装为当前配额。
+		info.Stale = true
+		return info
+	}
+
+	// 复用 estimateSetupTokenUsage 构建 5h 窗口（OAuth 和 SetupToken 逻辑一致）
+	info = s.estimateSetupTokenUsage(account)
+	info.Source = "passive"
+	if sampledAt, ok := passiveUsageSampledAt(account.Extra); ok {
+		info.UpdatedAt = &sampledAt
+	}
 	// 构建 7d 窗口（从被动采样数据）
 	info.SevenDay = buildPassiveUsageWindow(account.Extra, "passive_usage_7d_utilization", "passive_usage_7d_reset")
-
 	// 构建 7d Fable 窗口（从被动采样的 7d_oi 响应头数据）
 	info.SevenDayFable = buildPassiveUsageWindow(account.Extra, "passive_usage_7d_oi_utilization", "passive_usage_7d_oi_reset")
-
-	// 添加窗口统计
 	s.addWindowStats(ctx, account, info)
+	return info
+}
 
-	return info, nil
+func passiveUsageSampledAt(extra map[string]any) (time.Time, bool) {
+	if extra == nil {
+		return time.Time{}, false
+	}
+	raw, ok := extra["passive_usage_sampled_at"]
+	if !ok {
+		return time.Time{}, false
+	}
+	str, ok := raw.(string)
+	if !ok {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, str)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // buildPassiveUsageWindow 从 Extra 中的被动采样数据（utilization 为 0-1 小数、reset 为 Unix 秒）
@@ -538,6 +568,9 @@ func buildPassiveUsageWindow(extra map[string]any, utilKey, resetKey string) *Us
 	var remaining int
 	if resetRaw > 0 {
 		t := time.Unix(int64(resetRaw), 0)
+		if !time.Now().Before(t) {
+			return nil
+		}
 		resetAt = &t
 		remaining = int(time.Until(t).Seconds())
 		if remaining < 0 {

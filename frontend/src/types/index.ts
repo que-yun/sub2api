@@ -1101,6 +1101,7 @@ export interface GrokBillingSummary {
 export interface AccountUsageInfo {
   source?: 'passive' | 'active'
   updated_at: string | null
+  stale?: boolean
   five_hour: UsageProgress | null
   seven_day: UsageProgress | null
   seven_day_sonnet: UsageProgress | null

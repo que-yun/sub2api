@@ -76,14 +76,13 @@ func TestBuildPassiveUsageWindow(t *testing.T) {
 		require.Nil(t, buildPassiveUsageWindow(map[string]any{}, "u", "r"))
 	})
 
-	t.Run("expired reset clamps remaining to zero", func(t *testing.T) {
+	t.Run("expired reset returns nil", func(t *testing.T) {
 		past := time.Now().Add(-time.Hour).Unix()
 		window := buildPassiveUsageWindow(map[string]any{
 			"u": 0.5,
 			"r": float64(past),
 		}, "u", "r")
-		require.NotNil(t, window)
-		require.Equal(t, 0, window.RemainingSeconds)
+		require.Nil(t, window)
 	})
 
 	t.Run("utilization only", func(t *testing.T) {
@@ -92,6 +91,32 @@ func TestBuildPassiveUsageWindow(t *testing.T) {
 		require.InDelta(t, 25.0, window.Utilization, 1e-9)
 		require.Nil(t, window.ResetsAt)
 	})
+}
+
+func TestGetPassiveUsageForAccount_StaleSampleDoesNotExposeQuotaWindows(t *testing.T) {
+	sampledAt := time.Now().Add(-passiveUsageMaxAge - time.Minute).UTC().Truncate(time.Second)
+	resetAt := time.Now().Add(24 * time.Hour).Unix()
+	windowEnd := time.Now().Add(2 * time.Hour)
+	svc := &AccountUsageService{}
+
+	info := svc.getPassiveUsageForAccount(t.Context(), &Account{
+		SessionWindowEnd: &windowEnd,
+		Extra: map[string]any{
+			"passive_usage_sampled_at":        sampledAt.Format(time.RFC3339),
+			"session_window_utilization":      0.42,
+			"passive_usage_7d_utilization":    0.56,
+			"passive_usage_7d_reset":          float64(resetAt),
+			"passive_usage_7d_oi_utilization": 0.87,
+			"passive_usage_7d_oi_reset":       float64(resetAt),
+		},
+	})
+
+	require.True(t, info.Stale)
+	require.NotNil(t, info.UpdatedAt)
+	require.True(t, info.UpdatedAt.Equal(sampledAt))
+	require.Nil(t, info.FiveHour)
+	require.Nil(t, info.SevenDay)
+	require.Nil(t, info.SevenDayFable)
 }
 
 func TestSyncActiveToPassive_WritesFableExtras(t *testing.T) {

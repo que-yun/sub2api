@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Pull VPS usage_logs / ops_error_logs / last_used_at into local DB (merge, no delete).
+# Pull VPS usage logs and Anthropic Setup Token runtime state into local DB (merge, no delete).
 
 REMOTE_EXEC_TARGET="${REMOTE_EXEC_TARGET:-root@100.99.28.61}"
 SSH_PORT="${SSH_PORT:-}"
@@ -23,6 +23,7 @@ tmp_dir="$(mktemp -d)"
 usage_path="${tmp_dir}/vps-usage-logs.tsv"
 error_path="${tmp_dir}/vps-ops-error-logs.tsv"
 touch_path="${tmp_dir}/vps-last-used.tsv"
+runtime_path="${tmp_dir}/vps-anthropic-setup-runtime.tsv"
 
 cleanup() {
   rm -rf "${tmp_dir}"
@@ -136,10 +137,44 @@ COPY (
 ) TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER E'\\t');
 \"" > "${touch_path}"
 
+# The VPS is the runtime source of truth for setup-token accounts because it serves the traffic.
+# Include JSON nulls for absent keys so old local passive samples are cleared instead of surviving
+# indefinitely after the remote state has reset.
+remote_exec "timeout $(printf "%q" "${REMOTE_QUERY_TIMEOUT_SECONDS}") docker exec sub2api-standby-postgres psql -U $(printf "%q" "${PGUSER}") -d $(printf "%q" "${PGDATABASE}") -v ON_ERROR_STOP=1 -c \"
+COPY (
+  SELECT
+    a.id,
+    a.session_window_start,
+    a.session_window_end,
+    a.session_window_status,
+    a.rate_limited_at,
+    a.rate_limit_reset_at,
+    a.overload_until,
+    a.temp_unschedulable_until,
+    a.temp_unschedulable_reason,
+    a.updated_at,
+    jsonb_build_object(
+      'model_rate_limits', a.extra->'model_rate_limits',
+      'session_window_utilization', a.extra->'session_window_utilization',
+      'passive_usage_7d_utilization', a.extra->'passive_usage_7d_utilization',
+      'passive_usage_7d_reset', a.extra->'passive_usage_7d_reset',
+      'passive_usage_7d_oi_utilization', a.extra->'passive_usage_7d_oi_utilization',
+      'passive_usage_7d_oi_reset', a.extra->'passive_usage_7d_oi_reset',
+      'passive_usage_sampled_at', a.extra->'passive_usage_sampled_at'
+    ) AS runtime_extra
+  FROM public.accounts a
+  WHERE a.deleted_at IS NULL
+    AND a.platform = 'anthropic'
+    AND a.type = 'setup-token'
+  ORDER BY a.id
+) TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER E'\\t');
+\"" > "${runtime_path}"
+
 usage_rows=$(($(wc -l < "${usage_path}" | tr -d ' ') - 1)); [[ $usage_rows -lt 0 ]] && usage_rows=0
 error_rows=$(($(wc -l < "${error_path}" | tr -d ' ') - 1)); [[ $error_rows -lt 0 ]] && error_rows=0
 touch_rows=$(($(wc -l < "${touch_path}" | tr -d ' ') - 1)); [[ $touch_rows -lt 0 ]] && touch_rows=0
-echo "Pulled usage_rows=${usage_rows} ops_error_rows=${error_rows} last_used_rows=${touch_rows}"
+runtime_rows=$(($(wc -l < "${runtime_path}" | tr -d ' ') - 1)); [[ $runtime_rows -lt 0 ]] && runtime_rows=0
+echo "Pulled usage_rows=${usage_rows} ops_error_rows=${error_rows} last_used_rows=${touch_rows} anthropic_setup_runtime_rows=${runtime_rows}"
 
 local_psql -v ON_ERROR_STOP=1 <<SQL
 CREATE TEMP TABLE vps_usage_logs (
@@ -279,6 +314,52 @@ WITH ua AS (
   RETURNING k.id
 )
 SELECT 'merged_last_used accounts=' || (SELECT count(*) FROM ua) || ' api_keys=' || (SELECT count(*) FROM uk);
+
+CREATE TEMP TABLE vps_anthropic_setup_runtime (
+  id bigint PRIMARY KEY,
+  session_window_start timestamptz,
+  session_window_end timestamptz,
+  session_window_status varchar(20),
+  rate_limited_at timestamptz,
+  rate_limit_reset_at timestamptz,
+  overload_until timestamptz,
+  temp_unschedulable_until timestamptz,
+  temp_unschedulable_reason text,
+  updated_at timestamptz NOT NULL,
+  runtime_extra jsonb NOT NULL
+);
+\copy vps_anthropic_setup_runtime FROM '${runtime_path}' WITH (FORMAT csv, HEADER true, DELIMITER E'\t');
+
+WITH updated AS (
+  UPDATE public.accounts a
+  SET session_window_start = r.session_window_start,
+      session_window_end = r.session_window_end,
+      session_window_status = r.session_window_status,
+      rate_limited_at = r.rate_limited_at,
+      rate_limit_reset_at = r.rate_limit_reset_at,
+      overload_until = r.overload_until,
+      temp_unschedulable_until = r.temp_unschedulable_until,
+      temp_unschedulable_reason = r.temp_unschedulable_reason,
+      extra = (
+        COALESCE(a.extra, '{}'::jsonb) - ARRAY[
+          'model_rate_limits',
+          'session_window_utilization',
+          'passive_usage_7d_utilization',
+          'passive_usage_7d_reset',
+          'passive_usage_7d_oi_utilization',
+          'passive_usage_7d_oi_reset',
+          'passive_usage_sampled_at'
+        ]
+      ) || r.runtime_extra,
+      updated_at = GREATEST(a.updated_at, r.updated_at)
+  FROM vps_anthropic_setup_runtime r
+  WHERE a.id = r.id
+    AND a.deleted_at IS NULL
+    AND a.platform = 'anthropic'
+    AND a.type = 'setup-token'
+  RETURNING a.id
+)
+SELECT 'merged_vps_anthropic_setup_runtime=' || count(*) FROM updated;
 SQL
 
 echo "VPS usage pull completed."

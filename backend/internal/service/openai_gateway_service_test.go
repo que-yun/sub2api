@@ -222,6 +222,59 @@ func TestOpenAIGatewayService_GenerateSessionHash_Priority(t *testing.T) {
 	}
 }
 
+func TestOpenAIGatewayService_GenerateSessionHash_CodexMetadataSurvivesCompaction(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &OpenAIGatewayService{}
+
+	// Codex can replace the original first user turn with a compacted summary.
+	// The stable turn metadata must remain the routing identity when regular
+	// session_id and conversation_id headers are absent.
+	beforeCompact := []byte(`{"model":"gpt-5.4","instructions":"You are a coding agent.","input":[{"role":"user","content":"Inspect the repository and fix the failing test."},{"role":"assistant","content":"I will inspect it."},{"role":"user","content":"Please continue."}]}`)
+	afterCompact := []byte(`{"model":"gpt-5.4","instructions":"You are a coding agent.","input":[{"role":"user","content":"Summary of the earlier work: inspect the repository and fix the failing test. Continue from that summary."},{"role":"user","content":"Please continue."}]}`)
+
+	newContext := func(body []byte) (*gin.Context, []byte) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		c.Request.Header.Set(codexTurnMetadataHeader, `{"prompt_cache_key":"codex-stable-cache-key","window_id":"window-1"}`)
+		return c, body
+	}
+
+	beforeContext, beforeBody := newContext(beforeCompact)
+	afterContext, afterBody := newContext(afterCompact)
+	beforeHash := svc.GenerateSessionHash(beforeContext, beforeBody)
+	afterHash := svc.GenerateSessionHash(afterContext, afterBody)
+
+	require.NotEmpty(t, beforeHash)
+	require.Equal(t, beforeHash, afterHash, "compaction must not change the sticky routing key when Codex metadata is stable")
+}
+
+func TestOpenAIGatewayService_GenerateSessionHash_CodexMetadataTransportAndWindowFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := &OpenAIGatewayService{}
+	body := []byte(`{"model":"gpt-5.4","input":[{"type":"input_text","text":"same request"}]}`)
+
+	newContext := func() *gin.Context {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		return c
+	}
+
+	headerPrompt := newContext()
+	headerPrompt.Request.Header.Set(codexTurnMetadataHeader, `{"prompt_cache_key":"shared-key"}`)
+	payloadPrompt := newContext()
+	payloadPromptHash := svc.GenerateSessionHash(payloadPrompt, []byte(`{"model":"gpt-5.4","client_metadata":{"x-codex-turn-metadata":"{\"prompt_cache_key\":\"shared-key\"}"},"input":[{"type":"input_text","text":"different request"}]}`))
+	require.Equal(t, svc.GenerateSessionHash(headerPrompt, body), payloadPromptHash)
+
+	headerWindow := newContext()
+	headerWindow.Request.Header.Set(codexWindowIDHeader, "window-shared")
+	payloadWindow := newContext()
+	payloadWindowHash := svc.GenerateSessionHash(payloadWindow, []byte(`{"model":"gpt-5.4","client_metadata":{"x-codex-window-id":"window-shared"},"input":[{"type":"input_text","text":"different request"}]}`))
+	require.Equal(t, svc.GenerateSessionHash(headerWindow, body), payloadWindowHash)
+	require.NotEqual(t, payloadPromptHash, payloadWindowHash)
+}
+
 func TestOpenAIGatewayService_GenerateSessionHash_UsesXXHash64(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()

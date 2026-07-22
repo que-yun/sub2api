@@ -1400,7 +1400,7 @@ describe('AccountUsageCell', () => {
     expect(wrapper.text()).not.toContain('7d F')
   })
 
-  it('Anthropic Setup Token 展示 5h/7d 本地 window_stats，不重复今日/历史', async () => {
+  it('Anthropic Setup Token 只展示上游配额窗口，不将本地流量统计混作上游用量', async () => {
     getUsage.mockResolvedValue({
       source: 'passive',
       five_hour: {
@@ -1454,10 +1454,45 @@ describe('AccountUsageCell', () => {
 
     await flushPromises()
 
-    expect(wrapper.text()).toContain('5h|0|2')
-    expect(wrapper.text()).toContain('7d|56|1903')
+    expect(wrapper.text()).toContain('5h|0|-')
+    expect(wrapper.text()).toContain('7d|56|-')
     expect(wrapper.text()).not.toContain('8 req')
     expect(wrapper.text()).not.toContain('total 1.9K req')
+  })
+
+  it('Anthropic Setup Token 的 VPS 被动快照过期时不显示旧窗口或无效查询按钮', async () => {
+    getUsage.mockResolvedValue({
+      source: 'passive',
+      stale: true,
+      updated_at: '2026-07-22T00:00:00Z',
+      five_hour: null,
+      seven_day: null,
+      seven_day_fable: null
+    })
+
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({
+          id: 21331,
+          platform: 'anthropic',
+          type: 'setup-token',
+          extra: {}
+        })
+      },
+      global: {
+        stubs: {
+          UsageProgressBar: true,
+          AccountQuotaInfo: true,
+          GrokQuotaProbeCell: true
+        }
+      }
+    })
+
+    await flushPromises()
+
+    expect(getUsage).toHaveBeenCalledWith(21331, 'passive')
+    expect(wrapper.text()).toContain('admin.accounts.usageWindow.passiveExpired')
+    expect(wrapper.find('button').exists()).toBe(false)
   })
 
 

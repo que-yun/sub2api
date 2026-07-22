@@ -2657,6 +2657,26 @@ func TestHandleGrokAccountUpstreamErrorPermissionDeniedMarksError(t *testing.T) 
 	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 }
 
+func TestHandleGrokAccountUpstreamErrorPaymentRequiredHoldsUntilSuccess(t *testing.T) {
+	account := &Account{ID: 72, Platform: PlatformGrok, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true}
+	repo := &grokQuotaAccountRepo{}
+	svc := &OpenAIGatewayService{accountRepo: repo}
+
+	// 402 body is not a permission-denied/free-usage body; it must still leave the pool.
+	body := []byte(`{"error":{"message":"Upstream request failed","type":"upstream_error"}}`)
+	svc.handleGrokAccountUpstreamError(context.Background(), account, http.StatusPaymentRequired, nil, body)
+
+	require.Equal(t, 1, repo.setErrorCalls)
+	require.Equal(t, account.ID, repo.lastErrorID)
+	require.Equal(t, grokPaymentRequiredReason, repo.lastErrorMsg)
+	require.Zero(t, repo.tempUnschedCalls)
+	require.Zero(t, repo.rateLimitedCalls)
+	require.Equal(t, StatusError, account.Status)
+	require.False(t, account.Schedulable)
+	require.True(t, GrokAccountRequiresSuccessBeforeSchedule(account))
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
 func TestHandleGrokAccountUpstreamError429SetsRateLimitedFromRetryAfter(t *testing.T) {
 	account := &Account{ID: 61, Platform: PlatformGrok, Type: AccountTypeOAuth}
 	repo := &grokQuotaAccountRepo{}

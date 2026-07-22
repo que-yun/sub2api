@@ -2269,6 +2269,29 @@ func appendGrokCLIProxyFallbackOpsEvent(c *gin.Context, account *Account, status
 	})
 }
 
+// holdGrokAccountUntilSuccess sticky-blocks a Grok account (status=error,
+// unschedulable) until a proven success clears the hold. Used for permanent-ish
+// upstream denials that an account cannot self-clear per request: entitlement /
+// permission 403 and payment / spending-limit 402. The recover probe's sticky
+// queue re-tests held accounts and ClearGrokHoldAfterSuccess restores them.
+func (s *OpenAIGatewayService) holdGrokAccountUntilSuccess(ctx context.Context, account *Account, reason string) {
+	if s == nil || account == nil {
+		return
+	}
+	if s.accountRepo != nil {
+		stateCtx, cancel := openAIAccountStateContext(ctx)
+		defer cancel()
+		_ = s.accountRepo.SetError(stateCtx, account.ID, reason)
+		MarkGrokHoldUntilSuccess(stateCtx, s.accountRepo, account)
+	}
+	account.Status = StatusError
+	account.Schedulable = false
+	account.ErrorMessage = reason
+	account.TempUnschedulableUntil = nil
+	account.TempUnschedulableReason = ""
+	s.BlockAccountScheduling(account, time.Time{}, reason)
+}
+
 func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Context, account *Account, statusCode int, headers http.Header, responseBody []byte) {
 	if s == nil || account == nil {
 		return
@@ -2278,6 +2301,13 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 	switch statusCode {
 	case http.StatusUnauthorized:
 		s.tempUnscheduleGrok(ctx, account, 10*time.Minute, "grok credentials unauthorized")
+	case http.StatusPaymentRequired:
+		// 402 = xAI payment required / spending-limit block. This is a billing-side
+		// denial the account cannot self-clear per request, so sticky-hold it until a
+		// proven success (recover probe) clears the hold. Without this the account
+		// stays schedulable and gets reselected every request, burning the failover
+		// budget and surfacing 402 to clients.
+		s.holdGrokAccountUntilSuccess(ctx, account, grokPaymentRequiredReason)
 	case http.StatusForbidden:
 		// Free-usage exhaustion can arrive as 403/429; keep recoverable rate-limit semantics.
 		if freeInfo := xai.ParseFreeUsageExhaustedBody(responseBody); freeInfo != nil && freeInfo.Exhausted {
@@ -2306,18 +2336,7 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 		// Prefer sticky error immediately for explicit permission-denied bodies;
 		// otherwise escalate after consecutive 403s to avoid endless short cooldowns.
 		if IsGrokPermissionDeniedBody(responseBody) {
-			if s.accountRepo != nil {
-				stateCtx, cancel := openAIAccountStateContext(ctx)
-				defer cancel()
-				_ = s.accountRepo.SetError(stateCtx, account.ID, grokHoldUntilSuccessReason)
-				MarkGrokHoldUntilSuccess(stateCtx, s.accountRepo, account)
-			}
-			account.Status = StatusError
-			account.Schedulable = false
-			account.ErrorMessage = grokHoldUntilSuccessReason
-			account.TempUnschedulableUntil = nil
-			account.TempUnschedulableReason = ""
-			s.BlockAccountScheduling(account, time.Time{}, grokHoldUntilSuccessReason)
+			s.holdGrokAccountUntilSuccess(ctx, account, grokHoldUntilSuccessReason)
 			return
 		}
 		if s.rateLimitService != nil {

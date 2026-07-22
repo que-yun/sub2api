@@ -41,27 +41,30 @@
           {{ usageInfo.error }}
         </div>
 
+        <div v-if="usageInfo.stale" class="text-[10px] text-amber-600 dark:text-amber-400">
+          {{ t('admin.accounts.usageWindow.passiveExpired') }}
+        </div>
+
         <!--
           Anthropic 用量列只展示配额窗口 + 对应本地 window_stats。
           今日/历史已有「今日统计」列（AccountTodayStatsCell），这里再画会和 5h/7d 本地数叠在一起。
         -->
-        <!-- 5h：上游配额% + 本地 session 窗统计 -->
+        <!-- Setup Token 没有官方 token/金额明细；不要把中转 usage_logs 伪装成上游配额用量。 -->
         <UsageProgressBar
           v-if="usageInfo.five_hour"
           label="5h"
           :utilization="usageInfo.five_hour.utilization"
           :resets-at="usageInfo.five_hour.resets_at"
-          :window-stats="usageInfo.five_hour.window_stats"
+          :window-stats="account.type === 'setup-token' ? undefined : usageInfo.five_hour.window_stats"
           color="indigo"
         />
 
-        <!-- 7d：上游配额% + 本地近 7 天 usage_logs 统计 -->
         <UsageProgressBar
           v-if="usageInfo.seven_day"
           label="7d"
           :utilization="usageInfo.seven_day.utilization"
           :resets-at="usageInfo.seven_day.resets_at"
-          :window-stats="usageInfo.seven_day.window_stats"
+          :window-stats="account.type === 'setup-token' ? undefined : usageInfo.seven_day.window_stats"
           color="emerald"
         />
 
@@ -92,6 +95,7 @@
             {{ t('admin.accounts.usageWindow.passiveSampled') }}
           </span>
           <button
+            v-if="account.type === 'oauth'"
             type="button"
             class="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[9px] font-medium text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-900/30 transition-colors"
             :disabled="activeQueryLoading"

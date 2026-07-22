@@ -16,6 +16,11 @@ const (
 	// signal instead of silent auto-resume when the timer expires.
 	grokHoldUntilSuccessExtraKey = "grok_hold_until_success"
 	grokHoldUntilSuccessReason   = "grok entitlement or subscription tier denied"
+	// grokPaymentRequiredReason marks Grok accounts sticky-blocked after an
+	// upstream 402 (payment required / spending-limit). Same hold-until-success
+	// lifecycle as an entitlement 403, kept as a distinct reason so operators can
+	// tell billing blocks apart from permission revocations in diagnostics.
+	grokPaymentRequiredReason = "grok payment required or spending limit (402)"
 )
 
 // GrokAccountRequiresSuccessBeforeSchedule reports whether a Grok account is

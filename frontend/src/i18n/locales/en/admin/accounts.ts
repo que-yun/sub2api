@@ -1295,6 +1295,7 @@ export default {
         grokLastProbe: 'Probe {time}',
         grokLastHeadersSeen: 'Headers {time}',
         passiveSampled: 'Passive',
+        passiveExpired: 'Passive snapshot expired; waiting for a new VPS snapshot',
         activeQuery: 'Query'
       },
       openaiQuotaReset: {

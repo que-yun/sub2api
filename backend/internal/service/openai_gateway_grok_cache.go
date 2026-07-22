@@ -113,7 +113,7 @@ func explicitGrokCacheSeed(c *gin.Context, body []byte, explicitKey string) stri
 		// so prompt cache routing matches CPA behavior.
 		seed = claudeCodeGrokCacheSeed(c, body)
 		if seed == "" && c.Request != nil {
-			seed = codexGrokCacheSeedFromHeaders(c.Request.Header)
+			seed = codexCacheSeedFromHeaders(c.Request.Header)
 		}
 		if seed == "" {
 			seed = strings.TrimSpace(c.GetHeader("session_id"))
@@ -129,7 +129,7 @@ func explicitGrokCacheSeed(c *gin.Context, body []byte, explicitKey string) stri
 		seed = claudeCodeGrokCacheSeedFromPayload(body)
 	}
 	if seed == "" && len(body) > 0 {
-		seed = codexGrokCacheSeedFromPayload(body)
+		seed = codexCacheSeedFromPayload(body)
 	}
 	if seed == "" && len(body) > 0 {
 		seed = strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
@@ -165,11 +165,14 @@ func claudeCodeGrokCacheSeedFromPayload(body []byte) string {
 	return "claude:" + sessionID + ":agent:main"
 }
 
-func codexGrokCacheSeedFromHeaders(headers http.Header) string {
+// codexCacheSeedFromHeaders extracts the stable Codex prompt-cache identity
+// without changing it. Callers decide how the identity is scoped for their
+// own routing purpose.
+func codexCacheSeedFromHeaders(headers http.Header) string {
 	if headers == nil {
 		return ""
 	}
-	if seed := codexGrokCacheSeedFromTurnMetadata(headers.Get(codexTurnMetadataHeader)); seed != "" {
+	if seed := codexCacheSeedFromTurnMetadata(headers.Get(codexTurnMetadataHeader)); seed != "" {
 		return seed
 	}
 	if windowID := strings.TrimSpace(headers.Get(codexWindowIDHeader)); windowID != "" {
@@ -178,13 +181,13 @@ func codexGrokCacheSeedFromHeaders(headers http.Header) string {
 	return ""
 }
 
-func codexGrokCacheSeedFromPayload(body []byte) string {
+func codexCacheSeedFromPayload(body []byte) string {
 	metadata := gjson.GetBytes(body, "client_metadata")
 	if !metadata.IsObject() {
 		return ""
 	}
 	if turnMetadata := metadata.Get("x-codex-turn-metadata"); turnMetadata.Exists() {
-		if seed := codexGrokCacheSeedFromTurnMetadata(turnMetadata.String()); seed != "" {
+		if seed := codexCacheSeedFromTurnMetadata(turnMetadata.String()); seed != "" {
 			return seed
 		}
 	}
@@ -194,7 +197,7 @@ func codexGrokCacheSeedFromPayload(body []byte) string {
 	return ""
 }
 
-func codexGrokCacheSeedFromTurnMetadata(value string) string {
+func codexCacheSeedFromTurnMetadata(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" || len(value) > maxCodexTurnMetadataBytes {
 		return ""

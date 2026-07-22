@@ -794,6 +794,94 @@ func buildOpenAIWeightedSelectionOrder(
 	return order
 }
 
+func shouldPreferLeastRecentlyUsedFreeOAuth(req OpenAIAccountScheduleRequest) bool {
+	return strings.TrimSpace(req.PreviousResponseID) == "" &&
+		req.StickyAccountID <= 0 &&
+		req.StickyPreviousAccountID <= 0
+}
+
+func isOpenAIFreeOAuthAccount(account *Account) bool {
+	return account != nil && account.IsOpenAIOAuth() &&
+		strings.EqualFold(strings.TrimSpace(account.GetCredential("plan_type")), "free")
+}
+
+func buildOpenAILeastRecentlyUsedFreeOAuthSelectionOrder(
+	pool []openAIAccountCandidateScore,
+	topK int,
+) []openAIAccountCandidateScore {
+	bestPriority := 0
+	hasPriority := false
+	for _, candidate := range pool {
+		if candidate.account == nil {
+			continue
+		}
+		if !hasPriority || candidate.priority < bestPriority {
+			bestPriority = candidate.priority
+			hasPriority = true
+		}
+	}
+	if !hasPriority {
+		return nil
+	}
+
+	freeOAuth := make([]openAIAccountCandidateScore, 0, len(pool))
+	for _, candidate := range pool {
+		if candidate.priority == bestPriority && isOpenAIFreeOAuthAccount(candidate.account) {
+			freeOAuth = append(freeOAuth, candidate)
+		}
+	}
+	if len(freeOAuth) == 0 || topK <= 0 {
+		return nil
+	}
+
+	sort.SliceStable(freeOAuth, func(i, j int) bool {
+		left, right := freeOAuth[i], freeOAuth[j]
+		if left.priority != right.priority {
+			return left.priority < right.priority
+		}
+		switch {
+		case left.account.LastUsedAt == nil && right.account.LastUsedAt != nil:
+			return true
+		case left.account.LastUsedAt != nil && right.account.LastUsedAt == nil:
+			return false
+		case left.account.LastUsedAt != nil && right.account.LastUsedAt != nil && !left.account.LastUsedAt.Equal(*right.account.LastUsedAt):
+			return left.account.LastUsedAt.Before(*right.account.LastUsedAt)
+		default:
+			return left.account.ID < right.account.ID
+		}
+	})
+	if topK < len(freeOAuth) {
+		freeOAuth = freeOAuth[:topK]
+	}
+	return freeOAuth
+}
+
+func prependUniqueOpenAIAccountCandidates(
+	primary []openAIAccountCandidateScore,
+	fallback []openAIAccountCandidateScore,
+) []openAIAccountCandidateScore {
+	if len(primary) == 0 {
+		return fallback
+	}
+	ordered := make([]openAIAccountCandidateScore, 0, len(primary)+len(fallback))
+	seen := make(map[int64]struct{}, len(primary)+len(fallback))
+	appendCandidates := func(candidates []openAIAccountCandidateScore) {
+		for _, candidate := range candidates {
+			if candidate.account == nil {
+				continue
+			}
+			if _, exists := seen[candidate.account.ID]; exists {
+				continue
+			}
+			seen[candidate.account.ID] = struct{}{}
+			ordered = append(ordered, candidate)
+		}
+	}
+	appendCandidates(primary)
+	appendCandidates(fallback)
+	return ordered
+}
+
 func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 	ctx context.Context,
 	req OpenAIAccountScheduleRequest,
@@ -1045,6 +1133,15 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 	buildFailsafeSelectionOrder := func(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
 		return buildOpenAIFailsafeTieredSelectionOrder(pool, req, buildSelectionOrder)
 	}
+	buildLeastRecentlyUsedFreeOAuthOrder := func(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
+		return buildOpenAILeastRecentlyUsedFreeOAuthSelectionOrder(pool, plan.topK)
+	}
+	buildFailsafeLeastRecentlyUsedFreeOAuthOrder := func(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
+		return buildOpenAIFailsafeTieredSelectionOrder(pool, req, buildLeastRecentlyUsedFreeOAuthOrder)
+	}
+
+	var selectionOrder []openAIAccountCandidateScore
+	var leastRecentlyUsedFreeOAuthOrder []openAIAccountCandidateScore
 
 	if req.RequireCompact {
 		buildCompactSelectionOrder := func(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
@@ -1063,15 +1160,37 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 			selectionOrder = append(selectionOrder, buildSelectionOrder(unknown)...)
 			return selectionOrder
 		}
-		selectionOrder := make([]openAIAccountCandidateScore, 0, len(plan.allCandidates))
+		buildCompactLeastRecentlyUsedFreeOAuthOrder := func(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
+			supported := make([]openAIAccountCandidateScore, 0, len(pool))
+			unknown := make([]openAIAccountCandidateScore, 0, len(pool))
+			for _, candidate := range pool {
+				switch openAICompactSupportTier(candidate.account) {
+				case 2:
+					supported = append(supported, candidate)
+				case 1:
+					unknown = append(unknown, candidate)
+				}
+			}
+			ordered := make([]openAIAccountCandidateScore, 0, len(pool))
+			ordered = append(ordered, buildLeastRecentlyUsedFreeOAuthOrder(supported)...)
+			ordered = append(ordered, buildLeastRecentlyUsedFreeOAuthOrder(unknown)...)
+			return ordered
+		}
+		selectionOrder = make([]openAIAccountCandidateScore, 0, len(plan.allCandidates))
 		selectionOrder = append(selectionOrder, buildOpenAIFailsafeTieredSelectionOrder(plan.candidates, req, buildCompactSelectionOrder)...)
 		if len(plan.staleSnapshotCompactRetry) > 0 && s.service.schedulerSnapshot != nil {
 			selectionOrder = append(selectionOrder, sortOpenAICompactRetryCandidates(plan.staleSnapshotCompactRetry)...)
 		}
-		return selectionOrder
+		leastRecentlyUsedFreeOAuthOrder = buildOpenAIFailsafeTieredSelectionOrder(plan.candidates, req, buildCompactLeastRecentlyUsedFreeOAuthOrder)
+	} else {
+		selectionOrder = buildFailsafeSelectionOrder(plan.candidates)
+		leastRecentlyUsedFreeOAuthOrder = buildFailsafeLeastRecentlyUsedFreeOAuthOrder(plan.candidates)
 	}
 
-	return buildFailsafeSelectionOrder(plan.candidates)
+	if !shouldPreferLeastRecentlyUsedFreeOAuth(req) {
+		return selectionOrder
+	}
+	return prependUniqueOpenAIAccountCandidates(leastRecentlyUsedFreeOAuthOrder, selectionOrder)
 }
 
 func buildOpenAIFailsafeTieredSelectionOrder(

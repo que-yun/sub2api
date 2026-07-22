@@ -13,6 +13,21 @@ type accountUsageCodexProbeRepo struct {
 	rateLimitCh   chan time.Time
 }
 
+type countingClaudeUsageFetcher struct {
+	response *ClaudeUsageResponse
+	calls    int
+}
+
+func (f *countingClaudeUsageFetcher) FetchUsage(_ context.Context, _ string, _ string) (*ClaudeUsageResponse, error) {
+	f.calls++
+	return f.response, nil
+}
+
+func (f *countingClaudeUsageFetcher) FetchUsageWithOptions(_ context.Context, _ *ClaudeUsageFetchOptions) (*ClaudeUsageResponse, error) {
+	f.calls++
+	return f.response, nil
+}
+
 func (r *accountUsageCodexProbeRepo) UpdateExtra(_ context.Context, _ int64, updates map[string]any) error {
 	if r.updateExtraCh != nil {
 		copied := make(map[string]any, len(updates))
@@ -29,6 +44,54 @@ func (r *accountUsageCodexProbeRepo) SetRateLimited(_ context.Context, _ int64, 
 		r.rateLimitCh <- resetAt
 	}
 	return nil
+}
+
+func (r *accountUsageCodexProbeRepo) UpdateSessionWindowEnd(_ context.Context, _ int64, _ time.Time) error {
+	return nil
+}
+
+func TestAccountUsageService_GetUsage_ForceBypassesAnthropicUsageCache(t *testing.T) {
+	accountID := int64(42001)
+	resetAt := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	account := Account{
+		ID:       accountID,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token": "test-access-token",
+		},
+	}
+	repo := &accountUsageCodexProbeRepo{
+		stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}},
+	}
+	fetcher := &countingClaudeUsageFetcher{
+		response: &ClaudeUsageResponse{
+			FiveHour: ClaudeUsageWindow{Utilization: 37, ResetsAt: resetAt.Format(time.RFC3339)},
+		},
+	}
+	cache := NewUsageCache()
+	cache.apiCache.Store(accountID, &apiUsageCache{
+		response: &ClaudeUsageResponse{
+			FiveHour: ClaudeUsageWindow{Utilization: 12, ResetsAt: resetAt.Format(time.RFC3339)},
+		},
+		timestamp: time.Now(),
+	})
+	svc := &AccountUsageService{
+		accountRepo:  repo,
+		usageFetcher: fetcher,
+		cache:        cache,
+	}
+
+	usage, err := svc.GetUsage(context.Background(), accountID, true)
+	if err != nil {
+		t.Fatalf("GetUsage() error = %v", err)
+	}
+	if fetcher.calls != 1 {
+		t.Fatalf("force query fetch calls = %d, want 1", fetcher.calls)
+	}
+	if usage.FiveHour == nil || usage.FiveHour.Utilization != 37 {
+		t.Fatalf("force query usage = %#v, want fresh upstream response", usage.FiveHour)
+	}
 }
 
 func TestShouldRefreshOpenAICodexSnapshot(t *testing.T) {

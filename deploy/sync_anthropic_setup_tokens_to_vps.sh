@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# One-way sync: local anthropic setup-token credentials -> VPS.
-# Does NOT delete VPS-only accounts. Local is token source of truth.
+# One-way sync: local Anthropic setup-token credentials and configuration -> VPS.
+# Does NOT delete VPS-only accounts. Local owns credentials/configuration; the VPS owns
+# runtime state produced by traffic, including quota windows and passive usage samples.
 
 REMOTE_EXEC_TARGET="${REMOTE_EXEC_TARGET:-root@100.99.28.61}"
 REMOTE_COPY_HOST="${REMOTE_COPY_HOST:-root@100.99.28.61}"
@@ -217,7 +218,17 @@ SET credentials_changed = NOT EXISTS (
 WITH updated AS (
   UPDATE public.accounts a
   SET credentials = l.credentials,
-      extra = COALESCE(a.extra, '{}'::jsonb) || COALESCE(l.extra, '{}'::jsonb),
+      extra = COALESCE(a.extra, '{}'::jsonb) || (
+        COALESCE(l.extra, '{}'::jsonb) - ARRAY[
+          'model_rate_limits',
+          'session_window_utilization',
+          'passive_usage_7d_utilization',
+          'passive_usage_7d_reset',
+          'passive_usage_7d_oi_utilization',
+          'passive_usage_7d_oi_reset',
+          'passive_usage_sampled_at'
+        ]
+      ),
       proxy_id = CASE
         WHEN '${STANDBY_PROXY_POLICY}' = 'clear_all' THEN NULL
         WHEN l.proxy_id IS NULL THEN NULL
@@ -259,7 +270,16 @@ inserted AS (
     priority, status, schedulable, created_at, updated_at
   )
   SELECT
-    l.id, l.name, l.platform, l.type, l.credentials, l.extra,
+    l.id, l.name, l.platform, l.type, l.credentials,
+    COALESCE(l.extra, '{}'::jsonb) - ARRAY[
+      'model_rate_limits',
+      'session_window_utilization',
+      'passive_usage_7d_utilization',
+      'passive_usage_7d_reset',
+      'passive_usage_7d_oi_utilization',
+      'passive_usage_7d_oi_reset',
+      'passive_usage_sampled_at'
+    ],
     CASE
       WHEN '${STANDBY_PROXY_POLICY}' = 'clear_all' THEN NULL
       WHEN l.proxy_id IS NULL THEN NULL

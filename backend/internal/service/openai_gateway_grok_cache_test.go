@@ -231,7 +231,6 @@ func TestGrokConversationHeaderIsScopedToGrokRequestScheduling(t *testing.T) {
 	openAIContext := newGrokCacheTestContext(601)
 	openAIContext.Set("api_key", &APIKey{ID: 601, Group: &Group{Platform: PlatformOpenAI}})
 	openAIContext.Request.Header.Set(grokConversationIDHeader, "must-be-ignored")
-	openAIContext.Request.Header.Set(codexTurnMetadataHeader, `{"prompt_cache_key":"must-not-affect-openai"}`)
 	openAIContext.Request.Header.Set(claudeCodeAgentHeader, "must-not-affect-openai")
 	require.Equal(t, "body-session", (&OpenAIGatewayService{}).ExtractSessionID(openAIContext, body))
 
