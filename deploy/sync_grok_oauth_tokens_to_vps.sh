@@ -5,8 +5,8 @@ set -euo pipefail
 # 目的：把本地 remint/refresh 后的最新 grok 凭证原地 UPDATE 到 VPS 正在服务的库，
 #      不做 dump/restore、不 shadow_swap、不重启 sub2api、不触碰 usage/日志表。
 # 这样 grok 的新 token 能在 10 分钟内到达 VPS，而不必等每日那次全量 warm-standby。
-# 本脚本只推 credentials；当 credentials 实际变化时顺带恢复 active/schedulable 并清冷却，
-# 因为 VPS 过期只做临时冷却，等本机同步后应立刻可调度（不做 VPS 侧 refresh）。
+# 当 credentials 实际变化时，VPS 会标记账号为待主动探测；只有 VPS 自己的
+# active probe 成功才恢复调度。本机仍是唯一的凭据刷新方，VPS 不做 refresh。
 # 结构与用法与 sync_openai_oauth_tokens_to_vps.sh 对齐，便于维护。
 
 REMOTE_EXEC_TARGET="${REMOTE_EXEC_TARGET:-root@100.99.28.61}"
@@ -113,7 +113,8 @@ COPY (
   SELECT
     id,
     credentials,
-    updated_at
+    updated_at,
+    md5(credentials::text) AS credential_revision
   FROM public.accounts
   WHERE deleted_at IS NULL
     AND platform = 'grok'
@@ -140,10 +141,11 @@ docker exec -i sub2api-standby-postgres psql -U $(shell_quote "${PGUSER}") -d $(
 CREATE TEMP TABLE local_grok_oauth_credentials (
   id bigint PRIMARY KEY,
   credentials jsonb NOT NULL,
-  updated_at timestamptz NOT NULL
+  updated_at timestamptz NOT NULL,
+  credential_revision text NOT NULL
 );
 
-\copy local_grok_oauth_credentials (id, credentials, updated_at) FROM '/tmp/grok-oauth-credentials.tsv' WITH (FORMAT csv, DELIMITER E'\t', QUOTE E'\b');
+\copy local_grok_oauth_credentials (id, credentials, updated_at, credential_revision) FROM '/tmp/grok-oauth-credentials.tsv' WITH (FORMAT csv, DELIMITER E'\t', QUOTE E'\b');
 
 CREATE TEMP TABLE grok_oauth_credentials_changed_ids (
   id bigint PRIMARY KEY
@@ -154,6 +156,7 @@ WITH changed AS (
     a.id,
     l.credentials AS new_credentials,
     l.updated_at AS local_updated_at,
+    l.credential_revision,
     (a.credentials IS DISTINCT FROM l.credentials) AS credentials_changed
   FROM public.accounts a
   JOIN local_grok_oauth_credentials l ON a.id = l.id
@@ -165,19 +168,38 @@ updated AS (
   UPDATE public.accounts a
   SET credentials = c.new_credentials,
       updated_at = GREATEST(a.updated_at, c.local_updated_at),
-      -- 仅当凭证内容真变化时恢复调度态，避免覆盖 VPS 本地临时冷却/业务错误。
-      status = CASE WHEN c.credentials_changed THEN 'active' ELSE a.status END,
-      schedulable = CASE WHEN c.credentials_changed THEN true ELSE a.schedulable END,
-      error_message = CASE WHEN c.credentials_changed THEN NULL ELSE a.error_message END,
+      -- 新凭据只表示凭据版本变了；VPS 必须用自己的出口真实探测成功后才能恢复调度。
+      status = CASE WHEN c.credentials_changed THEN 'error' ELSE a.status END,
+      schedulable = CASE WHEN c.credentials_changed THEN false ELSE a.schedulable END,
+      error_message = CASE WHEN c.credentials_changed THEN 'grok vps credential revision pending active probe' ELSE a.error_message END,
       temp_unschedulable_until = CASE WHEN c.credentials_changed THEN NULL ELSE a.temp_unschedulable_until END,
       temp_unschedulable_reason = CASE WHEN c.credentials_changed THEN NULL ELSE a.temp_unschedulable_reason END,
-      -- 新 token 到达即"重新给一次机会"：清掉 403 权限封禁遗留的 grok_hold_until_success。
-      -- 否则上面的 status=active/schedulable=true 会造成 hold=true 却可调度的僵尸态，污染选号 TopK
-      -- (调度器 meta 已能识别 hold 并排除，但僵尸态本身仍是脏数据、仪表盘误显示可用)。清 hold 后账号
-      -- 获得一次真实 chat 尝试：能用则夺回；仍被拒则由转发层 403 正常重新 hold(status=error/schedulable=false)，
-      -- 比僵尸态干净。恢复服务只做 billing 探测、不发真实 chat，held 号靠它证明不了成功，故用新 token 触发重试。
-      extra = CASE WHEN c.credentials_changed AND a.extra ? 'grok_hold_until_success'
-                   THEN a.extra - 'grok_hold_until_success' ELSE a.extra END
+      extra = CASE WHEN c.credentials_changed THEN
+        (a.extra
+          - 'grok_usage_snapshot'
+          - 'grok_billing_snapshot'
+          - 'grok_vps_probe'
+          - 'grok_vps_probe_requested_at'
+          - 'grok_vps_probe_requested_revision'
+          - 'grok_vps_probe_completed_at'
+          - 'grok_free_usage_exhausted'
+          - 'grok_free_usage_error_code'
+          - 'grok_free_usage_window'
+          - 'grok_free_usage_model'
+          - 'grok_free_usage_cooldown_until'
+          - 'grok_free_usage_actual_tokens'
+          - 'grok_free_usage_limit_tokens'
+          - 'grok_error_recovery_last_probe_at'
+          - 'grok_error_recovery_last_class'
+          - 'grok_error_recovery_last_status'
+          - 'grok_error_recovery_last_message'
+          - 'grok_error_recovery_last_recovered_at') || jsonb_build_object(
+            'grok_credential_revision', c.credential_revision,
+            'grok_vps_probe_requested_at', now()::text,
+            'grok_vps_probe_requested_revision', c.credential_revision,
+            'grok_hold_until_success', true
+          )
+      ELSE a.extra END
   FROM changed c
   WHERE a.id = c.id
   RETURNING a.id, c.credentials_changed
@@ -190,12 +212,12 @@ ins AS (
 stats AS (
   SELECT
     count(*) AS synced,
-    count(*) FILTER (WHERE credentials_changed) AS healed
+    count(*) FILTER (WHERE credentials_changed) AS pending_probe
   FROM updated
 )
 SELECT
   'synced_grok_oauth_accounts=' || synced ||
-  ' healed_status_on_credential_change=' || healed
+  ' pending_vps_active_probe_on_credential_change=' || pending_probe
 FROM stats;
 
 \copy (SELECT id FROM grok_oauth_credentials_changed_ids ORDER BY id) TO '/tmp/grok-oauth-credentials-changed-ids.tsv' WITH (FORMAT csv, DELIMITER E'\t', HEADER false);
@@ -230,6 +252,30 @@ if grep -q '^TOKEN_REFRESH_REQUEST_REFRESH_ENABLED=' /etc/sub2api-standby.env; t
   sed -i 's/^TOKEN_REFRESH_REQUEST_REFRESH_ENABLED=.*/TOKEN_REFRESH_REQUEST_REFRESH_ENABLED=false/' /etc/sub2api-standby.env
 else
   printf '\nTOKEN_REFRESH_REQUEST_REFRESH_ENABLED=false\n' >> /etc/sub2api-standby.env
+fi
+# Fresh credentials are queued as error+hold above. The existing VPS recovery
+# worker is the only component allowed to release that hold after its own
+# active chat probe. Five minutes gives prompt recovery without probing on the
+# request path or creating an SSH-triggered probe storm.
+changed_env=0
+ensure_env() {
+  local key="\$1" value="\$2"
+  if grep -q "^\${key}=" /etc/sub2api-standby.env; then
+    if ! grep -qx "\${key}=\${value}" /etc/sub2api-standby.env; then
+      sed -i "s#^\${key}=.*#\${key}=\${value}#" /etc/sub2api-standby.env
+      changed_env=1
+    fi
+  else
+    printf '\n%s=%s\n' "\${key}" "\${value}" >> /etc/sub2api-standby.env
+    changed_env=1
+  fi
+}
+ensure_env GROK_ERROR_RECOVERY_ENABLED true
+ensure_env GROK_ERROR_RECOVERY_CHECK_INTERVAL_HOURS 0.0833333333
+ensure_env GROK_ERROR_RECOVERY_CONCURRENCY 2
+ensure_env GROK_ERROR_RECOVERY_MAX_ACCOUNTS_PER_CYCLE 120
+if [ "\${changed_env}" -eq 1 ]; then
+  systemctl restart sub2api-standby
 fi
 "
 

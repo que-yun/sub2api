@@ -26,4 +26,11 @@ export GROK_RECOVER_403_LIMIT="${GROK_RECOVER_403_LIMIT:-120}"
 export GROK_RECOVER_403_INTERVAL_SEC="${GROK_RECOVER_403_INTERVAL_SEC:-21600}"
 
 mkdir -p "${GROK_RECOVER_OUT_DIR}"
-exec /usr/bin/env python3 "${SCRIPT_DIR}/grok_recover_probe.py"
+LOCK_DIR="${TMPDIR:-/tmp}/sub2api-grok-recover-probe.lock"
+if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+  echo "Another Grok recovery probe is already running; skipping this interval."
+  exit 0
+fi
+trap 'rmdir "${LOCK_DIR}" 2>/dev/null || true' EXIT
+
+/usr/bin/env python3 "${SCRIPT_DIR}/grok_recover_probe.py"

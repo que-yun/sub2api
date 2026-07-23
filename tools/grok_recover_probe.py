@@ -7,6 +7,7 @@ Design goals:
   1) transport / token / proxy style temp failures  (fast queue)
   2) free-usage 429 whose rate_limit_reset_at has expired (fast queue)
   3) sticky entitlement 403 holds                     (slow queue)
+  4) newer VPS active-probe 401/402/403 observations   (priority queue)
 - Healthy / currently schedulable accounts are skipped.
 - Successful probe/test path in backend clears sticky hold.
 - Always call quota with mode=active so chat readiness, not billing, decides rescue.
@@ -21,6 +22,8 @@ Environment:
   GROK_RECOVER_403_LIMIT   default 120
   GROK_RECOVER_403_INTERVAL_SEC default 21600  (6h)
   GROK_RECOVER_FORCE_403   1 to force sticky queue this run
+  GROK_RECOVER_VPS_OBSERVATION_ONLY 1 to process only new VPS failure observations
+  GROK_RECOVER_VPS_OBSERVATION_LIMIT default 24
   GROK_PREFERRED_PROXY_ID  default 6; warn if Grok accounts drift away
 """
 
@@ -131,6 +134,25 @@ def parse_ts(value: str | None) -> datetime | None:
         return None
 
 
+def timestamp_epoch(value: datetime | None) -> float:
+    if value is None:
+        return 0.0
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.timestamp()
+
+
+def has_new_vps_failure_observation(item: dict[str, Any]) -> bool:
+    """Return true only when a matched-version VPS failure is newer locally."""
+    if item.get("local_credential_revision") != item.get("vps_credential_revision"):
+        return False
+    if item.get("vps_observation_source") != "active_probe":
+        return False
+    if item.get("vps_status_code") not in ("401", "402", "403"):
+        return False
+    return timestamp_epoch(item.get("vps_last_probe")) > timestamp_epoch(item.get("last_probe"))
+
+
 def classify(http_code: int, body: str) -> tuple[str, int | None, str]:
     """Classify recovery probe results.
 
@@ -179,6 +201,8 @@ def classify(http_code: int, body: str) -> tuple[str, int | None, str]:
             return "rate_429", 429, ""
         if sc_i == 403:
             return "forbidden_403", 403, msg
+        if sc_i == 402:
+            return "payment_402", 402, msg
         if sc_i == 401:
             return "token_error", 401, msg
         if sc_i is None:
@@ -186,6 +210,8 @@ def classify(http_code: int, body: str) -> tuple[str, int | None, str]:
             return "unknown_status", None, "missing active probe status_code"
         return f"http200_sc_{sc_i}", sc_i, msg
 
+    if http_code == 402 or sc_i == 402 or "upstream returned 402" in msg:
+        return "payment_402", 402, msg
     if http_code == 403 or "permission-denied" in msg or "Access to the chat endpoint is denied" in msg or "entitlement" in msg.lower():
         return "forbidden_403", 403, msg
     if http_code == 429 or "free-usage-exhausted" in msg:
@@ -260,6 +286,8 @@ def main() -> int:
     sticky_limit = int(os.environ.get("GROK_RECOVER_403_LIMIT", "120"))
     sticky_interval = int(os.environ.get("GROK_RECOVER_403_INTERVAL_SEC", "21600"))
     force_403 = os.environ.get("GROK_RECOVER_FORCE_403", "0") in ("1", "true", "TRUE", "yes")
+    vps_observation_only = os.environ.get("GROK_RECOVER_VPS_OBSERVATION_ONLY", "0") in ("1", "true", "TRUE", "yes")
+    vps_observation_limit = int(os.environ.get("GROK_RECOVER_VPS_OBSERVATION_LIMIT", "24"))
     preferred_proxy = int(os.environ.get("GROK_PREFERRED_PROXY_ID", "6"))
 
     out_dir = Path(os.environ.get("GROK_RECOVER_OUT_DIR", repo / "deploy" / "data-host" / "grok-scan" / "recover"))
@@ -311,18 +339,29 @@ def main() -> int:
       COALESCE(rate_limit_reset_at::text, '') AS rate_reset,
       COALESCE(extra->>'grok_free_usage_exhausted', '') AS free_exh,
       COALESCE(extra->'grok_usage_snapshot'->>'updated_at', '') AS snap_updated,
-      COALESCE(extra->'grok_usage_snapshot'->>'last_probe_at', '') AS last_probe
+      COALESCE(extra->'grok_usage_snapshot'->>'last_probe_at', '') AS last_probe,
+      md5(credentials::text) AS local_credential_revision,
+      COALESCE(extra->'grok_vps_probe'->>'credential_revision', '') AS vps_credential_revision,
+      COALESCE(extra->'grok_vps_probe'->>'status_code', '') AS vps_status_code,
+      COALESCE(extra->'grok_vps_probe'->>'observation_source', '') AS vps_observation_source,
+      COALESCE(extra->'grok_vps_probe'->>'last_probe_at', '') AS vps_last_probe
     FROM accounts
     WHERE platform = 'grok'
       AND deleted_at IS NULL
-      AND lower(name) NOT LIKE '%@hotmail.%'
-      AND lower(name) NOT LIKE '%@outlook.%'
-      AND lower(name) NOT LIKE '%@live.%'
+      AND (
+        (
+          lower(name) NOT LIKE '%@hotmail.%'
+          AND lower(name) NOT LIKE '%@outlook.%'
+          AND lower(name) NOT LIKE '%@live.%'
+        )
+        OR extra ? 'grok_vps_probe'
+      )
     ORDER BY id
     """
     rows = psql_rows(file_env, sql)
     now = datetime.now(timezone.utc)
 
+    vps_observations: list[dict[str, Any]] = []
     fast: list[dict[str, Any]] = []
     sticky: list[dict[str, Any]] = []
 
@@ -340,7 +379,18 @@ def main() -> int:
             "free_exh": (r[9] or "").lower() in ("t", "true", "1"),
             "snap_updated": parse_ts(r[10]),
             "last_probe": parse_ts(r[11]),
+            "local_credential_revision": r[12] or "",
+            "vps_credential_revision": r[13] or "",
+            "vps_status_code": r[14] or "",
+            "vps_observation_source": r[15] or "",
+            "vps_last_probe": parse_ts(r[16]),
         }
+        if has_new_vps_failure_observation(item):
+            item["queue"] = "vps_observation"
+            vps_observations.append(item)
+            continue
+        if vps_observation_only:
+            continue
         reason_l = item["temp_reason"].lower()
         temp_active = item["temp_until"] is not None and item["temp_until"] > now
         rate_active = item["rate_reset"] is not None and item["rate_reset"] > now
@@ -362,6 +412,7 @@ def main() -> int:
         rate_due = item["rate_reset"] is not None and item["rate_reset"] <= now and item["snap"] == "429"
 
         if item["hold"] or (item["snap"] == "403" and (temp_active or "entitlement" in reason_l or "subscription tier" in reason_l)):
+            item["queue"] = "sticky"
             sticky.append(item)
             continue
 
@@ -369,6 +420,7 @@ def main() -> int:
             # skip if currently healthy schedulable-ish already (no temp, no rate)
             if item["status"] == "active" and not temp_active and not rate_active and item["snap"] == "200" and not item["hold"]:
                 continue
+            item["queue"] = "fast"
             fast.append(item)
 
     # order: older probe first
@@ -381,23 +433,30 @@ def main() -> int:
         except Exception:
             return 0.0
 
+    vps_observations.sort(key=lambda it: timestamp_epoch(it.get("vps_last_probe")), reverse=True)
     fast.sort(key=age_key)
     sticky.sort(key=age_key)
 
     last_403 = float(state.get("last_403_pass_epoch") or 0)
-    due_403 = force_403 or (time.time() - last_403 >= sticky_interval)
+    due_403 = not vps_observation_only and (force_403 or (time.time() - last_403 >= sticky_interval))
     selected: list[dict[str, Any]] = []
-    selected.extend(fast[:fast_limit])
-    if due_403:
-        selected.extend(sticky[:sticky_limit])
+    selected.extend(vps_observations[:vps_observation_limit])
+    if vps_observation_only:
         log(
-            f"queues: fast={min(len(fast), fast_limit)}/{len(fast)} sticky={min(len(sticky), sticky_limit)}/{len(sticky)} (403 due)"
+            f"queues: vps_observation={min(len(vps_observations), vps_observation_limit)}/{len(vps_observations)} only"
         )
     else:
-        remain = int(sticky_interval - (time.time() - last_403))
-        log(
-            f"queues: fast={min(len(fast), fast_limit)}/{len(fast)} sticky=0/{len(sticky)} (403 next in ~{max(remain,0)//60}m)"
-        )
+        selected.extend(fast[:fast_limit])
+        if due_403:
+            selected.extend(sticky[:sticky_limit])
+            log(
+                f"queues: vps_observation={min(len(vps_observations), vps_observation_limit)}/{len(vps_observations)} fast={min(len(fast), fast_limit)}/{len(fast)} sticky={min(len(sticky), sticky_limit)}/{len(sticky)} (403 due)"
+            )
+        else:
+            remain = int(sticky_interval - (time.time() - last_403))
+            log(
+                f"queues: vps_observation={min(len(vps_observations), vps_observation_limit)}/{len(vps_observations)} fast={min(len(fast), fast_limit)}/{len(fast)} sticky=0/{len(sticky)} (403 next in ~{max(remain,0)//60}m)"
+            )
 
     # de-dup by id preserving order
     seen: set[int] = set()
@@ -432,7 +491,7 @@ def main() -> int:
     def work(it: dict[str, Any]) -> dict[str, Any]:
         res = probe_one(base, jwt, it["id"], timeout)
         res["name"] = it["name"]
-        res["queue"] = "sticky" if it.get("hold") or it.get("snap") == "403" else "fast"
+        res["queue"] = it.get("queue", "fast")
         res["prev_snap"] = it.get("snap")
         res["prev_reason"] = (it.get("temp_reason") or "")[:160]
         return res
@@ -461,6 +520,8 @@ def main() -> int:
         "proxy_drift": drift_n,
         "preferred_proxy": preferred_proxy,
         "sticky_queue_ran": due_403,
+        "vps_observation_only": vps_observation_only,
+        "vps_observation_candidates": len(vps_observations),
         "fast_candidates": len(fast),
         "sticky_candidates": len(sticky),
         "result_file": str(result_path),

@@ -24,10 +24,6 @@ export SSH_PORT="${SSH_PORT:-22222}"
 export SSH_IDENTITY_FILE="${SSH_IDENTITY_FILE:-${HOME}/.ssh/sub2api_vps_db_tunnel_ed25519}"
 export SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-8}"
 export REMOTE_QUERY_TIMEOUT_SECONDS="${REMOTE_QUERY_TIMEOUT_SECONDS:-45}"
-# 默认不把 VPS 永久 error 写回本地 accounts.status（本地权威）。
-export VPS_RUNTIME_PULL_IMPORT_PERMANENT_ERRORS="${VPS_RUNTIME_PULL_IMPORT_PERMANENT_ERRORS:-false}"
-# VPS 判定可用时，允许扶正本地仍为 error 的同账号（覆盖过期 probe）。
-export VPS_RUNTIME_PULL_HEAL_LOCAL_ERRORS="${VPS_RUNTIME_PULL_HEAL_LOCAL_ERRORS:-true}"
 export REMOTE_QUERY_TIMEOUT_SECONDS="${REMOTE_QUERY_TIMEOUT_SECONDS:-90}"
 
 LOCK_DIR="${TMPDIR:-/tmp}/sub2api-vps-grok-oauth-runtime-pull.lock"
@@ -38,3 +34,9 @@ fi
 trap 'rmdir "${LOCK_DIR}" 2>/dev/null || true' EXIT
 
 "${ROOT_DIR}/deploy/sync_vps_grok_oauth_runtime_to_local.sh"
+
+# VPS 失败观测只会触发本机用自己的出口复探；它不会直接改动本机健康态。
+GROK_RECOVER_VPS_OBSERVATION_ONLY=true \
+GROK_RECOVER_CONCURRENCY=2 \
+GROK_RECOVER_VPS_OBSERVATION_LIMIT=24 \
+"${ROOT_DIR}/tools/run_grok_recover_probe.sh"
