@@ -296,6 +296,16 @@ func (p *GrokTokenProvider) GetAccessTokenForManualTest(ctx context.Context, acc
 		return accessToken, nil
 	}
 
+	// Resolve the missing-refresh case before the refresh-API-availability check:
+	// an expired access token with no refresh token is definitively "refresh token
+	// missing", not "refresh not configured", regardless of whether refreshAPI is
+	// wired. A still-valid access-only token is honored.
+	if strings.TrimSpace(account.GetGrokRefreshToken()) == "" {
+		if tokenValid {
+			return accessToken, nil
+		}
+		return "", withGrokCredentialFailureSnapshot(errGrokOAuthRefreshTokenMissing, account)
+	}
 	if p == nil || p.refreshAPI == nil || p.executor == nil || p.requestRefreshOff {
 		if tokenValid {
 			return accessToken, nil
@@ -304,12 +314,6 @@ func (p *GrokTokenProvider) GetAccessTokenForManualTest(ctx context.Context, acc
 			return "", withGrokCredentialFailureSnapshot(errGrokOAuthAccessTokenExpired, account)
 		}
 		return "", errGrokOAuthRefreshNotConfigured
-	}
-	if strings.TrimSpace(account.GetGrokRefreshToken()) == "" {
-		if tokenValid {
-			return accessToken, nil
-		}
-		return "", withGrokCredentialFailureSnapshot(errGrokOAuthRefreshTokenMissing, account)
 	}
 
 	// Deliberately not marked as a request-path refresh: the request path

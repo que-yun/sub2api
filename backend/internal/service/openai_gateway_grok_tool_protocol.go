@@ -15,6 +15,12 @@ import (
 
 const grokResponsesClientToolMappingContextKey = "grok_responses_client_tool_mapping"
 
+// grokDefaultToolNamespace is the Codex reserved namespace for ordinary client
+// function tools. Unlike a real MCP/plugin namespace (e.g. "collaboration"),
+// its children are plain functions, so the Grok fork keeps them unqualified
+// instead of letting apicompat rewrite them to "functions__<name>".
+const grokDefaultToolNamespace = "functions"
+
 func adaptGrokResponsesClientTools(body []byte) ([]byte, apicompat.ResponsesClientToolMapping, error) {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
@@ -23,11 +29,18 @@ func adaptGrokResponsesClientTools(body []byte) ([]byte, apicompat.ResponsesClie
 		return body, apicompat.ResponsesClientToolMapping{}, fmt.Errorf("decode Grok Responses client tools: %w", err)
 	}
 
+	// Lower the reserved "functions" default namespace to bare-named function
+	// tools before apicompat runs. apicompat would otherwise prefix them as
+	// "functions__<name>"; real namespaces (collaboration, image_gen, ...) are
+	// left for apicompat so their qualified identity and restoration mapping
+	// stay intact.
+	preChanged := flattenGrokDefaultNamespaceTools(requestBody)
+
 	mapping, changed, err := apicompat.AdaptResponsesClientTools(requestBody)
 	if err != nil {
 		return body, apicompat.ResponsesClientToolMapping{}, err
 	}
-	if !changed {
+	if !changed && !preChanged {
 		return body, mapping, nil
 	}
 	rebuilt, err := marshalOpenAIUpstreamJSON(requestBody)
@@ -35,6 +48,88 @@ func adaptGrokResponsesClientTools(body []byte) ([]byte, apicompat.ResponsesClie
 		return body, apicompat.ResponsesClientToolMapping{}, fmt.Errorf("encode Grok Responses client tools: %w", err)
 	}
 	return rebuilt, mapping, nil
+}
+
+// flattenGrokDefaultNamespaceTools lifts children of the reserved "functions"
+// namespace into bare-named top-level function tools. A tool_choice qualified
+// with that namespace can no longer bind to a specific child, so it falls back
+// to the first plain top-level function tool (or is dropped when none exists).
+// Real namespaces are left untouched. Returns true when the request changed.
+func flattenGrokDefaultNamespaceTools(req map[string]any) bool {
+	tools, ok := req["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		return false
+	}
+	flattenedDefault := false
+	firstFunctionName := ""
+	flattened := make([]any, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			flattened = append(flattened, raw)
+			continue
+		}
+		typ := strings.TrimSpace(grokToolStringField(tool["type"]))
+		if typ == "namespace" && grokToolNamespaceName(tool) == grokDefaultToolNamespace {
+			flattenedDefault = true
+			for _, rawChild := range grokNamespaceToolChildren(tool) {
+				child, ok := rawChild.(map[string]any)
+				if !ok || strings.TrimSpace(grokToolStringField(child["type"])) != "function" {
+					continue
+				}
+				flattened = append(flattened, rawChild)
+			}
+			continue
+		}
+		if typ == "function" && firstFunctionName == "" {
+			if name := strings.TrimSpace(grokToolStringField(tool["name"])); name != "" {
+				firstFunctionName = name
+			}
+		}
+		flattened = append(flattened, raw)
+	}
+	if !flattenedDefault {
+		return false
+	}
+	req["tools"] = flattened
+
+	choice, ok := req["tool_choice"].(map[string]any)
+	if !ok {
+		return true
+	}
+	choiceNamespace := strings.TrimSpace(grokToolStringField(choice["namespace"]))
+	if strings.TrimSpace(grokToolStringField(choice["type"])) == "namespace" {
+		choiceNamespace = grokToolNamespaceName(choice)
+	}
+	if choiceNamespace != grokDefaultToolNamespace {
+		return true
+	}
+	if firstFunctionName != "" {
+		req["tool_choice"] = map[string]any{"type": "function", "name": firstFunctionName}
+	} else {
+		delete(req, "tool_choice")
+	}
+	return true
+}
+
+func grokToolStringField(value any) string {
+	text, _ := value.(string)
+	return text
+}
+
+func grokToolNamespaceName(tool map[string]any) string {
+	if name := strings.TrimSpace(grokToolStringField(tool["name"])); name != "" {
+		return name
+	}
+	return strings.TrimSpace(grokToolStringField(tool["namespace"]))
+}
+
+func grokNamespaceToolChildren(tool map[string]any) []any {
+	if children, ok := tool["tools"].([]any); ok && len(children) > 0 {
+		return children
+	}
+	children, _ := tool["children"].([]any)
+	return children
 }
 
 func hasGrokResponsesClientToolMapping(mapping apicompat.ResponsesClientToolMapping) bool {

@@ -164,6 +164,9 @@ func buildGrokOAuthCredentialSummary(credentials map[string]any) map[string]any 
 			summary[key] = value
 		}
 	}
+	if keys, ok := credentials["oauth_token_response_extra_keys"]; ok && keys != nil {
+		summary["extra_keys"] = keys
+	}
 	return summary
 }
 

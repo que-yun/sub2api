@@ -105,6 +105,10 @@ type GrokTokenInfo struct {
 	TeamID            string `json:"team_id,omitempty"`
 	SubscriptionTier  string `json:"subscription_tier,omitempty"`
 	EntitlementStatus string `json:"entitlement_status,omitempty"`
+	// Raw token-endpoint extras captured at registration for admin diagnostics
+	// (e.g. team_id, provider-specific fields) and their observed key order.
+	TokenResponseExtra     map[string]any `json:"-"`
+	TokenResponseExtraKeys []string       `json:"-"`
 }
 
 func (s *GrokOAuthService) ExchangeCode(ctx context.Context, input *GrokExchangeCodeInput) (*GrokTokenInfo, error) {
@@ -258,6 +262,13 @@ func (s *GrokOAuthService) BuildAccountCredentials(tokenInfo *GrokTokenInfo) map
 	if tokenInfo.EntitlementStatus != "" {
 		creds["entitlement_status"] = tokenInfo.EntitlementStatus
 	}
+	if len(tokenInfo.TokenResponseExtra) > 0 {
+		creds["oauth_token_response_extra"] = tokenInfo.TokenResponseExtra
+	}
+	if len(tokenInfo.TokenResponseExtraKeys) > 0 {
+		creds["oauth_token_response_extra_keys"] = tokenInfo.TokenResponseExtraKeys
+	}
+	creds["oauth_token_response_summary"] = buildGrokOAuthCredentialSummary(creds)
 	creds["base_url"] = xai.DefaultCLIBaseURL
 	return creds
 }
@@ -282,12 +293,18 @@ func (s *GrokOAuthService) tokenInfoFromResponse(tokenResp *xai.TokenResponse, c
 		ClientID:     strings.TrimSpace(clientID),
 		Scope:        tokenResp.Scope,
 		Referrer:     tokenResp.Referrer,
+
+		TokenResponseExtra:     tokenResp.Extra,
+		TokenResponseExtraKeys: tokenResp.ExtraKeys,
 	}
 	if info.ClientID == "" {
 		info.ClientID = xai.EffectiveClientID()
 	}
 	if info.TokenType == "" {
 		info.TokenType = "Bearer"
+	}
+	if info.Referrer == "" {
+		info.Referrer = xai.DefaultReferrer
 	}
 	applyGrokTokenClaims(info, tokenResp.IDToken)
 	applyGrokTokenClaims(info, tokenResp.AccessToken)

@@ -82,7 +82,10 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	// (append web_search/x_search so xAI does not force non-cacheable build-free).
 	// Request-scoped opt-in/out via applyGrokFreeRequestToolCacheRoute; intent comes from
 	// the already-patched body so Codex additional_tools promotions stay visible.
-	patchedBody, err = applyGrokFreeRequestToolCacheRoute(c, patchedBody, mixedCacheIntentBody, account, cacheIdentity)
+	// Codex custom tools (e.g. apply_patch) are dropped by the base promotion; the
+	// Free cache route re-adds them as function tools from the original request.
+	codexCustomFunctionTools := extractGrokCodexAdditionalCustomFunctionTools(body)
+	patchedBody, err = applyGrokFreeRequestToolCacheRoute(c, patchedBody, mixedCacheIntentBody, account, cacheIdentity, codexCustomFunctionTools...)
 	if err != nil {
 		return nil, fmt.Errorf("apply grok Free function-tool cache route: %w", err)
 	}
@@ -498,10 +501,9 @@ func patchGrokResponsesBodyBase(body []byte, upstreamModel string) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	out, err = stripGrokUnsupportedReasoningItems(out)
-	if err != nil {
-		return nil, err
-	}
+	// 不再主动剥离带 encrypted_content 的 reasoning 项:compaction 还原与跨账号续链依赖
+	// 原生 reasoning 回放,解密失败由 handleErrorResponse 的反应式重试
+	// (trimGrokInvalidEncryptedContentRetryBody)兜底剥离后重试一次。
 	out, err = sanitizeGrokReasoningNullContent(out)
 	if err != nil {
 		return nil, err
@@ -857,10 +859,10 @@ func normalizeGrokResponsesModelInputItem(item gjson.Result) (json.RawMessage, b
 		}
 		return marshalGrokModelInputMessage("user", text)
 	case "reasoning":
-		if text := extractGrokReasoningSummaryText(item); text != "" {
-			return marshalGrokModelInputMessage("assistant", text)
-		}
-		return nil, false, true, nil
+		// 保留原生 reasoning 项(含 summary / encrypted_content),不再扁平成 assistant
+		// message。xAI /v1/responses 接受 reasoning 项,且 compaction 还原与加密内容
+		// 反应式重试都依赖它按原样回放;content:null 已由 sanitizeGrokReasoningNullContent 处理。
+		return json.RawMessage(item.Raw), true, false, nil
 	case "function_call":
 		// OpenAI/Codex 历史里 arguments 常是 JSON 字符串；xAI 要求 object。
 		return normalizeGrokFunctionCallItem(item)
@@ -1115,6 +1117,35 @@ func sanitizeGrokResponsesInput(body []byte) ([]byte, error) {
 	return mergeGrokResponsesTools(body, promotedTools)
 }
 
+// extractGrokCodexAdditionalCustomFunctionTools scans a request body's input for
+// additional_tools carriers and returns their custom tools lowered to function
+// tools. The base promotion path drops custom tools, so the Free-account cache
+// route uses this to re-inject them (e.g. apply_patch) after the search pair.
+func extractGrokCodexAdditionalCustomFunctionTools(body []byte) []json.RawMessage {
+	if !bytes.Contains(body, []byte(`"additional_tools"`)) {
+		return nil
+	}
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return nil
+	}
+	var out []json.RawMessage
+	for _, item := range input.Array() {
+		if strings.TrimSpace(item.Get("type").String()) != "additional_tools" {
+			continue
+		}
+		for _, nested := range item.Get("tools").Array() {
+			if strings.TrimSpace(nested.Get("type").String()) != "custom" {
+				continue
+			}
+			if converted, ok := marshalGrokCodexCustomFunctionTool(nested); ok {
+				out = append(out, converted)
+			}
+		}
+	}
+	return out
+}
+
 // stripGrokUnsupportedReasoningItems 移除 input 中携带 encrypted_content 的 reasoning 项。
 //
 // 背景：Codex 以 OpenAI Responses 协议工作，会在每轮把上一轮返回的 reasoning.encrypted_content
@@ -1325,16 +1356,69 @@ func convertGrokCodexTool(tool gjson.Result) (json.RawMessage, bool) {
 	}
 }
 
+// marshalGrokCodexCustomFunctionTool lowers a Codex custom tool (e.g.
+// apply_patch) into a client-executable function tool. xAI's Responses API has
+// no custom-tool type. The base promotion path drops custom tools; only the
+// Free-account mixed-tool cache route re-adds them via this helper so paid/API
+// paths stay lean while Free Codex sessions keep apply_patch executable.
+func marshalGrokCodexCustomFunctionTool(tool gjson.Result) (json.RawMessage, bool) {
+	if !tool.IsObject() {
+		return nil, false
+	}
+	name := strings.TrimSpace(firstNonEmptyString(
+		tool.Get("name").String(),
+		tool.Get("function.name").String(),
+	))
+	if name == "" {
+		return nil, false
+	}
+	out := map[string]any{
+		"type": "function",
+		"name": name,
+	}
+	if description := strings.TrimSpace(firstNonEmptyString(
+		tool.Get("description").String(),
+		tool.Get("function.description").String(),
+	)); description != "" {
+		out["description"] = description
+	}
+	// Preserve an explicit object schema when the tool ships one; otherwise fall
+	// back to a single freeform string input.
+	if params := tool.Get("parameters"); params.IsObject() {
+		out["parameters"] = json.RawMessage(params.Raw)
+	} else {
+		out["parameters"] = map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"input": map[string]any{
+					"type":        "string",
+					"description": "Freeform input for the custom tool.",
+				},
+			},
+			"additionalProperties": true,
+		}
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return nil, false
+	}
+	return raw, true
+}
+
 func marshalGrokCodexShellFunctionTool(tool gjson.Result) (json.RawMessage, bool) {
 	name := strings.TrimSpace(firstNonEmptyString(
 		tool.Get("name").String(),
 		tool.Get("function.name").String(),
 	))
-	// Keep names Codex already understands. local_shell is rewritten to
-	// exec_command because current Codex Desktop/TUI primarily execute that
-	// function tool for command running.
+	// A Codex local shell tool always executes commands, so rewrite it to
+	// exec_command regardless of the client's label (e.g. a bespoke name like
+	// kept_shell). Only write_stdin keeps its distinct unified-exec identity;
+	// otherwise the canonical marshaler would reject the unknown name and the
+	// shell tool would be silently dropped.
 	switch strings.ToLower(name) {
-	case "", "local_shell", "shell", "container.exec":
+	case "write_stdin":
+		name = "write_stdin"
+	default:
 		name = "exec_command"
 	}
 	return marshalGrokCodexCanonicalFunctionTool(name, tool)
@@ -2075,11 +2159,14 @@ func (s *OpenAIGatewayService) updateGrokUsageSnapshot(ctx context.Context, acco
 		})
 	}
 	// Error responses are reconciled by handleGrokAccountUpstreamError, which
-	// also installs the immediate in-memory scheduling block. Successful
-	// responses can still consume the last available request/token, so persist
-	// that exhausted window here as a real rate limit rather than relying only
-	// on the passive snapshot scheduler check.
-	if hasActiveLimit {
+	// owns the error-specific cooldown window and installs the immediate
+	// in-memory scheduling block. Persisting a rate limit here too would
+	// double-write the same limit (handleGrokAccountUpstreamError also calls this
+	// function before its own 429/403 handling). Successful responses can still
+	// consume the last available request/token, so persist that exhausted window
+	// here as a real rate limit rather than relying only on the passive snapshot
+	// scheduler check.
+	if hasActiveLimit && snapshot.StatusCode < http.StatusBadRequest {
 		s.rateLimitGrok(stateCtx, account, resetAt)
 	} else if recovery {
 		clearGrokRateLimitAfterRecovery(stateCtx, s.accountRepo, account)
@@ -2420,11 +2507,18 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 		// 这里补一层显式兜底：按上游语义解析冷却时长(free-usage 耗尽=滚动窗口默认 24h，普通
 		// 429=2min 或 retry-after)，durable 落 rate_limit_reset_at + 设内存封禁，与探测路径
 		// ApplyGrokProbeOrTestStatus 的 429 处理保持一致，让耗尽账号即时退出调度并可被同步/探测。
+		// 优先用配额快照解析出的真实耗尽窗口 reset。带窗口的 429(X-Ratelimit-Remaining=0)
+		// 必须用它自己的窗口 reset;ResolveGrokCooldown 会把这类 429 误判为 free-usage 耗尽而
+		// 返回 ~24h 冷却。无窗口时再退回 ResolveGrokCooldown 的冷却(retry-after 或 2min 默认)。
+		snapshot := parseGrokQuotaSnapshot(headers, statusCode, now)
+		until, windowed := grokRateLimitResetAtForAccount(account, snapshot, now)
 		cooldown, _, freeInfo, _ := xai.ResolveGrokCooldown(statusCode, headers, responseBody)
-		if cooldown <= 0 {
-			cooldown = 2 * time.Minute
+		if !windowed {
+			if cooldown <= 0 {
+				cooldown = 2 * time.Minute
+			}
+			until = now.Add(cooldown)
 		}
-		until := now.Add(cooldown)
 		// 已有更晚的限流窗口时不缩短(与 403 free-usage 分支一致)。
 		if account.RateLimitResetAt != nil && account.RateLimitResetAt.After(until) {
 			until = *account.RateLimitResetAt

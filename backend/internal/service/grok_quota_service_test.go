@@ -141,6 +141,10 @@ func (r *grokQuotaUsageLogRepo) GetAccountTodayStats(context.Context, int64) (*u
 	return nil, nil
 }
 
+func (r *grokQuotaUsageLogRepo) GetAccountLifetimeStats(context.Context, int64) (*usagestats.AccountStats, error) {
+	return nil, nil
+}
+
 type grokHybridUpstream struct {
 	httpUpstreamRecorder
 	mu                   sync.Mutex

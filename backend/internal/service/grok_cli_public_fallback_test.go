@@ -52,13 +52,17 @@ func TestForwardGrokResponsesFallsBackToPublicAPIOnCLIProxy403Isolated(t *testin
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	account := &Account{
-		ID:       20767,
-		Platform: PlatformGrok,
-		Type:     AccountTypeOAuth,
-		Name:     "ThospqAbadi@hotmail.com",
+		ID:          20767,
+		Platform:    PlatformGrok,
+		Type:        AccountTypeOAuth,
+		Name:        "ThospqAbadi@hotmail.com",
+		Status:      StatusActive,
+		Schedulable: true,
 		Credentials: map[string]any{
-			"access_token": "token",
-			"email":        "thospqabadi@hotmail.com",
+			"access_token":  "token",
+			"refresh_token": "refresh-token",
+			"expires_at":    time.Now().Add(2 * grokTokenRefreshSkew).UTC().Format(time.RFC3339),
+			"email":         "thospqabadi@hotmail.com",
 		},
 		Extra: map[string]any{
 			"grok_billing_snapshot": map[string]any{"plan": "SuperGrok"},
@@ -82,7 +86,16 @@ func TestForwardGrokResponsesFallsBackToPublicAPIOnCLIProxy403Isolated(t *testin
 			Body:       io.NopCloser(strings.NewReader(okBody)),
 		},
 	}}
-	svc := &OpenAIGatewayService{httpUpstream: upstream}
+	repo := &grokQuotaAccountRepo{
+		mockAccountRepoForPlatform: &mockAccountRepoForPlatform{
+			accountsByID: map[int64]*Account{20767: account},
+		},
+	}
+	svc := &OpenAIGatewayService{
+		httpUpstream:      upstream,
+		accountRepo:       repo,
+		grokTokenProvider: NewGrokTokenProvider(repo, nil),
+	}
 
 	result, err := svc.forwardGrokResponses(context.Background(), c, account, body, "grok", true, time.Now())
 	require.NoError(t, err)

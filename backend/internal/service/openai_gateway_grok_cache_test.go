@@ -173,10 +173,13 @@ func TestExplicitGrokCacheSeedPriority(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c := newGrokCacheTestContext(403)
 	headers := []struct {
-		name  string
-		value string
+		name   string
+		value  string
+		expect string
 	}{
-		{name: claudeCodeSessionHeader, value: "claude-session"},
+		// Claude Code sessions are scoped by agent id (agent:main by default) so
+		// main and sub-agent prompt caches never collide; see claudeCodeGrokCacheSeed.
+		{name: claudeCodeSessionHeader, value: "claude-session", expect: "claude:claude-session:agent:main"},
 		{name: "session_id", value: "generic-session"},
 		{name: "conversation_id", value: "generic-conversation"},
 		{name: openCodeSessionAffinityHeader, value: "opencode-affinity"},
@@ -191,7 +194,11 @@ func TestExplicitGrokCacheSeedPriority(t *testing.T) {
 
 	body := []byte(`{"model":"grok","prompt_cache_key":"body-key","input":"hi"}`)
 	for _, header := range headers {
-		require.Equal(t, header.value, explicitGrokCacheSeed(c, body, "explicit-argument"), header.name)
+		want := header.expect
+		if want == "" {
+			want = header.value
+		}
+		require.Equal(t, want, explicitGrokCacheSeed(c, body, "explicit-argument"), header.name)
 		c.Request.Header.Del(header.name)
 	}
 	require.Equal(t, "body-key", explicitGrokCacheSeed(c, body, "explicit-argument"))

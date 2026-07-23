@@ -1474,7 +1474,7 @@ func TestForwardGrokMediaOAuthImageToVideoKeepsCLIGatewayForLargeBody(t *testing
 	// Local: OAuth media keeps CLI gateway for large image-to-video bodies.
 	// Upstream: normalize image field to official image.url (not legacy image_url).
 	require.Equal(t, xai.DefaultCLIBaseURL+"/videos/generations", upstream.lastReq.URL.String())
-	require.Empty(t, upstream.lastReq.Header.Get("X-XAI-Token-Auth"))
+	require.Equal(t, xai.DefaultCLITokenAuth, upstream.lastReq.Header.Get("X-XAI-Token-Auth"))
 	require.Equal(t, "data:image/png;base64,"+imageData, gjson.GetBytes(upstream.lastBody, "image.url").String())
 	require.False(t, gjson.GetBytes(upstream.lastBody, "image.image_url").Exists())
 }
@@ -2231,7 +2231,7 @@ func TestForwardAsChatCompletionsForGrokStreamingUsesRawXAIChatCompletions(t *te
 	require.Equal(t, xai.DefaultCLIBaseURL+"/chat/completions", upstream.lastReq.URL.String())
 	require.Equal(t, "Bearer access-token", upstream.lastReq.Header.Get("Authorization"))
 	require.Equal(t, "text/event-stream", upstream.lastReq.Header.Get("Accept"))
-	require.Equal(t, "sub2api-grok/1.0", upstream.lastReq.Header.Get("User-Agent"))
+	require.Equal(t, xai.DefaultCLIUserAgent, upstream.lastReq.Header.Get("User-Agent"))
 	require.Equal(t, "grok-4.5", gjson.GetBytes(upstream.lastBody, "model").String())
 	require.True(t, gjson.GetBytes(upstream.lastBody, "stream_options.include_usage").Bool())
 	require.True(t, result.Stream)
@@ -2404,7 +2404,7 @@ func TestForwardAsChatCompletionsForGrokStreamingStopFallsBackToRawXAIChatComple
 	require.Equal(t, xai.DefaultCLIBaseURL+"/chat/completions", upstream.lastReq.URL.String())
 	require.Equal(t, "Bearer access-token", upstream.lastReq.Header.Get("Authorization"))
 	require.Equal(t, "text/event-stream", upstream.lastReq.Header.Get("Accept"))
-	require.Equal(t, "sub2api-grok/1.0", upstream.lastReq.Header.Get("User-Agent"))
+	require.Equal(t, xai.DefaultCLIUserAgent, upstream.lastReq.Header.Get("User-Agent"))
 	require.Equal(t, grokCLIVersion, upstream.lastReq.Header.Get("X-Grok-Client-Version"))
 	require.NotEmpty(t, upstream.lastReq.Header.Get(grokConversationIDHeader))
 	require.NotEqual(t, "native-client-conversation", upstream.lastReq.Header.Get(grokConversationIDHeader))
@@ -2508,7 +2508,7 @@ func TestForwardAsAnthropicForGrokUsesXAIResponses(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, xai.DefaultCLIBaseURL+"/responses", upstream.lastReq.URL.String())
 	require.Equal(t, "Bearer access-token", upstream.lastReq.Header.Get("Authorization"))
-	require.Equal(t, "sub2api-grok/1.0", upstream.lastReq.Header.Get("User-Agent"))
+	require.Equal(t, xai.DefaultCLIUserAgent, upstream.lastReq.Header.Get("User-Agent"))
 	require.Equal(t, grokCLIVersion, upstream.lastReq.Header.Get("X-Grok-Client-Version"))
 	require.Equal(t, "grok-experimental", upstream.lastReq.Header.Get("OpenAI-Beta"))
 	require.Empty(t, upstream.lastReq.Header.Get("originator"))
@@ -2589,7 +2589,9 @@ func TestForwardAsAnthropicForGrokFunctionToolUsesCacheCapableMixedRoute(t *test
 	require.Equal(t, "object", tools[0].Get("parameters.type").String())
 	require.Equal(t, "web_search", tools[1].Get("type").String())
 	require.Equal(t, "x_search", tools[2].Get("type").String())
-	require.Equal(t, "auto", gjson.GetBytes(upstream.lastBody, "tool_choice").String())
+	// fork 的 requireGrokResponsesFunctionToolChoice 会把带初始 function tool 的
+	// auto 抬升为 required。
+	require.Equal(t, "required", gjson.GetBytes(upstream.lastBody, "tool_choice").String())
 
 	require.Equal(t, 7000, result.Usage.InputTokens)
 	require.Equal(t, 6144, result.Usage.CacheReadInputTokens)
@@ -3444,13 +3446,17 @@ func TestForwardGrokResponsesFallsBackToPublicAPIOnCLIProxy403(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	account := &Account{
-		ID:       20767,
-		Platform: PlatformGrok,
-		Type:     AccountTypeOAuth,
-		Name:     "ThospqAbadi@hotmail.com",
+		ID:          20767,
+		Platform:    PlatformGrok,
+		Type:        AccountTypeOAuth,
+		Name:        "ThospqAbadi@hotmail.com",
+		Status:      StatusActive,
+		Schedulable: true,
 		Credentials: map[string]any{
-			"access_token": "token",
-			"email":        "thospqabadi@hotmail.com",
+			"access_token":  "token",
+			"refresh_token": "refresh-token",
+			"expires_at":    time.Now().Add(2 * grokTokenRefreshSkew).UTC().Format(time.RFC3339),
+			"email":         "thospqabadi@hotmail.com",
 		},
 		Extra: map[string]any{
 			"grok_billing_snapshot": map[string]any{"plan": "SuperGrok"},
@@ -3474,9 +3480,15 @@ func TestForwardGrokResponsesFallsBackToPublicAPIOnCLIProxy403(t *testing.T) {
 			Body:       io.NopCloser(strings.NewReader(okBody)),
 		},
 	}}
+	repo := &grokQuotaAccountRepo{
+		mockAccountRepoForPlatform: &mockAccountRepoForPlatform{
+			accountsByID: map[int64]*Account{20767: account},
+		},
+	}
 	svc := &OpenAIGatewayService{
-		httpUpstream: upstream,
-		accountRepo:  &grokQuotaAccountRepo{},
+		httpUpstream:      upstream,
+		accountRepo:       repo,
+		grokTokenProvider: NewGrokTokenProvider(repo, nil),
 	}
 
 	result, err := svc.forwardGrokResponses(context.Background(), c, account, body, "grok", true, time.Now())

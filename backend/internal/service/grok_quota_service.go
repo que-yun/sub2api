@@ -15,6 +15,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
+	"github.com/tidwall/gjson"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -217,7 +218,10 @@ func (s *GrokQuotaService) probeUsage(ctx context.Context, accountID int64) (*Gr
 	persistErr := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{
 		grokQuotaSnapshotExtraKey: snapshot,
 	})
-	if limited {
+	if limited && resp.StatusCode < http.StatusBadRequest {
+		// Error statuses (429/403) are marked by ApplyGrokProbeOrTestStatus below;
+		// only persist here for successful-but-exhausted windows to avoid double
+		// rate-limit writes.
 		persistGrokRateLimit(ctx, s.accountRepo, account, resetAt)
 	} else if isSuccessfulGrokRateLimitRecovery(account, snapshot) {
 		clearGrokRateLimitAfterRecovery(ctx, s.accountRepo, account)
@@ -243,22 +247,39 @@ func (s *GrokQuotaService) probeUsage(ctx context.Context, accountID int64) (*Gr
 	}
 	if resp.StatusCode >= 400 {
 		const reason = "GROK_QUOTA_PROBE_UPSTREAM_ERROR"
-		bodyText := truncate(strings.TrimSpace(string(bodyBytes)), 240)
+		// Never echo the raw upstream body: free-text error/detail fields can carry
+		// credentials. Surface only the structured classification code (e.g.
+		// permission-denied / personal-team-blocked:spending-limit), which is safe
+		// and lets callers distinguish a hard entitlement 403 from billing. bodyBytes
+		// is still consumed above by ApplyGrokProbeOrTestStatus for readiness.
+		upstreamCode := strings.TrimSpace(gjson.GetBytes(bodyBytes, "code").String())
+		if upstreamCode == "" {
+			upstreamCode = strings.TrimSpace(gjson.GetBytes(bodyBytes, "error.code").String())
+		}
 		slog.Warn(
 			"grok_quota_probe_failed",
 			"account_id", account.ID,
 			"model", probeModel,
 			"status", resp.StatusCode,
 			"reason", reason,
-			"body", bodyText,
+			"upstream_code", upstreamCode,
 		)
+		if upstreamCode != "" {
+			return nil, infraerrors.Newf(
+				mapUpstreamStatus(resp.StatusCode),
+				reason,
+				"upstream returned %d for probe model %q: %s",
+				resp.StatusCode,
+				probeModel,
+				upstreamCode,
+			)
+		}
 		return nil, infraerrors.Newf(
 			mapUpstreamStatus(resp.StatusCode),
 			reason,
-			"upstream returned %d for probe model %q: %s",
+			"upstream returned %d for probe model %q",
 			resp.StatusCode,
 			probeModel,
-			bodyText,
 		)
 	}
 	return result, nil

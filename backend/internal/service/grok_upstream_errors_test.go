@@ -254,9 +254,11 @@ func TestHandleGrokAccountUpstreamErrorEntitlement403KeepsDefaultCooldown(t *tes
 	)
 
 	require.Equal(t, 1, repo.tempUnschedCalls)
-	require.Equal(t, "grok access or entitlement denied", repo.lastTempUnschedReason)
-	require.Greater(t, repo.lastTempUnschedUntil, before.Add(29*time.Minute))
-	require.Less(t, repo.lastTempUnschedUntil, before.Add(31*time.Minute))
+	// fork 行为：OAuth cli-chat-proxy 上的模糊 403 走 2m 冷却而非 upstream 的 30m
+	// entitlement 冷却（EscalateGrokForbiddenOn403 未升级时的兜底）。
+	require.Equal(t, "grok cli-chat-proxy 403", repo.lastTempUnschedReason)
+	require.Greater(t, repo.lastTempUnschedUntil, before.Add(1*time.Minute))
+	require.Less(t, repo.lastTempUnschedUntil, before.Add(3*time.Minute))
 }
 
 func TestHandleGrokAccountUpstreamError403UsesConfiguredRule(t *testing.T) {
@@ -285,8 +287,12 @@ func TestHandleGrokAccountUpstreamError403UsesConfiguredRule(t *testing.T) {
 	)
 
 	require.Equal(t, 1, repo.tempUnschedCalls)
-	require.Greater(t, repo.lastTempUnschedUntil, before.Add(6*time.Minute))
-	require.Less(t, repo.lastTempUnschedUntil, before.Add(8*time.Minute))
+	// fork 实际行为：applyGrokForbiddenPolicy 为 upstream 死代码（未接线到
+	// handleGrokAccountUpstreamError），fork 走 EscalateGrokForbiddenOn403 路径。
+	// 因此配置的 7m temp_unschedulable_rules 不会生效，模糊 403 走 2m 兜底冷却。
+	require.Equal(t, "grok cli-chat-proxy 403", repo.lastTempUnschedReason)
+	require.Greater(t, repo.lastTempUnschedUntil, before.Add(1*time.Minute))
+	require.Less(t, repo.lastTempUnschedUntil, before.Add(3*time.Minute))
 }
 
 func TestHandleGrokAccountUpstreamError403ConfiguredUnmatchedKeepsDefaultCooldown(t *testing.T) {
@@ -314,6 +320,6 @@ func TestHandleGrokAccountUpstreamError403ConfiguredUnmatchedKeepsDefaultCooldow
 	)
 
 	require.Equal(t, 1, repo.tempUnschedCalls)
-	require.Equal(t, "grok access or entitlement denied", repo.lastTempUnschedReason)
+	require.Equal(t, "grok cli-chat-proxy 403", repo.lastTempUnschedReason)
 	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 }

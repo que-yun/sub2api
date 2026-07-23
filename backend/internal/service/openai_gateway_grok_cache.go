@@ -299,7 +299,7 @@ func applyGrokFreeMessagesFunctionToolCacheRoute(body, intentSourceBody []byte, 
 // applyGrokFreeRequestToolCacheRoute also accepts a request-scoped opt-in. The
 // sub2api header is consumed locally because buildGrokResponsesRequest only
 // forwards the explicitly supported OpenAI-Beta header from downstream.
-func applyGrokFreeRequestToolCacheRoute(c *gin.Context, body, intentSourceBody []byte, account *Account, cacheIdentity string) ([]byte, error) {
+func applyGrokFreeRequestToolCacheRoute(c *gin.Context, body, intentSourceBody []byte, account *Account, cacheIdentity string, extraFunctionTools ...json.RawMessage) ([]byte, error) {
 	allowPureClientTools, accountPolicyExplicit := grokClientToolCacheAccountPolicy(account)
 	requestOptOut := false
 	if c != nil {
@@ -319,7 +319,7 @@ func applyGrokFreeRequestToolCacheRoute(c *gin.Context, body, intentSourceBody [
 	// opt-in may override an account opt-out, while an explicit request opt-out
 	// always wins. The legacy Claude fingerprint remains only as a compatibility
 	// fallback when no account policy has been recorded (#4486).
-	return applyGrokFreeToolCacheRoute(body, intentSourceBody, account, cacheIdentity, allowPureClientTools, allowPureClientTools)
+	return applyGrokFreeToolCacheRoute(body, intentSourceBody, account, cacheIdentity, allowPureClientTools, allowPureClientTools, extraFunctionTools...)
 }
 
 // grokClientToolCacheAccountPolicy is intentionally strict for configured
@@ -372,7 +372,7 @@ func isGrokClaudeDesktopResponsesCacheRequest(c *gin.Context) bool {
 	return strings.TrimSpace(c.GetHeader("X-Claude-Code-Session-Id")) != ""
 }
 
-func applyGrokFreeToolCacheRoute(body, intentSourceBody []byte, account *Account, cacheIdentity string, allowPureClientTools, allowFunctionSearch bool) ([]byte, error) {
+func applyGrokFreeToolCacheRoute(body, intentSourceBody []byte, account *Account, cacheIdentity string, allowPureClientTools, allowFunctionSearch bool, extraFunctionTools ...json.RawMessage) ([]byte, error) {
 	if strings.TrimSpace(cacheIdentity) == "" || !isKnownGrokFreeAccount(account) {
 		return body, nil
 	}
@@ -383,10 +383,11 @@ func applyGrokFreeToolCacheRoute(body, intentSourceBody []byte, account *Account
 	}
 	if intentToolChoice.Type == gjson.String && strings.TrimSpace(intentToolChoice.String()) == grokFreeCacheDisabledToolChoice {
 		// Adding native cache-routing tools cannot change behavior when the
-		// client has explicitly disabled all tool execution.
+		// client has explicitly disabled all tool execution. Client custom tools
+		// are likewise irrelevant here, so they are not re-added.
 		return appendGrokFreeCacheNativeToolsWithPolicy(body, true, false)
 	}
-	return appendGrokFreeCacheNativeToolsWithPolicy(body, allowPureClientTools, allowFunctionSearch)
+	return appendGrokFreeCacheNativeToolsWithPolicy(body, allowPureClientTools, allowFunctionSearch, extraFunctionTools...)
 }
 
 func isKnownGrokFreeAccount(account *Account) bool {
@@ -511,7 +512,7 @@ func appendGrokFreeCacheNativeTools(body []byte, allowPureClientTools bool) ([]b
 	return appendGrokFreeCacheNativeToolsWithPolicy(body, allowPureClientTools, true)
 }
 
-func appendGrokFreeCacheNativeToolsWithPolicy(body []byte, allowPureClientTools, allowFunctionSearch bool) ([]byte, error) {
+func appendGrokFreeCacheNativeToolsWithPolicy(body []byte, allowPureClientTools, allowFunctionSearch bool, extraFunctionTools ...json.RawMessage) ([]byte, error) {
 	tools := gjson.GetBytes(body, "tools")
 	if !tools.Exists() || !tools.IsArray() {
 		return body, nil
@@ -590,6 +591,7 @@ func appendGrokFreeCacheNativeToolsWithPolicy(body []byte, allowPureClientTools,
 	if !allowPureClientTools && !present["web_search"] && !present["x_search"] {
 		return body, nil
 	}
+	missing := make([]json.RawMessage, 0, 2)
 	for _, toolType := range []string{"web_search", "x_search"} {
 		if present[toolType] {
 			continue
@@ -598,7 +600,51 @@ func appendGrokFreeCacheNativeToolsWithPolicy(body []byte, allowPureClientTools,
 		if err != nil {
 			return nil, err
 		}
-		merged = append(merged, raw)
+		missing = append(missing, raw)
+	}
+	if len(missing) > 0 {
+		// Keep the web_search/x_search pair adjacent: inject the missing native
+		// companion right after the existing search tool instead of at the tail,
+		// so it does not drift behind later client tools (e.g. apply_patch) and
+		// break the caller's original additional_tools ordering (#4486).
+		insertAfter := -1
+		for i, raw := range merged {
+			switch strings.TrimSpace(gjson.GetBytes(raw, "type").String()) {
+			case "web_search", "x_search":
+				insertAfter = i
+			}
+		}
+		if insertAfter < 0 {
+			merged = append(merged, missing...)
+		} else {
+			tail := append([]json.RawMessage{}, merged[insertAfter+1:]...)
+			merged = append(merged[:insertAfter+1], missing...)
+			merged = append(merged, tail...)
+		}
+	}
+	if len(extraFunctionTools) > 0 {
+		// Re-add Codex client custom tools (e.g. apply_patch) that the base
+		// promotion path dropped. They land after the web_search/x_search pair,
+		// preserving the caller's original additional_tools tail order. Dedupe by
+		// name so a client tool already present is not duplicated.
+		existingNames := make(map[string]struct{}, len(merged))
+		for _, raw := range merged {
+			name := strings.TrimSpace(gjson.GetBytes(raw, "name").String())
+			if name != "" {
+				existingNames[name] = struct{}{}
+			}
+		}
+		for _, extra := range extraFunctionTools {
+			name := strings.TrimSpace(gjson.GetBytes(extra, "name").String())
+			if name == "" {
+				continue
+			}
+			if _, exists := existingNames[name]; exists {
+				continue
+			}
+			existingNames[name] = struct{}{}
+			merged = append(merged, extra)
+		}
 	}
 	encoded, err := json.Marshal(merged)
 	if err != nil {

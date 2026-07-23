@@ -784,7 +784,10 @@ func (s *AccountTestService) testGrokAccountConnection(c *gin.Context, account *
 		_ = s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{
 			grokQuotaSnapshotExtraKey: snapshot,
 		})
-		if limited {
+		if limited && resp.StatusCode < http.StatusBadRequest {
+			// Error statuses are marked by ApplyGrokProbeOrTestStatus below; only
+			// persist here for successful-but-exhausted windows to avoid double
+			// rate-limit writes.
 			persistGrokRateLimit(ctx, s.accountRepo, account, resetAt)
 		} else if isSuccessfulGrokRateLimitRecovery(account, snapshot) {
 			clearGrokRateLimitAfterRecovery(ctx, s.accountRepo, account)

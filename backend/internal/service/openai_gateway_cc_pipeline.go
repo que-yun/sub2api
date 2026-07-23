@@ -91,6 +91,13 @@ func (s *OpenAIGatewayService) failoverOpenAIUpstreamHTTPError(
 ) *UpstreamFailoverError {
 	if account != nil && account.Platform == PlatformGrok {
 		s.handleGrokAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody)
+		// Grok owns its failover policy: content-policy 403s and other
+		// request-scoped errors must stay on the account and be returned to the
+		// caller instead of draining the pool. The generic check below would
+		// wrongly fail over a content-policy 403 (#4719 isolation intent).
+		if !s.shouldFailoverGrokUpstreamError(resp.StatusCode, respBody) {
+			return nil
+		}
 	}
 	// Prefer the model the client actually requested so mapping decisions are
 	// based on gpt-* (or whatever the client sent), not the already-mapped GLM id.
