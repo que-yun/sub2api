@@ -82,6 +82,31 @@ func TestIsGrokErrorRecoveryCandidate_RespectsMinReprobeInterval(t *testing.T) {
 	require.True(t, isGrokErrorRecoveryCandidate(acc, now, time.Hour))
 }
 
+func TestSortGrokErrorRecoveryCandidatesPrioritizesPendingVPSProbe(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	candidates := []Account{
+		{ID: 1, Extra: map[string]any{grokErrorRecoveryLastProbeAtExtraKey: now.Add(-24 * time.Hour).Format(time.RFC3339)}},
+		{ID: 2, Extra: map[string]any{grokVPSProbeRequestedAtExtraKey: now.Add(-time.Minute).Format(time.RFC3339)}},
+		{ID: 3, Extra: map[string]any{
+			grokVPSProbeRequestedAtExtraKey: now.Add(-2 * time.Minute).Format(time.RFC3339),
+			grokVPSProbeCompletedAtExtraKey: now.Add(-time.Minute).Format(time.RFC3339),
+		}},
+	}
+
+	sortGrokErrorRecoveryCandidates(candidates)
+	require.Equal(t, int64(2), candidates[0].ID)
+	require.True(t, grokVPSProbePendingAt(&candidates[0]).Equal(now.Add(-time.Minute)))
+	require.True(t, grokVPSProbePendingAt(&candidates[2]).IsZero())
+}
+
+func TestIsGrokVPSProbeTerminalStatus(t *testing.T) {
+	for _, statusCode := range []int{200, 401, 402, 403, 429} {
+		require.True(t, isGrokVPSProbeTerminalStatus(statusCode), "status=%d", statusCode)
+	}
+	require.False(t, isGrokVPSProbeTerminalStatus(0))
+	require.False(t, isGrokVPSProbeTerminalStatus(503))
+}
+
 func TestClassifyGrokErrorRecoveryFailure(t *testing.T) {
 	class, code := classifyGrokErrorRecoveryFailure(`upstream returned 403 for probe model "grok-4.5": permission-denied`)
 	require.Equal(t, grokErrorRecoveryClassForbidden, class)

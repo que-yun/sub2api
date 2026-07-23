@@ -58,6 +58,52 @@ func TestApplyGrokProbeOrTestStatusForbiddenMarksErrorAndStickyHold(t *testing.T
 	require.Equal(t, true, repo.updates[acc.ID][grokHoldUntilSuccessExtraKey])
 }
 
+func TestApplyGrokProbeOrTestStatusPaymentRequiredMarksErrorAndStickyHold(t *testing.T) {
+	repo := &grokQuotaAccountRepo{}
+	acc := &Account{
+		ID:          1004,
+		Platform:    PlatformGrok,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Extra:       map[string]any{},
+	}
+	ApplyGrokProbeOrTestStatus(
+		context.Background(),
+		repo,
+		nil,
+		acc,
+		http.StatusPaymentRequired,
+		http.Header{},
+		[]byte(`{"code":"personal-team-blocked:spending-limit"}`),
+		"active_probe",
+	)
+	require.Equal(t, 1, repo.setErrorCalls)
+	require.Equal(t, grokPaymentRequiredReason, repo.lastErrorMsg)
+	require.Equal(t, StatusError, acc.Status)
+	require.False(t, acc.Schedulable)
+	require.True(t, GrokAccountRequiresSuccessBeforeSchedule(acc))
+}
+
+func TestGrokAccountRequiresSuccessBeforeScheduleFromActiveProbeSnapshot(t *testing.T) {
+	acc := &Account{
+		Platform:    PlatformGrok,
+		Status:      StatusActive,
+		Schedulable: true,
+		Extra: map[string]any{
+			"grok_usage_snapshot": map[string]any{
+				"observation_source": "active_probe",
+				"status_code":        402,
+			},
+		},
+	}
+	require.True(t, GrokAccountRequiresSuccessBeforeSchedule(acc))
+	require.False(t, acc.IsSchedulable())
+
+	acc.Extra["grok_free_usage_exhausted"] = true
+	require.False(t, GrokAccountRequiresSuccessBeforeSchedule(acc))
+}
+
 func TestApplyGrokProbeOrTestStatusSuccessClearsStickyHold(t *testing.T) {
 	repo := &grokQuotaAccountRepo{}
 	until := time.Now().Add(2 * time.Hour)
@@ -132,4 +178,3 @@ func TestMarkGrokTokenAcquisitionFailureTransient(t *testing.T) {
 	require.True(t, acc.Schedulable)
 	require.NotNil(t, acc.TempUnschedulableUntil)
 }
-

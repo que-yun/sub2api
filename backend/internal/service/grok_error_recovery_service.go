@@ -13,23 +13,33 @@ import (
 
 const (
 	// Extra keys used by the background 403 recovery worker.
-	grokErrorRecoveryLastProbeAtExtraKey    = "grok_error_recovery_last_probe_at"
-	grokErrorRecoveryLastClassExtraKey      = "grok_error_recovery_last_class"
-	grokErrorRecoveryLastStatusExtraKey     = "grok_error_recovery_last_status"
-	grokErrorRecoveryLastMessageExtraKey    = "grok_error_recovery_last_message"
+	grokErrorRecoveryLastProbeAtExtraKey     = "grok_error_recovery_last_probe_at"
+	grokErrorRecoveryLastClassExtraKey       = "grok_error_recovery_last_class"
+	grokErrorRecoveryLastStatusExtraKey      = "grok_error_recovery_last_status"
+	grokErrorRecoveryLastMessageExtraKey     = "grok_error_recovery_last_message"
 	grokErrorRecoveryLastRecoveredAtExtraKey = "grok_error_recovery_last_recovered_at"
+	// A credential sync adds this marker on the VPS. It gives a fresh credential
+	// one prompt, local-to-VPS readiness probe before it joins the normal retry
+	// cadence for the much larger sticky-error pool.
+	grokVPSProbeRequestedAtExtraKey = "grok_vps_probe_requested_at"
+	grokVPSProbeCompletedAtExtraKey = "grok_vps_probe_completed_at"
 
 	// Recovery class labels persisted into Extra for ops visibility.
-	grokErrorRecoveryClassRecovered      = "recovered"
-	grokErrorRecoveryClassForbidden      = "forbidden_403"
-	grokErrorRecoveryClassRateLimited    = "rate_429"
-	grokErrorRecoveryClassTokenError     = "token_error"
-	grokErrorRecoveryClassTransportError = "transport_error"
-	grokErrorRecoveryClassOtherError     = "other_error"
-	grokErrorRecoveryClassSkipped        = "skipped"
+	grokErrorRecoveryClassRecovered       = "recovered"
+	grokErrorRecoveryClassForbidden       = "forbidden_403"
+	grokErrorRecoveryClassPaymentRequired = "payment_402"
+	grokErrorRecoveryClassRateLimited     = "rate_429"
+	grokErrorRecoveryClassTokenError      = "token_error"
+	grokErrorRecoveryClassTransportError  = "transport_error"
+	grokErrorRecoveryClassOtherError      = "other_error"
+	grokErrorRecoveryClassSkipped         = "skipped"
 
 	// Default cycle timeout keeps a single pass from hanging forever.
 	grokErrorRecoveryDefaultCycleTimeout = 30 * time.Minute
+	// A single account must not hold a recovery worker forever. ProbeUsage has
+	// its own upstream deadline, while this deadline also bounds persistence and
+	// any provider-side work around the probe.
+	grokErrorRecoveryProbeTimeout = 30 * time.Second
 )
 
 // GrokErrorRecoveryService periodically re-probes Grok OAuth accounts that are
@@ -197,10 +207,7 @@ func (s *GrokErrorRecoveryService) RunOnce(ctx context.Context) GrokErrorRecover
 		candidates = append(candidates, acc)
 	}
 
-	// Prefer accounts that have never been probed (or probed longest ago).
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return grokErrorRecoveryLastProbeTime(&candidates[i]).Before(grokErrorRecoveryLastProbeTime(&candidates[j]))
-	})
+	sortGrokErrorRecoveryCandidates(candidates)
 
 	maxN := s.maxAccountsPerCycle()
 	if maxN > 0 && len(candidates) > maxN {
@@ -233,7 +240,9 @@ func (s *GrokErrorRecoveryService) RunOnce(ctx context.Context) GrokErrorRecover
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			class, statusCode, msg := s.probeOne(ctx, &account)
+			probeCtx, cancel := context.WithTimeout(ctx, grokErrorRecoveryProbeTimeout)
+			defer cancel()
+			class, statusCode, msg := s.probeOne(probeCtx, &account)
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -243,6 +252,8 @@ func (s *GrokErrorRecoveryService) RunOnce(ctx context.Context) GrokErrorRecover
 				result.Recovered++
 			case grokErrorRecoveryClassForbidden:
 				result.Forbidden++
+			case grokErrorRecoveryClassPaymentRequired:
+				result.Other++
 			case grokErrorRecoveryClassRateLimited:
 				result.RateLimit++
 			case grokErrorRecoveryClassTokenError:
@@ -311,10 +322,61 @@ func (s *GrokErrorRecoveryService) probeOne(ctx context.Context, account *Accoun
 	if class == grokErrorRecoveryClassRecovered {
 		extra[grokErrorRecoveryLastRecoveredAtExtraKey] = now.UTC().Format(time.RFC3339)
 	}
+	// A definitive upstream result acknowledges the credential-sync probe. Leave
+	// transport failures unacknowledged so they can still receive their first
+	// proper readiness probe, while 200/401/402/403/429 rejoin normal recovery
+	// scheduling after this attempt.
+	if isGrokVPSProbeTerminalStatus(statusCode) {
+		extra[grokVPSProbeCompletedAtExtraKey] = now.UTC().Format(time.RFC3339)
+	}
 	if s.accountRepo != nil {
 		_ = s.accountRepo.UpdateExtra(ctx, account.ID, extra)
 	}
 	return class, statusCode, message
+}
+
+func sortGrokErrorRecoveryCandidates(candidates []Account) {
+	sort.SliceStable(candidates, func(i, j int) bool {
+		iPending := grokVPSProbePendingAt(&candidates[i])
+		jPending := grokVPSProbePendingAt(&candidates[j])
+		if !iPending.IsZero() || !jPending.IsZero() {
+			switch {
+			case iPending.IsZero():
+				return false
+			case jPending.IsZero():
+				return true
+			case !iPending.Equal(jPending):
+				return iPending.After(jPending)
+			}
+		}
+		// For the normal recovery pool, prefer accounts that have never been
+		// probed (or whose last probe is oldest).
+		return grokErrorRecoveryLastProbeTime(&candidates[i]).Before(grokErrorRecoveryLastProbeTime(&candidates[j]))
+	})
+}
+
+func grokVPSProbePendingAt(account *Account) time.Time {
+	if account == nil || account.Extra == nil {
+		return time.Time{}
+	}
+	requested := parseExtraTime(account.Extra[grokVPSProbeRequestedAtExtraKey])
+	if requested.IsZero() {
+		return time.Time{}
+	}
+	completed := parseExtraTime(account.Extra[grokVPSProbeCompletedAtExtraKey])
+	if !completed.IsZero() && !completed.Before(requested) {
+		return time.Time{}
+	}
+	return requested
+}
+
+func isGrokVPSProbeTerminalStatus(statusCode int) bool {
+	switch statusCode {
+	case 200, 401, 402, 403, 429:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *GrokErrorRecoveryService) now() time.Time {
@@ -391,6 +453,14 @@ func isGrokErrorRecoveryCandidate(account *Account, now time.Time, minReprobeAge
 	if !looksLikeGrokEntitlementError(account) && !GrokAccountRequiresSuccessBeforeSchedule(account) {
 		// Keep conservative: only probe entitlement-like or sticky-hold accounts.
 		return false
+	}
+
+	// A locally synced credential stays in the VPS readiness queue until this
+	// node observes a definitive upstream response. Do not make a transient
+	// transport failure wait for the normal 6-hour entitlement re-probe window:
+	// the short recovery cadence retries it without refreshing the credential.
+	if !grokVPSProbePendingAt(account).IsZero() {
+		return true
 	}
 
 	last := grokErrorRecoveryLastProbeTime(account)
@@ -487,6 +557,14 @@ func classifyGrokErrorRecoveryFailure(message string) (class string, statusCode 
 		strings.Contains(m, "access to the chat endpoint is denied") ||
 		strings.Contains(m, "entitlement"):
 		return grokErrorRecoveryClassForbidden, 403
+	case strings.Contains(m, "returned 402") ||
+		strings.Contains(m, "payment required") ||
+		strings.Contains(m, "spending-limit") ||
+		strings.Contains(m, "personal-team-blocked"):
+		// The quota endpoint intentionally maps most upstream 4xx responses to
+		// 502 for admin callers. Preserve the embedded upstream 402 so a VPS
+		// credential readiness probe is acknowledged as a definitive result.
+		return grokErrorRecoveryClassPaymentRequired, 402
 	case strings.Contains(m, "returned 429") ||
 		strings.Contains(m, "free-usage") ||
 		strings.Contains(m, "rate limit"):

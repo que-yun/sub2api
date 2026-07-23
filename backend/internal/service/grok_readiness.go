@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -29,7 +30,28 @@ func GrokAccountRequiresSuccessBeforeSchedule(account *Account) bool {
 	if account == nil || account.Platform != PlatformGrok {
 		return false
 	}
-	return asBool(account.Extra[grokHoldUntilSuccessExtraKey])
+	if asBool(account.Extra[grokHoldUntilSuccessExtraKey]) {
+		return true
+	}
+	if asBool(account.Extra["grok_free_usage_exhausted"]) {
+		return false
+	}
+	snapshot, ok := account.Extra["grok_usage_snapshot"].(map[string]any)
+	if !ok {
+		return false
+	}
+	if strings.TrimSpace(snapshotString(snapshot, "observation_source")) != "active_probe" {
+		return false
+	}
+	code := strings.TrimSpace(snapshotString(snapshot, "status_code"))
+	return code == "402" || code == "403"
+}
+
+func snapshotString(snapshot map[string]any, key string) string {
+	if value, ok := snapshot[key]; ok {
+		return strings.TrimSpace(fmt.Sprint(value))
+	}
+	return ""
 }
 
 func asBool(v any) bool {
@@ -164,7 +186,6 @@ func MarkGrokTokenAcquisitionFailure(ctx context.Context, repo AccountRepository
 	account.TempUnschedulableReason = ""
 }
 
-
 // ApplyGrokProbeOrTestStatus applies the same readiness side effects that
 // production traffic uses when an admin probe/test hits upstream.
 //
@@ -223,6 +244,17 @@ func ApplyGrokProbeOrTestStatus(
 	}
 
 	switch statusCode {
+	case http.StatusPaymentRequired:
+		// xAI returns a non-free-usage 402 when the account has no usable
+		// entitlement. It is not a rate limit: keep it out of scheduling until
+		// a later real chat success proves that the entitlement has recovered.
+		_ = repo.SetError(ctx, account.ID, grokPaymentRequiredReason)
+		account.Status = StatusError
+		account.Schedulable = false
+		account.ErrorMessage = grokPaymentRequiredReason
+		account.TempUnschedulableUntil = nil
+		account.TempUnschedulableReason = ""
+		MarkGrokHoldUntilSuccess(ctx, repo, account)
 	case http.StatusUnauthorized:
 		until := now.Add(10 * time.Minute)
 		if account.TempUnschedulableUntil != nil && account.TempUnschedulableUntil.After(until) {
