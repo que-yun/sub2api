@@ -116,10 +116,7 @@ func explicitGrokCacheSeed(c *gin.Context, body []byte, explicitKey string) stri
 			seed = codexCacheSeedFromHeaders(c.Request.Header)
 		}
 		if seed == "" {
-			seed = strings.TrimSpace(c.GetHeader("session_id"))
-		}
-		if seed == "" {
-			seed = strings.TrimSpace(c.GetHeader("conversation_id"))
+			seed = explicitOpenAIHeaderSessionID(c)
 		}
 		if seed == "" {
 			seed = strings.TrimSpace(c.GetHeader(grokConversationIDHeader))

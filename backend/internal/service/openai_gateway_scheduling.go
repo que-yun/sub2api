@@ -21,19 +21,36 @@ import (
 
 const codexMetadataSessionSeedPrefix = "codex-metadata:v1:"
 
+const (
+	openCodeSessionAffinityHeader = "X-Session-Affinity"
+	openCodeSessionIDHeader       = "X-Session-Id"
+	openCodeNativeSessionHeader   = "X-OpenCode-Session"
+	codeBuddyConversationHeader   = "X-Conversation-ID"
+)
+
 // ExtractSessionID extracts the raw session ID from headers or body without hashing.
 // Used by ForwardAsAnthropic to pass as prompt_cache_key for upstream cache.
 func (s *OpenAIGatewayService) ExtractSessionID(c *gin.Context, body []byte) string {
 	return explicitOpenAIRequestSessionID(c, body)
 }
 
-// explicitOpenAIHeaderSessionID resolves stable conversation identifiers sent by
-// OpenAI-compatible clients (fork-local minimal: session-scoped headers only).
+// explicitOpenAIHeaderSessionID resolves stable conversation identifiers sent
+// by OpenAI-compatible clients. Keep this list limited to session-scoped
+// fields: request/message IDs rotate every turn and would defeat sticky routing
+// and upstream prompt caching. OpenCode and CodeBuddy send their affinity under
+// dedicated headers, so preserve them here to keep those clients' cache sessions.
 func explicitOpenAIHeaderSessionID(c *gin.Context) string {
 	if c == nil {
 		return ""
 	}
-	for _, header := range []string{"session_id", "conversation_id"} {
+	for _, header := range []string{
+		"session_id",
+		"conversation_id",
+		openCodeSessionAffinityHeader,
+		openCodeSessionIDHeader,
+		openCodeNativeSessionHeader,
+		codeBuddyConversationHeader,
+	} {
 		if sessionID := strings.TrimSpace(c.GetHeader(header)); sessionID != "" {
 			return sessionID
 		}
