@@ -308,6 +308,16 @@ func TestIsOpenAIContextWindowError(t *testing.T) {
 		"maximum context length exceeded",
 		nil,
 	))
+	// Grok cli-chat-proxy phrasing: must map to terminal 400 / no-failover, not a
+	// retryable 502 masked into "Upstream error: 400".
+	require.True(t, isOpenAIContextWindowError(
+		"",
+		[]byte(`{"error":{"message":"maximum prompt length is 500000","type":"invalid_request_error","code":null}}`),
+	))
+	require.True(t, isOpenAIContextWindowError(
+		"The maximum prompt length is 500000 tokens, however you requested 1240000 tokens",
+		nil,
+	))
 	require.False(t, isOpenAIContextWindowError(
 		"context canceled",
 		nil,

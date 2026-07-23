@@ -411,6 +411,13 @@ func isOpenAIContextWindowError(upstreamMsg string, upstreamBody []byte) bool {
 		if strings.Contains(lower, "maximum context length") || strings.Contains(lower, "max context length") {
 			return true
 		}
+		// Grok cli-chat-proxy rejects oversized prompts with a 400 whose message is
+		// "maximum prompt length is 500000". Recognize it here so it maps to a
+		// terminal 400 / no-failover like OpenAI's context_length_exceeded, instead
+		// of being masked into a retryable "Upstream error: 400" that loops the client.
+		if strings.Contains(lower, "maximum prompt length") || strings.Contains(lower, "max prompt length") {
+			return true
+		}
 		hasExceeded := strings.Contains(lower, "exceed") || strings.Contains(lower, "too large") || strings.Contains(lower, "too long")
 		if strings.Contains(lower, "context window") && hasExceeded {
 			return true
