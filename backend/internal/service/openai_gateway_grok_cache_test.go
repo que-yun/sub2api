@@ -372,6 +372,7 @@ func TestApplyGrokFreeFunctionToolCacheRouteInfersFreeFrom2MTokenLimit(t *testin
 	limit := int64(xai.GrokFreeRolling24hTokenLimit)
 	remaining := limit
 	account.Extra = map[string]any{
+		grokClientToolCacheOptInExtraKey: true,
 		grokQuotaSnapshotExtraKey: &xai.QuotaSnapshot{
 			Tokens: &xai.QuotaWindow{Limit: &limit, Remaining: &remaining},
 		},
@@ -437,7 +438,7 @@ func TestApplyGrokCacheIdentityWritesResponsesBodyAndHeader(t *testing.T) {
 	require.False(t, gjson.GetBytes(unscopedBody, "tool_choice").Exists())
 }
 
-func TestGrokFreeMessagesClientToolCacheDefaultsOnForKnownFree(t *testing.T) {
+func TestGrokFreeMessagesClientToolCacheDefaultsOffForKnownFree(t *testing.T) {
 	account := healthyGrokOAuthGatewayTestAccount(901, "access-token")
 	account.Credentials["subscription_tier"] = " FREE "
 	tests := []struct {
@@ -458,14 +459,15 @@ func TestGrokFreeMessagesClientToolCacheDefaultsOnForKnownFree(t *testing.T) {
 
 			require.NoError(t, err)
 			require.Equal(t, "isolated-id", gjson.GetBytes(body, "prompt_cache_key").String())
+			// Pure client-tool cache route is opt-in now (default off): no native
+			// web_search/x_search companions get injected, so grok Build runs the
+			// client's own function tools instead of web-searching.
 			tools := gjson.GetBytes(body, "tools").Array()
-			require.Len(t, tools, 4)
-			require.Equal(t, "function", tools[0].Get("type").String())
+			require.Len(t, tools, 2)
 			require.Equal(t, "lookup", tools[0].Get("name").String())
-			require.Equal(t, "function", tools[1].Get("type").String())
 			require.Equal(t, "save", tools[1].Get("name").String())
-			require.Equal(t, "web_search", tools[2].Get("type").String())
-			require.Equal(t, "x_search", tools[3].Get("type").String())
+			require.False(t, gjson.GetBytes(body, `tools.#(type=="web_search")`).Exists())
+			require.False(t, gjson.GetBytes(body, `tools.#(type=="x_search")`).Exists())
 			require.Equal(t, tt.wantChoice, gjson.GetBytes(body, "tool_choice").Exists())
 		})
 	}
@@ -491,10 +493,13 @@ func TestGrokFreeMessagesClientToolCacheDefaultsWithMissingAccountSetting(t *tes
 			patched, err := applyGrokFreeMessagesFunctionToolCacheRoute(body, body, account, "isolated-id")
 
 			require.NoError(t, err)
+			// Missing account setting now defaults OFF (opt-in): no native search
+			// companions injected for a pure client function tool.
 			tools := gjson.GetBytes(patched, "tools").Array()
-			require.Len(t, tools, 3)
-			require.Equal(t, "web_search", tools[1].Get("type").String())
-			require.Equal(t, "x_search", tools[2].Get("type").String())
+			require.Len(t, tools, 1)
+			require.Equal(t, "view_image", tools[0].Get("name").String())
+			require.False(t, gjson.GetBytes(patched, `tools.#(type=="web_search")`).Exists())
+			require.False(t, gjson.GetBytes(patched, `tools.#(type=="x_search")`).Exists())
 		})
 	}
 }
@@ -583,7 +588,7 @@ func TestGrokFreeClientToolCacheRequestOptInOverridesAccountOptOut(t *testing.T)
 	require.Equal(t, "x_search", tools[2].Get("type").String())
 }
 
-func TestGrokFreeChatRequestClientToolCacheDefaultsOnWithoutClientFingerprint(t *testing.T) {
+func TestGrokFreeChatRequestClientToolCacheDefaultsOffWithoutClientFingerprint(t *testing.T) {
 	account := healthyGrokOAuthGatewayTestAccount(90140, "access-token")
 	account.Credentials["subscription_tier"] = "free"
 	c := newGrokCacheTestContext(90140)
@@ -593,11 +598,13 @@ func TestGrokFreeChatRequestClientToolCacheDefaultsOnWithoutClientFingerprint(t 
 	patched, err := applyGrokFreeRequestToolCacheRoute(c, body, body, account, "isolated-id")
 
 	require.NoError(t, err)
+	// Pure client-tool cache route is opt-in now (default off): otherwise grok
+	// Build web-searches instead of running the client's own function tools.
 	tools := gjson.GetBytes(patched, "tools").Array()
-	require.Len(t, tools, 3)
+	require.Len(t, tools, 1)
 	require.Equal(t, "view_image", tools[0].Get("name").String())
-	require.Equal(t, "web_search", tools[1].Get("type").String())
-	require.Equal(t, "x_search", tools[2].Get("type").String())
+	require.False(t, gjson.GetBytes(patched, `tools.#(type=="web_search")`).Exists())
+	require.False(t, gjson.GetBytes(patched, `tools.#(type=="x_search")`).Exists())
 }
 
 func TestGrokFreeClientToolCacheClaudeDesktopResponsesAutoOptIn(t *testing.T) {

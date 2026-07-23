@@ -314,12 +314,14 @@ func applyGrokFreeRequestToolCacheRoute(c *gin.Context, body, intentSourceBody [
 	if !allowPureClientTools && !accountPolicyExplicit && !requestOptOut && isGrokClaudeDesktopResponsesCacheRequest(c) {
 		allowPureClientTools = true
 	}
-	// A function merely named web_search/x_search is still a client function.
-	// Known Free OAuth accounts use the cache route by default; a request-scoped
-	// opt-in may override an account opt-out, while an explicit request opt-out
-	// always wins. The legacy Claude fingerprint remains only as a compatibility
-	// fallback when no account policy has been recorded (#4486).
-	return applyGrokFreeToolCacheRoute(body, intentSourceBody, account, cacheIdentity, allowPureClientTools, allowPureClientTools, extraFunctionTools...)
+	// Decouple the two levers (like the Messages route): allowPureClientTools
+	// governs whether PURE client function tools (e.g. Codex shell/apply_patch)
+	// get native web_search/x_search companions — default OFF so grok Build does
+	// not web-search instead of running the client's tools. allowFunctionSearch
+	// still converts a client-DECLARED web_search/x_search function to native form
+	// (genuine search intent), unless the request explicitly opted out.
+	allowFunctionSearch := !requestOptOut
+	return applyGrokFreeToolCacheRoute(body, intentSourceBody, account, cacheIdentity, allowPureClientTools, allowFunctionSearch, extraFunctionTools...)
 }
 
 // grokClientToolCacheAccountPolicy is intentionally strict for configured
@@ -330,12 +332,19 @@ func grokClientToolCacheAccountPolicy(account *Account) (enabled, explicit bool)
 	if !isKnownGrokFreeAccount(account) {
 		return false, false
 	}
+	// Default OFF (opt-in). Enabling the pure-client-tool cache route injects
+	// grok's native web_search/x_search as companion tools, and grok Build then
+	// keeps calling them (ignoring tool_choice) instead of the client's own
+	// function tools — coding agents like Codex end up web-searching instead of
+	// running shell/apply_patch. This aligns with #4486 (do not bias model tool
+	// selection for pure client functions). Set extra.grok_client_tool_cache_enabled=true
+	// per account to trade this off for Free-tier prompt caching.
 	if account.Extra == nil {
-		return true, false
+		return false, false
 	}
 	value, exists := account.Extra[grokClientToolCacheOptInExtraKey]
 	if !exists {
-		return true, false
+		return false, false
 	}
 	enabled, valid := value.(bool)
 	if !valid {

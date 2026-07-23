@@ -409,6 +409,13 @@ func TestForwardGrokChatViaResponsesTraeCompatibilityFieldsKeepCacheRoute(t *tes
 
 	account := grokChatBridgeTestAccount(716)
 	account.Credentials["subscription_tier"] = "free"
+	// The pure-client-tool cache route is opt-in (default off avoids grok Build
+	// web-searching instead of running client tools). Enable it explicitly so this
+	// test still exercises the native web_search/x_search companion injection.
+	if account.Extra == nil {
+		account.Extra = map[string]any{}
+	}
+	account.Extra[grokClientToolCacheOptInExtraKey] = true
 	repo := &grokQuotaAccountRepo{mockAccountRepoForPlatform: &mockAccountRepoForPlatform{
 		accountsByID: map[int64]*Account{account.ID: account},
 	}}
